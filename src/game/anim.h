@@ -1,6 +1,8 @@
 #ifndef FALLOUT_GAME_ANIMATION_H_
 #define FALLOUT_GAME_ANIMATION_H_
 
+#include <stddef.h>
+
 #include "game/object_types.h"
 
 namespace fallout {
@@ -116,6 +118,7 @@ int register_priority(int a1);
 int register_clear(Object* a1);
 int register_end();
 int check_registry(Object* obj);
+bool anim_rt_is_locked(Object* obj, char* description, size_t size);
 int anim_busy(Object* a1);
 int register_object_move_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay);

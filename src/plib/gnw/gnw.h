@@ -66,6 +66,7 @@ int win_width(int win);
 int win_height(int win);
 int win_get_rect(int win, Rect* rect);
 int win_check_all_buttons();
+int win_get_nav_points(int* xs, int* ys, int capacity);
 Button* GNW_find_button(int btn, Window** out_win);
 int GNW_check_menu_bars(int a1);
 void win_set_minimized_title(const char* title);

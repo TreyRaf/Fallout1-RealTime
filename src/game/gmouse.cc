@@ -53,6 +53,9 @@ static bool gmouse_initialized = false;
 // 0x50525C
 static int gmouse_enabled = 0;
 
+// RT: See `gmouse_set_rt_controller_mode`.
+static bool gmouse_rt_controller_mode = false;
+
 // 0x505260
 static int gmouse_mapper_mode = 0;
 
@@ -396,6 +399,13 @@ void gmouse_disable(int a1)
     }
 }
 
+// RT: Hides the 3D map cursor and disables edge scrolling while the game is
+// played with a controller.
+void gmouse_set_rt_controller_mode(bool enabled)
+{
+    gmouse_rt_controller_mode = enabled;
+}
+
 // 0x4430B4
 int gmouse_is_enabled()
 {
@@ -573,6 +583,16 @@ void gmouse_bk_process()
             }
         }
 
+        return;
+    }
+
+    // RT: Controller gameplay has no map cursor: the 3D hex stays hidden (the
+    // target lock marker uses the same red hex) and the parked cursor must not
+    // edge-scroll the map.
+    if (gmouse_rt_controller_mode) {
+        if (gmouse_3d_is_on()) {
+            gmouse_3d_off();
+        }
         return;
     }
 

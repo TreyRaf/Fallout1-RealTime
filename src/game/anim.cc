@@ -353,6 +353,12 @@ int register_begin(int requestOptions)
     }
 
     AnimationSequence* animationSequence = &(anim_set[v1]);
+
+    // RT: A sequence abandoned through `anim_cleanup` (failed registration)
+    // keeps its request flags; a later sequence reusing the slot must not
+    // inherit them (e.g. a walk becoming "prioritized" and uninterruptible).
+    animationSequence->flags &= ~(ANIM_SEQ_PRIORITIZED | ANIM_SEQ_RESERVED | ANIM_SEQ_INSIGNIFICANT | ANIM_SEQ_NO_STAND | ANIM_SEQ_COMBAT_ANIM_STARTED);
+
     animationSequence->flags |= ANIM_SEQ_ACCUMULATING;
 
     if ((requestOptions & ANIMATION_REQUEST_RESERVED) != 0) {
@@ -523,6 +529,55 @@ static void anim_cleanup()
 }
 
 // 0x41390C
+// RT: Mirrors the search in `register_clear` without ending anything: returns
+// true if `register_clear(obj)` would refuse (prioritized sequence). Fills
+// `description` with the blocking sequence for diagnostics.
+bool anim_rt_is_locked(Object* obj, char* description, size_t size)
+{
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        int animationDescriptionIndex;
+        for (animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (obj == animationDescription->owner && animationDescription->kind != ANIM_KIND_CALLBACK) {
+                break;
+            }
+        }
+
+        if (animationDescriptionIndex == animationSequence->length) {
+            continue;
+        }
+
+        if ((animationSequence->flags & ANIM_SEQ_PRIORITIZED) == 0) {
+            return false;
+        }
+
+        if (description != NULL) {
+            int written = snprintf(description, size, "seq=%d field_0=%d index=%d length=%d flags=0x%X kinds=",
+                animationSequenceIndex,
+                animationSequence->field_0,
+                animationSequence->animationIndex,
+                animationSequence->length,
+                animationSequence->flags);
+            for (int index = 0; index < animationSequence->length && written > 0 && (size_t)written < size; index++) {
+                AnimationDescription* animationDescription = &(animationSequence->animations[index]);
+                written += snprintf(description + written, size - written, "%d%s/%d ",
+                    animationDescription->kind,
+                    animationDescription->owner == obj ? "*" : "",
+                    animationDescription->anim);
+            }
+        }
+
+        return true;
+    }
+
+    return false;
+}
+
 int check_registry(Object* obj)
 {
     if (curr_anim_set == -1) {

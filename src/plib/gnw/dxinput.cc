@@ -1,5 +1,7 @@
 #include "plib/gnw/dxinput.h"
 
+#include "plib/gnw/gamepad.h"
+
 namespace fallout {
 
 static bool dxinput_mouse_init();
@@ -25,6 +27,9 @@ bool dxinput_init()
         goto err;
     }
 
+    // RT: Controller support.
+    gamepad_init();
+
     return true;
 
 err:
@@ -37,6 +42,7 @@ err:
 // 0x4E0478
 void dxinput_exit()
 {
+    gamepad_exit();
     SDL_QuitSubSystem(SDL_INIT_EVENTS);
 }
 
@@ -71,6 +77,21 @@ bool dxinput_get_mouse_state(MouseData* mouseState)
 
     gMouseWheelDeltaX = 0;
     gMouseWheelDeltaY = 0;
+
+    // RT: Merge the controller-driven virtual mouse.
+    int padDx;
+    int padDy;
+    bool padLeft;
+    bool padRight;
+    gamepad_get_mouse_delta(&padDx, &padDy, &padLeft, &padRight);
+    mouseState->x += padDx;
+    mouseState->y += padDy;
+    if (padLeft) {
+        mouseState->buttons[0] = 1;
+    }
+    if (padRight) {
+        mouseState->buttons[1] = 1;
+    }
 
     return true;
 }

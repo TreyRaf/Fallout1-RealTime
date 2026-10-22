@@ -102,6 +102,7 @@ void gmouse_3d_reset_fid();
 void gmouse_3d_on();
 void gmouse_3d_off();
 bool gmouse_3d_is_on();
+void gmouse_set_rt_controller_mode(bool enabled);
 Object* object_under_mouse(int objectType, bool a2, int elevation);
 int gmouse_3d_build_pick_frame(int x, int y, int menuItem, int width, int height);
 int gmouse_3d_pick_frame_hot(int* a1, int* a2);

@@ -1083,6 +1083,54 @@ static void refresh_all(Rect* rect, unsigned char* a2)
     }
 }
 
+// RT: Collects the centers (screen coordinates) of enabled, clickable buttons in
+// the topmost visible windows, down to and including the first modal window.
+// Used for controller (D-pad) menu navigation.
+int win_get_nav_points(int* xs, int* ys, int capacity)
+{
+    int count = 0;
+
+    for (int index = num_windows - 1; index >= 0 && count < capacity; index--) {
+        Window* w = window[index];
+        if (w == NULL || (w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+
+        for (Button* button = w->buttonListHead; button != NULL && count < capacity; button = button->next) {
+            if ((button->flags & BUTTON_FLAG_DISABLED) != 0) {
+                continue;
+            }
+
+            bool clickable = button->leftMouseUpEventCode != -1
+                || button->lefMouseDownEventCode != -1
+                || button->leftMouseUpProc != NULL
+                || button->leftMouseDownProc != NULL;
+            if (!clickable) {
+                continue;
+            }
+
+            int width = button->rect.lrx - button->rect.ulx + 1;
+            int height = button->rect.lry - button->rect.uly + 1;
+
+            // Large click areas (whole panels, scroll regions) aren't useful
+            // navigation stops.
+            if (width * height > 60000) {
+                continue;
+            }
+
+            xs[count] = w->rect.ulx + button->rect.ulx + width / 2;
+            ys[count] = w->rect.uly + button->rect.uly + height / 2;
+            count++;
+        }
+
+        if ((w->flags & WINDOW_MODAL) != 0) {
+            break;
+        }
+    }
+
+    return count;
+}
+
 // 0x4C3940
 Window* GNW_find(int win)
 {

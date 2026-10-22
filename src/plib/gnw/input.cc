@@ -8,6 +8,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/dxinput.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/intrface.h"
@@ -1123,11 +1124,13 @@ void GNW95_process_message()
                 break;
             case SDL_WINDOWEVENT_FOCUS_GAINED:
                 GNW95_isActive = true;
+                gamepad_set_focus(true);
                 win_refresh_all(&scr_size);
                 audioEngineResume();
                 break;
             case SDL_WINDOWEVENT_FOCUS_LOST:
                 GNW95_isActive = false;
+                gamepad_set_focus(false);
                 audioEnginePause();
                 break;
             }
@@ -1139,6 +1142,9 @@ void GNW95_process_message()
     }
 
     touch_process_gesture();
+
+    // RT: Poll the controller (translates buttons to keys in menus).
+    gamepad_update();
 
     if (GNW95_isActive && !kb_is_disabled()) {
         // NOTE: Uninline

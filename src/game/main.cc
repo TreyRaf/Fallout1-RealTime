@@ -30,6 +30,8 @@
 #include "game/options.h"
 #include "game/palette.h"
 #include "game/proto.h"
+#include "game/realtime.h"
+#include "game/rt_autotest.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/select.h"
@@ -38,6 +40,7 @@
 #include "game/worldmap.h"
 #include "plib/color/color.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -92,16 +95,22 @@ int gnw_main(int argc, char** argv)
         return 1;
     }
 
+    // RT: `--rt-autotest` runs the automated prototype test.
+    rt_autotest_parse_args(argc, argv);
+
     if (!main_init_system(argc, argv)) {
         return 1;
     }
 
-    gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
-    gmovie_play(MOVIE_INTRO, 0);
+    if (!rt_autotest_enabled()) {
+        gmovie_play(MOVIE_IPLOGO, GAME_MOVIE_FADE_IN);
+        gmovie_play(MOVIE_INTRO, 0);
+    }
 
     if (main_menu_create() == 0) {
         int language_filter = 1;
         bool done = false;
+        bool autotestStarted = false;
 
         config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_LANGUAGE_FILTER_KEY, &language_filter);
 
@@ -111,7 +120,14 @@ int gnw_main(int argc, char** argv)
             main_menu_show(1);
 
             mouse_show();
-            int mainMenuRc = main_menu_loop();
+            int mainMenuRc;
+            if (rt_autotest_enabled()) {
+                // The automated test starts a new game once, then exits.
+                mainMenuRc = autotestStarted ? MAIN_MENU_EXIT : MAIN_MENU_NEW_GAME;
+                autotestStarted = true;
+            } else {
+                mainMenuRc = main_menu_loop();
+            }
             mouse_hide();
 
             switch (mainMenuRc) {
@@ -123,7 +139,9 @@ int gnw_main(int argc, char** argv)
                 main_menu_hide(true);
                 main_menu_destroy();
                 if (select_character() == 2) {
-                    gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
+                    if (!rt_autotest_enabled()) {
+                        gmovie_play(MOVIE_OVRINTRO, GAME_MOVIE_STOP_MUSIC);
+                    }
                     roll_set_seed(-1);
                     main_load_new(mainMap);
                     main_game_loop();
@@ -322,19 +340,31 @@ static void main_game_loop()
     while (game_user_wants_to_quit == 0) {
         sharedFpsLimiter.mark();
 
+        // RT: Controller buttons drive gameplay only during this call; every
+        // other input loop (menus, dialogue) gets menu navigation.
+        gamepad_set_gameplay_mode(true);
         int keyCode = get_input();
+        gamepad_set_gameplay_mode(false);
+
         game_handle_input(keyCode, false);
 
         scripts_check_state();
 
         map_check_state();
 
+        // RT: Advance the real-time simulation.
+        rt_tick();
+        rt_autotest_tick();
+
         if (main_game_paused != 0) {
             main_game_paused = 0;
         }
 
-        if ((obj_dude->data.critter.combat.results & (DAM_DEAD | DAM_KNOCKED_OUT)) != 0) {
-            main_show_death_scene = 1;
+        // RT: Being knocked out is no longer fatal outside turn-based combat;
+        // the knockout queue event wakes the player up.
+        int fatalResults = rt_enabled() ? DAM_DEAD : (DAM_DEAD | DAM_KNOCKED_OUT);
+        if ((obj_dude->data.critter.combat.results & fatalResults) != 0) {
+            main_show_death_scene = rt_autotest_enabled() ? 0 : 1;
             game_user_wants_to_quit = 2;
         }
 

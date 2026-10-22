@@ -24,6 +24,7 @@
 #include "game/pipboy.h"
 #include "game/proto.h"
 #include "game/queue.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/skill.h"
@@ -2376,6 +2377,13 @@ static bool combat_should_end()
 // 0x420B20
 void combat(STRUCT_664980* attack)
 {
+    // RT: Turn-based combat is never started; the request only makes the
+    // participants hostile in the real-time layer.
+    if (rt_enabled()) {
+        rt_combat_request(attack);
+        return;
+    }
+
     if (attack == NULL
         || (attack->attacker == NULL || attack->attacker->elevation == map_elevation)
         || (attack->defender == NULL || attack->defender->elevation == map_elevation)) {
@@ -2546,6 +2554,13 @@ int combat_attack(Object* attacker, Object* defender, int hitMode, int hitLocati
     debug_printf("running attack...\n");
 
     return 0;
+}
+
+// RT: Exposes the vanilla attack computation (to-hit roll, criticals, damage)
+// to the real-time layer.
+int combat_rt_compute_attack(Attack* attack)
+{
+    return compute_attack(attack);
 }
 
 // 0x420EB0

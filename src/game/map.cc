@@ -26,6 +26,7 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/queue.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
@@ -920,6 +921,9 @@ int map_load_file(DB_FILE* stream)
 {
     int rc = 0;
     const char* error;
+
+    // RT: Real-time state references objects of the previous map.
+    rt_reset();
 
     map_save_in_game(true);
     gsound_background_play("wind2", 12, 13, 16);
