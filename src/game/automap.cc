@@ -1075,4 +1075,116 @@ int ReadAMList(AutomapHeader** automapHeaderPtr)
     return 0;
 }
 
+
+// -----------------------------------------------------------------------------
+// RT: automap rendering for the unified Pip-Boy (rt_pipboy.cc)
+// -----------------------------------------------------------------------------
+//
+// Both render into a 400x400 buffer (2 pixels per hex horizontally, a hex
+// row every 2 lines), with the same orientation and colors as the original
+// automap and Pip-Boy automaps.
+
+// Whether the map keeps an automap at all (desert encounters and similar
+// don't).
+bool automap_rt_available(int map, int elevation)
+{
+    if (map < 0 || map >= AUTOMAP_MAP_COUNT || elevation < 0 || elevation >= ELEVATION_COUNT) {
+        return false;
+    }
+    return amdbhead.offsets[map][elevation] >= 0;
+}
+
+// The current map, live: what the player has seen (as the in-game automap
+// shows it), plus the player's position. Returns the player's pixel.
+void automap_rt_render_live(unsigned char* dest, int elevation, bool highDetails, int* playerX, int* playerY)
+{
+    obj_process_seen();
+
+    *playerX = -1;
+    *playerY = -1;
+
+    for (Object* object = obj_find_first_at(elevation); object != NULL; object = obj_find_next_at()) {
+        if (object->tile == -1 || (object->flags & OBJECT_SEEN) == 0) {
+            continue;
+        }
+
+        int objectType = FID_TYPE(object->fid);
+        unsigned char color;
+        if (object->pid == PROTO_ID_0x2000031) {
+            color = colorTable[32328];
+        } else if (objectType == OBJ_TYPE_WALL) {
+            color = colorTable[992];
+        } else if (objectType == OBJ_TYPE_SCENERY && highDetails && object->pid != PROTO_ID_0x2000158) {
+            color = colorTable[480];
+        } else {
+            continue;
+        }
+
+        int x = AUTOMAP_RT_SIZE - 2 - 2 * (object->tile % HEX_GRID_WIDTH);
+        int y = 2 * (object->tile / HEX_GRID_WIDTH);
+        if (x < 0 || x + 1 >= AUTOMAP_RT_SIZE || y < 0 || y >= AUTOMAP_RT_SIZE) {
+            continue;
+        }
+
+        unsigned char* pixel = dest + AUTOMAP_RT_SIZE * y + x;
+        if (*pixel != colorTable[992] || color != colorTable[480]) {
+            pixel[0] = color;
+            pixel[1] = color;
+        }
+    }
+
+    if (obj_dude->elevation == elevation && obj_dude->tile != -1) {
+        *playerX = AUTOMAP_RT_SIZE - 2 - 2 * (obj_dude->tile % HEX_GRID_WIDTH);
+        *playerY = 2 * (obj_dude->tile / HEX_GRID_WIDTH);
+    }
+}
+
+// A saved automap (maps visited earlier), as the original Pip-Boy shows it.
+int automap_rt_render_saved(unsigned char* dest, int map, int elevation)
+{
+    unsigned char wallColor = colorTable[992];
+    unsigned char sceneryColor = colorTable[480];
+
+    ambuf = (unsigned char*)mem_malloc(11024);
+    if (ambuf == NULL) {
+        return -1;
+    }
+
+    if (AM_ReadEntry(map, elevation) == -1) {
+        mem_free(ambuf);
+        return -1;
+    }
+
+    int v1 = 0;
+    unsigned char v2 = 0;
+    unsigned char* ptr = ambuf;
+
+    for (int y = 0; y < HEX_GRID_HEIGHT; y++) {
+        unsigned char* row = dest + AUTOMAP_RT_SIZE * 2 * y;
+        for (int x = 0; x < HEX_GRID_WIDTH; x++) {
+            v1 -= 1;
+            if (v1 <= 0) {
+                v1 = 4;
+                v2 = *ptr++;
+            }
+
+            switch ((v2 & 0xC0) >> 6) {
+            case 1:
+                row[2 * x] = wallColor;
+                row[2 * x + 1] = wallColor;
+                break;
+            case 2:
+                row[2 * x] = sceneryColor;
+                row[2 * x + 1] = sceneryColor;
+                break;
+            }
+
+            v2 <<= 2;
+        }
+    }
+
+    mem_free(ambuf);
+    return 0;
+}
+
 } // namespace fallout

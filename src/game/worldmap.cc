@@ -3768,4 +3768,42 @@ static void BlackOut()
     memset(world_buf, colorTable[0], WM_WINDOW_WIDTH * WM_WINDOW_HEIGHT);
 }
 
+
+// -----------------------------------------------------------------------------
+// RT: read-only world map state for the unified Pip-Boy (rt_pipboy.cc)
+// -----------------------------------------------------------------------------
+
+int worldmap_rt_cell(int row, int column)
+{
+    if (row < 0 || row >= WORLDMAP_RT_GRID_ROWS || column < 0 || column >= WORLDMAP_RT_GRID_COLUMNS) {
+        return 0;
+    }
+    return WorldGrid[row][column];
+}
+
+void worldmap_rt_position(int* x, int* y)
+{
+    *x = world_xpos;
+    *y = world_ypos;
+}
+
+// Towns the world map lists (visited at least once).
+bool worldmap_rt_town_visited(int town)
+{
+    return town >= 0 && town < TOWN_COUNT && ((first_visit_flag >> town) & 1) != 0;
+}
+
+void worldmap_rt_town_position(int town, int* x, int* y)
+{
+    *x = WORLDMAP_RT_CELL_SIZE * city_location[town].column + WORLDMAP_RT_CELL_SIZE / 2;
+    *y = WORLDMAP_RT_CELL_SIZE * city_location[town].row + WORLDMAP_RT_CELL_SIZE / 2;
+}
+
+// Automated tests: reveals the land around the party as the world map does
+// on entering it and while traveling.
+void worldmap_rt_reveal_around_party()
+{
+    UpdVisualArea();
+}
+
 } // namespace fallout

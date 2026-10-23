@@ -2489,4 +2489,187 @@ static void pip_note()
     }
 }
 
+
+// -----------------------------------------------------------------------------
+// RT: unified Pip-Boy support (see rt_pipboy.cc)
+// -----------------------------------------------------------------------------
+
+// Opens the Pip-Boy window with the original background, clock, date and
+// note, but without the original buttons and opening logo.
+int pipboy_rt_begin(int* window, unsigned char** buffer, unsigned char** background)
+{
+    bk_enable = map_disable_bk_processes();
+
+    cycle_disable();
+    gmouse_3d_off();
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+
+    savefont = text_curr();
+    text_font(101);
+
+    proc_bail_flag = 0;
+    rest_time = 0;
+    cursor_line = 0;
+    hot_line_count = 0;
+    hot_back_line = 0;
+    bottom_line = PIPBOY_WINDOW_CONTENT_VIEW_HEIGHT / text_height() - 1;
+
+    if (!message_init(&pipboy_message_file)) {
+        return -1;
+    }
+
+    char path[COMPAT_MAX_PATH];
+    snprintf(path, sizeof(path), "%s%s", msg_path, "pipboy.msg");
+    if (!(message_load(&pipboy_message_file, path))) {
+        return -1;
+    }
+
+    int index;
+    for (index = 0; index < PIPBOY_FRM_COUNT; index++) {
+        int fid = art_id(OBJ_TYPE_INTERFACE, pipgrphs[index], 0, 0, 0);
+        pipbmp[index] = art_lock(fid, &(grphkey[index]), &(ginfo[index].width), &(ginfo[index].height));
+        if (pipbmp[index] == NULL) {
+            break;
+        }
+    }
+
+    if (index != PIPBOY_FRM_COUNT) {
+        while (--index >= 0) {
+            art_ptr_unlock(grphkey[index]);
+        }
+        message_exit(&pipboy_message_file);
+        return -1;
+    }
+
+    int x = (screenGetWidth() - PIPBOY_WINDOW_WIDTH) / 2;
+    int y = (screenGetHeight() - PIPBOY_WINDOW_HEIGHT) / 2;
+    pip_win = win_add(x, y, PIPBOY_WINDOW_WIDTH, PIPBOY_WINDOW_HEIGHT, colorTable[0], WINDOW_MODAL);
+    if (pip_win == -1) {
+        for (index = 0; index < PIPBOY_FRM_COUNT; index++) {
+            art_ptr_unlock(grphkey[index]);
+        }
+        message_exit(&pipboy_message_file);
+        return -1;
+    }
+
+    scrn_buf = win_get_buf(pip_win);
+    memcpy(scrn_buf, pipbmp[PIPBOY_FRM_BACKGROUND], PIPBOY_WINDOW_WIDTH * PIPBOY_WINDOW_HEIGHT);
+    pipboy_rt_draw_clock();
+
+    gsound_play_sfx_file("pipon");
+
+    *window = pip_win;
+    *buffer = scrn_buf;
+    *background = pipbmp[PIPBOY_FRM_BACKGROUND];
+    return 0;
+}
+
+void pipboy_rt_end()
+{
+    EndPipboy();
+}
+
+void pipboy_rt_draw_clock()
+{
+    pip_note();
+    pip_num(game_time_hour(), 4, PIPBOY_WINDOW_TIME_X, PIPBOY_WINDOW_TIME_Y);
+    pip_date();
+}
+
+const char* pipboy_rt_getmsg(int id)
+{
+    return getmsg(&pipboy_message_file, &pipmesg, id);
+}
+
+int pipboy_rt_quest_location_count()
+{
+    return QUEST_LOCATION_COUNT;
+}
+
+int pipboy_rt_quests_per_location()
+{
+    return QUEST_PER_LOCATION_COUNT;
+}
+
+int pipboy_rt_quest_gvar(int location, int quest)
+{
+    return sthreads[location][quest];
+}
+
+int pipboy_rt_holodisk_count()
+{
+    return HOLODISK_COUNT;
+}
+
+int pipboy_rt_holodisk_gvar(int holodisk)
+{
+    return holodisks[holodisk];
+}
+
+bool pipboy_rt_can_rest()
+{
+    return critter_can_obj_dude_rest();
+}
+
+// The original alarm clock options (see `PipAlarm`).
+bool pipboy_rt_rest(int option)
+{
+    proc_bail_flag = 0;
+    int minutes = 0;
+    int hours = 0;
+
+    switch (option) {
+    case PIPBOY_REST_DURATION_TEN_MINUTES:
+        TimedRest(0, 10, 0);
+        break;
+    case PIPBOY_REST_DURATION_THIRTY_MINUTES:
+        TimedRest(0, 30, 0);
+        break;
+    case PIPBOY_REST_DURATION_ONE_HOUR:
+    case PIPBOY_REST_DURATION_TWO_HOURS:
+    case PIPBOY_REST_DURATION_THREE_HOURS:
+    case PIPBOY_REST_DURATION_FOUR_HOURS:
+    case PIPBOY_REST_DURATION_FIVE_HOURS:
+    case PIPBOY_REST_DURATION_SIX_HOURS:
+        TimedRest(option - 1, 0, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_MORNING:
+        ClacTime(&hours, &minutes, 6);
+        TimedRest(hours, minutes, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_NOON:
+        ClacTime(&hours, &minutes, 12);
+        TimedRest(hours, minutes, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_EVENING:
+        ClacTime(&hours, &minutes, 18);
+        TimedRest(hours, minutes, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_MIDNIGHT:
+        ClacTime(&hours, &minutes, 0);
+        TimedRest(hours, minutes, 0);
+        break;
+    case PIPBOY_REST_DURATION_UNTIL_HEALED:
+        TimedRest(0, 0, option);
+        break;
+    default:
+        return false;
+    }
+
+    gsound_play_sfx_file("ib2lu1x1");
+    pipboy_rt_draw_clock();
+    return proc_bail_flag;
+}
+
+bool pipboy_rt_get_frame(int frm, unsigned char** data, int* width, int* height)
+{
+    if (frm < 0 || frm >= PIPBOY_FRM_COUNT || pipbmp[frm] == NULL) {
+        return false;
+    }
+    *data = pipbmp[frm];
+    *width = ginfo[frm].width;
+    *height = ginfo[frm].height;
+    return true;
+}
+
 } // namespace fallout

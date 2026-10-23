@@ -33,6 +33,7 @@
 #include "game/proto.h"
 #include "game/roll.h"
 #include "game/rt_context.h"
+#include "game/rt_pipboy.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -1718,7 +1719,7 @@ static void rt_update_dude(float dtMs)
     }
 
     if (pressB) {
-        GNW_add_input_buffer(KEY_LOWERCASE_I);
+        GNW_add_input_buffer(RT_PIPBOY_KEY_OPEN);
     }
     if (pressRB) {
         if (rt_reload_active) {

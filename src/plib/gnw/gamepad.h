@@ -58,6 +58,20 @@ void gamepad_exit();
 void gamepad_update();
 
 void gamepad_set_gameplay_mode(bool enabled);
+
+// Menu key mode: while enabled (outside gameplay), the controller drives a
+// screen with keys instead of the virtual mouse: A = Enter, B = Escape,
+// LB/RB = Page Up/Down, D-pad and left stick = arrow keys (with repeat), and
+// X, Y, LT, RT, Start, Back = the GAMEPAD_KEY_* codes below. Used by the
+// Pip-Boy.
+#define GAMEPAD_KEY_X 0x7001
+#define GAMEPAD_KEY_Y 0x7002
+#define GAMEPAD_KEY_LT 0x7003
+#define GAMEPAD_KEY_RT 0x7004
+#define GAMEPAD_KEY_START 0x7005
+#define GAMEPAD_KEY_BACK 0x7006
+void gamepad_set_menu_key_mode(bool enabled);
+bool gamepad_is_menu_key_mode();
 bool gamepad_is_gameplay_mode();
 
 // Window focus changes (from the SDL event loop).

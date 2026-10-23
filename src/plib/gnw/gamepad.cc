@@ -29,6 +29,8 @@ static void gamepad_interrupt_gameplay_input();
 static void gamepad_handle_menu_press(int button);
 static void gamepad_handle_menu_repeat(unsigned int now);
 static void gamepad_menu_navigate(int button);
+static void gamepad_handle_key_mode_press(int button);
+static void gamepad_update_key_mode_stick(unsigned int now);
 static void gamepad_update_flick();
 
 static bool gamepad_initialized = false;
@@ -66,6 +68,11 @@ static int gamepad_mouse_dx = 0;
 static int gamepad_mouse_dy = 0;
 static bool gamepad_mouse_left = false;
 static bool gamepad_mouse_right = false;
+
+// Menu key mode (see `gamepad_set_menu_key_mode`).
+static bool gamepad_key_mode = false;
+static int gamepad_stick_key = -1;
+static unsigned int gamepad_stick_key_next = 0;
 
 static int gamepad_repeat_button = -1;
 static unsigned int gamepad_repeat_next = 0;
@@ -307,8 +314,13 @@ void gamepad_update()
         gamepad_repeat_button = -1;
     }
 
-    // Virtual mouse: menus only. In gameplay the sticks belong to movement.
-    if (!gamepad_gameplay_mode) {
+    if (!gamepad_gameplay_mode && gamepad_key_mode) {
+        gamepad_update_key_mode_stick(now);
+    }
+
+    // Virtual mouse: menus only (not in key mode). In gameplay the sticks
+    // belong to movement.
+    if (!gamepad_gameplay_mode && !gamepad_key_mode) {
         float cx = gamepad_state.leftX;
         float cy = gamepad_state.leftY;
         if (cx == 0.0f && cy == 0.0f) {
@@ -342,6 +354,11 @@ void gamepad_update()
 
 static void gamepad_handle_menu_press(int button)
 {
+    if (gamepad_key_mode) {
+        gamepad_handle_key_mode_press(button);
+        return;
+    }
+
     switch (button) {
     case GAMEPAD_BUTTON_B:
     case GAMEPAD_BUTTON_BACK:
@@ -412,6 +429,12 @@ static void gamepad_menu_navigate(int button)
         break;
     }
 
+    // Key mode: plain arrow keys, the screen does its own selection.
+    if (gamepad_key_mode) {
+        GNW_add_input_buffer(key);
+        return;
+    }
+
     int xs[GAMEPAD_NAV_POINTS_CAPACITY];
     int ys[GAMEPAD_NAV_POINTS_CAPACITY];
     int count = win_get_nav_points(xs, ys, GAMEPAD_NAV_POINTS_CAPACITY);
@@ -443,6 +466,101 @@ static void gamepad_menu_navigate(int button)
     } else {
         GNW_add_input_buffer(key);
     }
+}
+
+static void gamepad_handle_key_mode_press(int button)
+{
+    switch (button) {
+    case GAMEPAD_BUTTON_A:
+        GNW_add_input_buffer(KEY_RETURN);
+        break;
+    case GAMEPAD_BUTTON_B:
+        GNW_add_input_buffer(KEY_ESCAPE);
+        break;
+    case GAMEPAD_BUTTON_X:
+        GNW_add_input_buffer(GAMEPAD_KEY_X);
+        break;
+    case GAMEPAD_BUTTON_Y:
+        GNW_add_input_buffer(GAMEPAD_KEY_Y);
+        break;
+    case GAMEPAD_BUTTON_START:
+        GNW_add_input_buffer(GAMEPAD_KEY_START);
+        break;
+    case GAMEPAD_BUTTON_BACK:
+        GNW_add_input_buffer(GAMEPAD_KEY_BACK);
+        break;
+    case GAMEPAD_BUTTON_LEFT_SHOULDER:
+        GNW_add_input_buffer(KEY_PAGE_UP);
+        break;
+    case GAMEPAD_BUTTON_RIGHT_SHOULDER:
+        GNW_add_input_buffer(KEY_PAGE_DOWN);
+        break;
+    case GAMEPAD_BUTTON_LEFT_TRIGGER:
+        GNW_add_input_buffer(GAMEPAD_KEY_LT);
+        break;
+    case GAMEPAD_BUTTON_RIGHT_TRIGGER:
+        GNW_add_input_buffer(GAMEPAD_KEY_RT);
+        break;
+    case GAMEPAD_BUTTON_DPAD_UP:
+    case GAMEPAD_BUTTON_DPAD_DOWN:
+    case GAMEPAD_BUTTON_DPAD_LEFT:
+    case GAMEPAD_BUTTON_DPAD_RIGHT:
+        gamepad_repeat_button = button;
+        gamepad_repeat_next = SDL_GetTicks() + GAMEPAD_REPEAT_DELAY;
+        gamepad_menu_navigate(button);
+        break;
+    }
+}
+
+// Key mode: the left stick works like the D-pad (dominant direction, with
+// repeat while held).
+static void gamepad_update_key_mode_stick(unsigned int now)
+{
+    float x = gamepad_state.leftX;
+    float y = gamepad_state.leftY;
+    int key = -1;
+    if (x * x + y * y >= 0.5f * 0.5f) {
+        if (fabsf(x) > fabsf(y)) {
+            key = x > 0.0f ? KEY_ARROW_RIGHT : KEY_ARROW_LEFT;
+        } else {
+            key = y > 0.0f ? KEY_ARROW_DOWN : KEY_ARROW_UP;
+        }
+    }
+
+    // Held since the mode started: wait for neutral first.
+    if (gamepad_stick_key == -2) {
+        if (key == -1) {
+            gamepad_stick_key = -1;
+        }
+        return;
+    }
+
+    if (key == -1) {
+        gamepad_stick_key = -1;
+        return;
+    }
+
+    if (key != gamepad_stick_key) {
+        gamepad_stick_key = key;
+        gamepad_stick_key_next = now + GAMEPAD_REPEAT_DELAY;
+        GNW_add_input_buffer(key);
+    } else if (now >= gamepad_stick_key_next) {
+        gamepad_stick_key_next = now + GAMEPAD_REPEAT_RATE;
+        GNW_add_input_buffer(key);
+    }
+}
+
+void gamepad_set_menu_key_mode(bool enabled)
+{
+    gamepad_key_mode = enabled;
+    gamepad_repeat_button = -1;
+    // A stick already pushed doesn't count as a new move.
+    gamepad_stick_key = -2;
+}
+
+bool gamepad_is_menu_key_mode()
+{
+    return gamepad_key_mode;
 }
 
 void gamepad_set_gameplay_mode(bool enabled)

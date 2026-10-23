@@ -91,6 +91,18 @@ int drop_ammo_into_weapon(Object* weapon, Object* ammo, Object** a3, int quantit
 void draw_amount(int value, int inventoryWindowType);
 int inven_set_timer(Object* a1);
 
+// RT: player inventory operations for the unified Pip-Boy.
+#define INVEN_RT_SLOT_LEFT_HAND 0
+#define INVEN_RT_SLOT_RIGHT_HAND 1
+#define INVEN_RT_SLOT_ARMOR 2
+int inven_rt_quantity(Object* item);
+void inven_rt_refresh_appearance();
+int inven_rt_equip(Object* item, int slot);
+int inven_rt_unequip(Object* item);
+int inven_rt_use(Object* item);
+int inven_rt_drop(Object* item, int quantity);
+int inven_rt_unload(Object* weapon);
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_INVENTRY_H_ */

@@ -43,6 +43,12 @@ int automap_pip_save();
 int YesWriteIndex(int mapIndex, int elevation);
 int ReadAMList(AutomapHeader** automapHeaderPtr);
 
+// RT: automap rendering for the unified Pip-Boy, into a 400x400 buffer.
+#define AUTOMAP_RT_SIZE 400
+bool automap_rt_available(int map, int elevation);
+void automap_rt_render_live(unsigned char* dest, int elevation, bool highDetails, int* playerX, int* playerY);
+int automap_rt_render_saved(unsigned char* dest, int map, int elevation);
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_AUTOMAP_H_ */

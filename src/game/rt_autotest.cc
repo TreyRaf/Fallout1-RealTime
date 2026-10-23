@@ -27,7 +27,13 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/realtime.h"
+#include "game/editor.h"
+#include "game/game_vars.h"
+#include "game/perk.h"
+#include "game/pipboy.h"
 #include "game/rt_context.h"
+#include "game/rt_pipboy.h"
+#include "game/worldmap.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -121,6 +127,20 @@ typedef enum AutotestCheck {
     C_LOAD,
     C_MAP_CHANGE,
     C_NO_TURN_BASED,
+    C_PB_PAUSE,
+    C_PB_NO_LEAK,
+    C_PB_TABS,
+    C_PB_REOPEN,
+    C_PB_EQUIP,
+    C_PB_USE,
+    C_PB_DROP,
+    C_PB_SKILL,
+    C_PB_PERK,
+    C_PB_MAP,
+    C_PB_DATA,
+    C_PB_SHORTCUTS,
+    C_PB_PERSIST,
+    C_PB_MAP_SAVED,
     C_COUNT,
 } AutotestCheck;
 
@@ -133,8 +153,8 @@ static const char* at_check_names[C_COUNT] = {
     "AP regenerates while not running",
     "AP exhaustion returns to walking and clears the toggle",
     "Running again requires a new L3 click",
-    "B opens inventory, stays open, B closes it",
-    "D-pad opens Pip-Boy, map, character, skilldex",
+    "B opens the Pip-Boy, it stays open, B closes it",
+    "D-pad opens Pip-Boy Data, Map, Stats and the Skilldex",
     "Y does nothing; LB reports the pending targeting system",
     "Menu: D-pad moves the cursor between buttons",
     "Menu: LT/RT do nothing (no lock, no attack)",
@@ -198,6 +218,20 @@ static const char* at_check_names[C_COUNT] = {
     "Load game with the controller; clean state after load",
     "Map transition leaves no stuck combat/input state",
     "Turn-based combat never started",
+    "Pip-Boy: game paused while open",
+    "Pip-Boy: opened while walking, A/RT inside; closing leaks no attack, interaction, movement or reopen",
+    "Pip-Boy: RT/LT switch tabs, RB/LB switch pages",
+    "Pip-Boy: B reopens it on the last tab",
+    "Pip-Boy: hold, put away and hold again a weapon (hand state changes)",
+    "Pip-Boy: using a Stimpak heals and consumes it",
+    "Pip-Boy: quantity picker drops part of a stack; Y inspects",
+    "Pip-Boy: skill point spent, undone (X) and spent again",
+    "Pip-Boy: perk chosen when one is due",
+    "Pip-Boy: live automap with player marker; world map matches the revealed cells",
+    "Pip-Boy: quests and holodisks from the game variables, readable",
+    "Pip-Boy: i, c, Tab, p, z (keys and HUD buttons) open the Pip-Boy on their tab",
+    "Pip-Boy: equipment, skills and perks survive save/load",
+    "Pip-Boy: after a map change, its saved automap opens; the world map shows revealed land",
 };
 
 static int at_results[C_COUNT];
@@ -1071,8 +1105,13 @@ static bool step_walk(unsigned int elapsed, bool first, bool timedOut)
 
 static bool step_stop(unsigned int elapsed, bool first, bool timedOut)
 {
+    if (first) {
+        at_tile_b = obj_dude->tile;
+    }
+
     if (elapsed >= 800) {
-        at_check(C_STOP, !anim_busy(obj_dude), "animation busy after release=%d", anim_busy(obj_dude) != 0);
+        at_check(C_STOP, !anim_busy(obj_dude), "animation busy after release=%d (anim %d, tiles moved after release %d)",
+            anim_busy(obj_dude) != 0, FID_ANIM_TYPE(obj_dude->fid), tile_dist(at_tile_b, obj_dude->tile));
         return true;
     }
     return false;
@@ -1194,7 +1233,7 @@ static bool step_inventory(unsigned int elapsed, bool first, bool timedOut)
 {
     if (first) {
         at_flag_a = false;
-        at_expect_menu("03_inventory", at_menu_inventory_script);
+        at_expect_menu("03_pipboy", at_menu_inventory_script);
         at_press(GAMEPAD_BUTTON_B);
         return false;
     }
@@ -1218,9 +1257,9 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
         GAMEPAD_BUTTON_DPAD_RIGHT,
     };
     static const char* names[] = {
-        "04_pipboy",
-        "05_automap",
-        "06_character",
+        "04_pipboy_data",
+        "05_pipboy_map",
+        "06_pipboy_stats",
         "07_skilldex",
     };
 
@@ -1250,8 +1289,12 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
     }
 
     if ((at_menu_seen && now - at_time_a > 300) || now - at_time_a > 5000) {
-        at_log("screen %s: opened=%d closed=%d", names[at_count_a], at_menu_seen, at_menu_done);
-        if (at_menu_seen && at_menu_done) {
+        // Up, down and left open the Pip-Boy on Data, Map and Stats (its state
+        // keeps the tab after closing); right opens the Skilldex.
+        static const int tabs[] = { RT_PIPBOY_TAB_DATA, RT_PIPBOY_TAB_MAP, RT_PIPBOY_TAB_STATS, -1 };
+        bool tabOk = tabs[at_count_a] == -1 || rt_pipboy_get_state()->tab == tabs[at_count_a];
+        at_log("screen %s: opened=%d closed=%d Pip-Boy tab %d", names[at_count_a], at_menu_seen, at_menu_done, rt_pipboy_get_state()->tab);
+        if (at_menu_seen && at_menu_done && tabOk) {
             at_count_b++;
         }
         at_menu_expected = false;
@@ -4514,6 +4557,921 @@ static bool step_script_scan(unsigned int elapsed, bool first, bool timedOut)
 // Script
 // -----------------------------------------------------------------------------
 
+// -----------------------------------------------------------------------------
+// Steps: the unified Pip-Boy
+// -----------------------------------------------------------------------------
+
+// Menu scripts press one button at a time, with time for the press and the
+// release to register.
+static unsigned int at_pb_last_press = 0;
+static int at_pb_phase = 0;
+static int at_pb_tries = 0;
+static unsigned int at_pb_phase_time = 0;
+
+static Object* at_pb_weapon = NULL;
+static Object* at_pb_ammo = NULL;
+static int at_pb_ammo_pid = -1;
+static int at_pb_ammo_before = 0;
+static int at_pb_hp_before = 0;
+static int at_pb_stims_before = 0;
+static int at_pb_skill = -1;
+static int at_pb_skill_before = 0;
+static int at_pb_unspent_before = 0;
+static int at_pb_perk = -1;
+static unsigned int at_pb_rt_time = 0;
+static unsigned int at_pb_game_time = 0;
+static int at_pb_open_tab = -1;
+static int at_pb_holodisk_gvar = -1;
+static int at_pb_tab_moves = 0;
+static int at_pb_page_moves = 0;
+static bool at_pb_unequipped = false;
+static bool at_pb_equipped = false;
+static bool at_pb_used = false;
+static bool at_pb_dropped = false;
+static bool at_pb_inspected = false;
+static bool at_pb_skill_ok = false;
+static bool at_pb_perk_ok = false;
+static int at_pb_quests = 0;
+static int at_pb_quest_lines = 0;
+static int at_pb_holodisks = 0;
+static int at_pb_holodisk_lines = 0;
+static int at_pb_local_pixels = 0;
+static bool at_pb_local_player = false;
+static int at_pb_world_pixels = 0;
+static bool at_pb_world_drawn = false;
+static int at_pb_saved_maps = -1;
+static int at_pb_saved_pixels = 0;
+static bool at_pb_paused = false;
+static int at_pb_attacks = 0;
+static int at_pb_interactions = 0;
+static int at_pb_opens = 0;
+static int at_pb_tile = 0;
+
+// Persistence, checked after the save/load steps.
+static int at_pb_saved_skill_value = -1;
+static int at_pb_saved_perk_level = -1;
+static int at_pb_saved_weapon_pid = -1;
+static int at_pb_saved_unspent = -1;
+
+static bool at_pb_ready(unsigned int gap = 170)
+{
+    return SDL_GetTicks() - at_pb_last_press >= gap;
+}
+
+static void at_pb_tap(GamepadButton button)
+{
+    at_press(button);
+    at_pb_last_press = SDL_GetTicks();
+}
+
+static void at_pb_next(int phase)
+{
+    at_pb_phase = phase;
+    at_pb_tries = 0;
+    at_pb_phase_time = SDL_GetTicks();
+}
+
+static const RtPipboyState* at_pb()
+{
+    return rt_pipboy_get_state();
+}
+
+// Presses RT/LT until `tab` is shown; true once there.
+static bool at_pb_goto_tab(int tab)
+{
+    if (at_pb()->tab == tab) {
+        return true;
+    }
+    if (at_pb_ready()) {
+        at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+    }
+    return false;
+}
+
+static bool at_pb_goto_page(int page)
+{
+    if (at_pb()->page == page && at_pb()->mode == RT_PIPBOY_MODE_NONE) {
+        return true;
+    }
+    if (at_pb_ready()) {
+        at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    }
+    return false;
+}
+
+static bool at_pb_goto_item(Object* item)
+{
+    if (at_pb()->cursorItem == item) {
+        return true;
+    }
+    if (at_pb_ready() && at_pb_tries++ < 80) {
+        at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+    }
+    return false;
+}
+
+static bool at_pb_goto_choice(int choice)
+{
+    const RtPipboyState* state = at_pb();
+    if (state->choiceCursor < state->choiceCount && state->choices[state->choiceCursor] == choice) {
+        return true;
+    }
+    if (at_pb_ready() && at_pb_tries++ < 80) {
+        at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+    }
+    return false;
+}
+
+static int at_pb_stack(int pid)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    int quantity = 0;
+    for (int index = 0; index < inventory->length; index++) {
+        if (inventory->items[index].item->pid == pid) {
+            quantity += inventory->items[index].quantity;
+        }
+    }
+    return quantity;
+}
+
+// The largest unequipped stack of `pid`.
+static Object* at_pb_find_stack(int pid)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    Object* best = NULL;
+    int bestQuantity = 0;
+    for (int index = 0; index < inventory->length; index++) {
+        InventoryItem* entry = &(inventory->items[index]);
+        if (entry->item->pid == pid && (entry->item->flags & OBJECT_EQUIPPED) == 0 && entry->quantity > bestQuantity) {
+            best = entry->item;
+            bestQuantity = entry->quantity;
+        }
+    }
+    return best;
+}
+
+// The whole Pip-Boy, driven with controller buttons only.
+static bool at_menu_pipboy_script(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+
+    // Generous per-phase timeout: give up on the phase, move on.
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_log("pipboy script: phase %d timed out (tab %d page %d mode %d cursor %d)", at_pb_phase, state->tab, state->page, state->mode, state->cursor);
+        if (state->mode != RT_PIPBOY_MODE_NONE) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+        }
+        at_pb_next(at_pb_phase + 1);
+        return false;
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_pb_open_tab = state->tab;
+            at_pb_rt_time = rt_get_time();
+            at_pb_game_time = game_time();
+            // The stick held when B was pressed is let go in the menu.
+            at_pad.leftX = 0.0f;
+            at_pad.leftY = 0.0f;
+            at_pb_next(1);
+        }
+        break;
+    case 1: {
+        // RT then LT: one tab forward and back.
+        static int before;
+        if (at_pb_tries == 0 && at_pb_ready()) {
+            before = state->tab;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_tries = 1;
+        } else if (at_pb_tries == 1 && at_pb_ready(300)) {
+            if (state->tab == (before + 1) % RT_PIPBOY_TAB_COUNT) {
+                at_pb_tab_moves++;
+            }
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_tries = 2;
+        } else if (at_pb_tries == 2 && at_pb_ready(300)) {
+            if (state->tab == before) {
+                at_pb_tab_moves++;
+            }
+            at_pb_next(2);
+        }
+        break;
+    }
+    case 2:
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_INVENTORY)) {
+            at_pb_next(3);
+        }
+        break;
+    case 3: {
+        // RB then LB: one page forward and back.
+        static int before;
+        if (at_pb_tries == 0 && at_pb_ready()) {
+            before = state->page;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            at_pb_tries = 1;
+        } else if (at_pb_tries == 1 && at_pb_ready(300)) {
+            if (state->page == (before + 1) % 6) {
+                at_pb_page_moves++;
+            }
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_SHOULDER);
+            at_pb_tries = 2;
+        } else if (at_pb_tries == 2 && at_pb_ready(300)) {
+            if (state->page == before) {
+                at_pb_page_moves++;
+            }
+            at_pb_next(4);
+        }
+        break;
+    }
+    case 4:
+        // Weapons: equip the test pistol in the right hand.
+        if (at_pb_goto_page(1)) {
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_goto_item(at_pb_weapon) && at_pb_ready()) {
+            at_screenshot("pb_02_inventory");
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        if (state->mode == RT_PIPBOY_MODE_ACTIONS && at_pb_ready(250) && at_pb_goto_choice(RT_PIPBOY_ACTION_EQUIP_RIGHT) && at_pb_ready()) {
+            at_screenshot("pb_03_actions");
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(7);
+        }
+        break;
+    case 7:
+        if (at_pb_ready(400)) {
+            at_pb_equipped = inven_right_hand(obj_dude) == at_pb_weapon;
+            at_log("pipboy: equip right -> right hand %s", inven_right_hand(obj_dude) != NULL ? object_name(inven_right_hand(obj_dude)) : "empty");
+            at_pb_next(8);
+        }
+        break;
+    case 8:
+        // Put it away, then hold it again (kept for the save/load check).
+        if (at_pb_goto_item(at_pb_weapon) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        if (state->mode == RT_PIPBOY_MODE_ACTIONS && at_pb_ready(250) && at_pb_goto_choice(RT_PIPBOY_ACTION_UNEQUIP) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(10);
+        }
+        break;
+    case 10:
+        if (at_pb_ready(400)) {
+            // Back in the inventory (possibly merged with a pistol already carried).
+            at_pb_unequipped = inven_right_hand(obj_dude) == NULL && inven_rt_quantity(at_pb_weapon) >= 1
+                && (at_pb_weapon->flags & OBJECT_EQUIPPED) == 0;
+            at_pb_next(11);
+        }
+        break;
+    case 11:
+        if (at_pb_goto_item(at_pb_weapon) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(12);
+        }
+        break;
+    case 12:
+        if (state->mode == RT_PIPBOY_MODE_ACTIONS && at_pb_ready(250) && at_pb_goto_choice(RT_PIPBOY_ACTION_EQUIP_RIGHT) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(13);
+        }
+        break;
+    case 13:
+        // Inspect with Y, back with B.
+        if (at_pb_ready(400) && at_pb_goto_item(at_pb_weapon) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(14);
+        }
+        break;
+    case 14:
+        if (at_pb_ready(400)) {
+            at_pb_inspected = state->mode == RT_PIPBOY_MODE_TEXT && state->listCount > 0;
+            at_screenshot("pb_04_inspect");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(15);
+        }
+        break;
+    case 15:
+        // Aid: use a Stimpak.
+        if (at_pb_ready(300) && at_pb_goto_page(3)) {
+            at_pb_hp_before = critter_get_hits(obj_dude);
+            at_pb_stims_before = at_pb_stack(at_chem_pid);
+            at_pb_next(16);
+        }
+        break;
+    case 16: {
+        Object* stim = at_pb_find_stack(at_chem_pid);
+        if (stim != NULL && at_pb_goto_item(stim) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(17);
+        }
+        break;
+    }
+    case 17:
+        if (state->mode == RT_PIPBOY_MODE_ACTIONS && at_pb_ready(250) && at_pb_goto_choice(RT_PIPBOY_ACTION_USE) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(18);
+        }
+        break;
+    case 18:
+        if (at_pb_ready(500)) {
+            int hp = critter_get_hits(obj_dude);
+            int stims = at_pb_stack(at_chem_pid);
+            at_pb_used = hp > at_pb_hp_before && stims == at_pb_stims_before - 1;
+            at_log("pipboy: Stimpak HP %d -> %d, Stimpaks %d -> %d", at_pb_hp_before, hp, at_pb_stims_before, stims);
+            at_pb_next(19);
+        }
+        break;
+    case 19:
+        // Ammo: drop 2 of a stack with the quantity picker.
+        if (at_pb_goto_page(4)) {
+            at_pb_ammo = at_pb_ammo_pid != -1 ? at_pb_find_stack(at_pb_ammo_pid) : NULL;
+            at_pb_ammo_before = at_pb_ammo_pid != -1 ? at_pb_stack(at_pb_ammo_pid) : 0;
+            at_pb_next(at_pb_ammo != NULL && inven_rt_quantity(at_pb_ammo) >= 3 ? 20 : 24);
+        }
+        break;
+    case 20:
+        if (at_pb_goto_item(at_pb_ammo) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(21);
+        }
+        break;
+    case 21:
+        if (state->mode == RT_PIPBOY_MODE_QUANTITY && at_pb_ready(250)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_RIGHT);
+            at_pb_next(22);
+        }
+        break;
+    case 22:
+        if (at_pb_ready(300) && state->quantity == 2) {
+            at_screenshot("pb_05_quantity");
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(23);
+        }
+        break;
+    case 23:
+        if (at_pb_ready(500)) {
+            int after = at_pb_stack(at_pb_ammo_pid);
+            at_pb_dropped = after == at_pb_ammo_before - 2;
+            at_log("pipboy: ammo %d -> %d", at_pb_ammo_before, after);
+            at_pb_next(24);
+        }
+        break;
+    case 24:
+        // Stats: spend a skill point, undo it with X, spend it again.
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_STATS)) {
+            at_pb_next(25);
+        }
+        break;
+    case 25:
+        if (at_pb_goto_page(2) && at_pb_ready(300)) {
+            at_pb_skill = state->cursor;
+            at_pb_skill_before = skill_level(obj_dude, at_pb_skill);
+            at_pb_unspent_before = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(26);
+        }
+        break;
+    case 26:
+        if (at_pb_ready(300)) {
+            at_pb_skill_ok = skill_level(obj_dude, at_pb_skill) > at_pb_skill_before
+                && stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == at_pb_unspent_before - 1;
+            at_screenshot("pb_06_skills");
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(27);
+        }
+        break;
+    case 27:
+        if (at_pb_ready(300)) {
+            at_pb_skill_ok = at_pb_skill_ok
+                && skill_level(obj_dude, at_pb_skill) == at_pb_skill_before
+                && stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == at_pb_unspent_before;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(28);
+        }
+        break;
+    case 28:
+        // Perks: choose the perk that is due.
+        if (at_pb_ready(300) && at_pb_goto_page(3)) {
+            at_pb_next(29);
+        }
+        break;
+    case 29:
+        if (at_pb_ready(300)) {
+            if (!editor_rt_has_free_perk()) {
+                at_log("pipboy: no perk due");
+                at_pb_next(34);
+                break;
+            }
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(30);
+        }
+        break;
+    case 30:
+        if (state->mode == RT_PIPBOY_MODE_CHOOSE_PERK && at_pb_ready(300)) {
+            // A perk without follow-up choices.
+            at_pb_perk = -1;
+            for (int index = 0; index < state->choiceCount; index++) {
+                int perk = state->choices[index];
+                if (perk != PERK_TAG && perk != PERK_MUTATE) {
+                    at_pb_perk = perk;
+                    break;
+                }
+            }
+            at_screenshot("pb_07_perks");
+            at_pb_next(at_pb_perk != -1 ? 31 : 34);
+        }
+        break;
+    case 31:
+        if (at_pb_goto_choice(at_pb_perk) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(32);
+        }
+        break;
+    case 32:
+        if (state->mode == RT_PIPBOY_MODE_CONFIRM_PERK && at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(33);
+        }
+        break;
+    case 33:
+        if (at_pb_ready(400)) {
+            at_pb_perk_ok = perk_level(at_pb_perk) == 1 && !editor_rt_has_free_perk() && state->mode == RT_PIPBOY_MODE_NONE;
+            at_log("pipboy: perk %s level %d, still due=%d", perk_name(at_pb_perk), perk_level(at_pb_perk), editor_rt_has_free_perk());
+            at_pb_next(34);
+        }
+        break;
+    case 34:
+        if (at_pb_ready(300) && at_pb_goto_page(0)) {
+            at_screenshot("pb_01_stats");
+            at_pb_next(35);
+        }
+        break;
+    case 35:
+        // Map: live automap, saved automaps, world map.
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_MAP) && at_pb_goto_page(0) && at_pb_ready(500)) {
+            at_pb_local_pixels = state->mapPixels;
+            at_pb_local_player = state->mapPlayer;
+            at_screenshot("pb_08_map_local");
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(36);
+        }
+        break;
+    case 36:
+        if (at_pb_ready(300)) {
+            at_screenshot("pb_09_map_zoomed");
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(37);
+        }
+        break;
+    case 37:
+        if (at_pb_ready(300) && at_pb_goto_page(1) && at_pb_ready(300)) {
+            at_pb_saved_maps = state->listCount;
+            if (state->listCount > 0) {
+                at_pb_tap(GAMEPAD_BUTTON_A);
+                at_pb_next(38);
+            } else {
+                at_pb_next(40);
+            }
+        }
+        break;
+    case 38:
+        if (at_pb_ready(400)) {
+            at_pb_saved_pixels = state->mode == RT_PIPBOY_MODE_SAVED_MAP ? state->mapPixels : 0;
+            at_screenshot("pb_10_map_saved");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(40);
+        }
+        break;
+    case 40:
+        if (at_pb_ready(300) && at_pb_goto_page(2) && at_pb_ready(400)) {
+            at_pb_world_pixels = state->mapPixels;
+            at_pb_world_drawn = state->mapPlayer;
+            at_screenshot("pb_11_map_world");
+            at_pb_next(41);
+        }
+        break;
+    case 41:
+        // Data: quests and holodisks from the game variables.
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_DATA) && at_pb_goto_page(0) && at_pb_ready(400)) {
+            at_pb_quests = state->listCount;
+            if (state->listCount > 0) {
+                at_pb_tap(GAMEPAD_BUTTON_A);
+                at_pb_next(42);
+            } else {
+                at_pb_next(43);
+            }
+        }
+        break;
+    case 42:
+        if (at_pb_ready(400)) {
+            at_pb_quest_lines = state->mode == RT_PIPBOY_MODE_TEXT ? state->listCount : 0;
+            at_screenshot("pb_12_quests");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(43);
+        }
+        break;
+    case 43:
+        if (at_pb_ready(300) && at_pb_goto_page(1) && at_pb_ready(400)) {
+            at_pb_holodisks = state->listCount;
+            if (state->listCount > 0) {
+                at_pb_tap(GAMEPAD_BUTTON_A);
+                at_pb_next(44);
+            } else {
+                at_pb_next(45);
+            }
+        }
+        break;
+    case 44:
+        if (at_pb_ready(400)) {
+            at_pb_holodisk_lines = state->mode == RT_PIPBOY_MODE_TEXT ? state->listCount : 0;
+            at_screenshot("pb_13_holodisk");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(45);
+        }
+        break;
+    case 45:
+        if (at_pb_ready(300) && at_pb_goto_page(3) && at_pb_ready(400)) {
+            at_screenshot("pb_14_rest");
+            at_pb_next(46);
+        }
+        break;
+    case 46:
+        // Pressing A and RT here must not leak into gameplay; then B closes
+        // from the main page.
+        if (at_pb_ready(300)) {
+            at_pb_paused = rt_get_time() - at_pb_rt_time < 600 && game_time() == at_pb_game_time;
+            at_log("pipboy: open %u ms; simulation advanced %u ms, game time %u -> %u", SDL_GetTicks() - at_pb_phase_time,
+                rt_get_time() - at_pb_rt_time, at_pb_game_time, game_time());
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(47);
+        }
+        break;
+    case 47:
+        return true;
+    }
+    return false;
+}
+
+static bool step_pipboy(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_no_heal = true;
+        at_phase = 0;
+        return false;
+    }
+
+    switch (at_phase) {
+    case 0: {
+        // Fixtures: a pistol with spare ammo, Stimpaks, missing HP, a level
+        // with a perk due, a holodisk.
+        at_unarmed();
+        at_pb_weapon = at_create_weapon(6, -1, true, 1);
+        at_pb_ammo_pid = -1;
+        if (at_pb_weapon != NULL) {
+            Proto* proto;
+            if (proto_ptr(at_pb_weapon->pid, &proto) != -1) {
+                at_pb_ammo_pid = proto->item.data.weapon.ammoTypePid;
+            }
+        }
+
+        if (at_chem_pid == -1) {
+            for (int index = 1; index < 600 && at_chem_pid == -1; index++) {
+                int pid = (OBJ_TYPE_ITEM << 24) | index;
+                Proto* proto;
+                if (proto_ptr(pid, &proto) != -1 && proto->item.type == ITEM_TYPE_DRUG
+                    && SDL_strcasecmp(proto_name(pid), "Stimpak") == 0) {
+                    at_chem_pid = pid;
+                }
+            }
+        }
+        Object* chem;
+        Rect rect;
+        if (at_chem_pid != -1 && obj_pid_new(&chem, at_chem_pid) != -1 && item_add_force(obj_dude, chem, 2) == 0) {
+            obj_disconnect(chem, &rect);
+        }
+
+        critter_adjust_hits(obj_dude, -std::min(12, critter_get_hits(obj_dude) - 1));
+        intface_update_hit_points(false);
+
+        int level = stat_pc_get(PC_STAT_LEVEL);
+        if (level < 3) {
+            // Level 3 (3000 XP) brings skill points and a perk.
+            stat_pc_add_experience(3000 - stat_pc_get(PC_STAT_EXPERIENCE));
+        }
+
+        at_pb_holodisk_gvar = pipboy_rt_holodisk_gvar(0);
+        game_global_vars[at_pb_holodisk_gvar] = 1;
+
+        at_log("harness: Pip-Boy fixtures: weapon=%s ammo pid=%d stimpak pid=%d hp=%d level=%d->%d holodisk gvar %d",
+            at_pb_weapon != NULL ? object_name(at_pb_weapon) : "none", at_pb_ammo_pid, at_chem_pid,
+            critter_get_hits(obj_dude), level, stat_pc_get(PC_STAT_LEVEL), at_pb_holodisk_gvar);
+
+        at_pb_phase = 0;
+        at_pb_tries = 0;
+        at_pb_phase_time = SDL_GetTicks();
+        at_pb_attacks = rt_get_stats()->playerAttacks;
+        at_pb_interactions = rt_context_get_stats()->interactions;
+        at_pb_opens = rt_pipboy_get_state()->opens;
+
+        // Open with B while walking (the stick is still held when B is
+        // pressed).
+        at_stick_open_direction();
+        at_expect_menu("pb_00_open", at_menu_pipboy_script);
+        at_press(GAMEPAD_BUTTON_B);
+        at_phase = 1;
+        at_time_a = SDL_GetTicks();
+        break;
+    }
+    case 1:
+        // This runs in gameplay only: the Pip-Boy has closed.
+        if (at_menu_seen) {
+            at_stick_release();
+            at_pb_tile = obj_dude->tile;
+            at_time_a = SDL_GetTicks();
+            at_phase = 2;
+        } else if (SDL_GetTicks() - at_time_a > 5000) {
+            at_check(C_PB_TABS, false, "B did not open the Pip-Boy");
+            at_menu_expected = false;
+            at_no_heal = false;
+            return true;
+        }
+        break;
+    case 2:
+        if (SDL_GetTicks() - at_time_a < 1200) {
+            break;
+        }
+        {
+            const RtPipboyState* state = rt_pipboy_get_state();
+            int attacks = rt_get_stats()->playerAttacks - at_pb_attacks;
+            int interactions = rt_context_get_stats()->interactions - at_pb_interactions;
+            int opens = state->opens - at_pb_opens;
+            bool moved = obj_dude->tile != at_pb_tile;
+            at_check(C_PB_PAUSE, at_pb_paused, "simulation and game clock stopped while open=%d", at_pb_paused);
+            at_check(C_PB_NO_LEAK, attacks == 0 && interactions == 0 && opens == 1 && !moved && rt_get_lock() == NULL && !state->open,
+                "attacks=%d interactions=%d opens=%d moved after close=%d lock=%d still open=%d",
+                attacks, interactions, opens, moved, rt_get_lock() != NULL, state->open);
+            at_check(C_PB_TABS, at_pb_tab_moves == 2 && at_pb_page_moves == 2,
+                "RT/LT tab moves=%d of 2, RB/LB page moves=%d of 2", at_pb_tab_moves, at_pb_page_moves);
+            at_check(C_PB_EQUIP, at_pb_weapon != NULL && at_pb_equipped && at_pb_unequipped && inven_right_hand(obj_dude) == at_pb_weapon,
+                "equip right=%d, put away=%d, held again=%d", at_pb_equipped, at_pb_unequipped, inven_right_hand(obj_dude) == at_pb_weapon);
+            at_check(C_PB_USE, at_pb_used, "Stimpak used from the Pip-Boy (HP before %d, now %d)", at_pb_hp_before, critter_get_hits(obj_dude));
+            at_check(C_PB_DROP, at_pb_dropped && at_pb_inspected, "dropped 2 from a stack=%d, inspect text shown=%d", at_pb_dropped, at_pb_inspected);
+            at_check(C_PB_SKILL, at_pb_skill_ok, "%s: point spent, undone and spent again=%d (unspent before %d, now %d)",
+                at_pb_skill >= 0 ? skill_name(at_pb_skill) : "?", at_pb_skill_ok, at_pb_unspent_before, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS));
+            at_check(C_PB_PERK, at_pb_perk_ok, "perk %s chosen=%d", at_pb_perk >= 0 ? perk_name(at_pb_perk) : "none", at_pb_perk_ok);
+            {
+                // The world map shows exactly the cells the game has revealed.
+                int seenCells = 0;
+                for (int row = 0; row < WORLDMAP_RT_GRID_ROWS; row++) {
+                    for (int column = 0; column < WORLDMAP_RT_GRID_COLUMNS; column++) {
+                        if (worldmap_rt_cell(row, column) != 0) {
+                            seenCells++;
+                        }
+                    }
+                }
+                at_check(C_PB_MAP, at_pb_local_pixels > 0 && at_pb_local_player && (seenCells > 0) == (at_pb_world_pixels > 0) && at_pb_world_drawn
+                        && (at_pb_saved_maps <= 0 || at_pb_saved_pixels > 0),
+                    "local automap %d px, player marker=%d; saved automaps %d (%d px); world map drawn=%d, %d revealed cells, %d px shown",
+                    at_pb_local_pixels, at_pb_local_player, at_pb_saved_maps, at_pb_saved_pixels, at_pb_world_drawn, seenCells, at_pb_world_pixels);
+            }
+            at_check(C_PB_DATA, at_pb_quests > 0 && at_pb_quest_lines > 0 && at_pb_holodisks > 0 && at_pb_holodisk_lines > 0,
+                "quest locations %d (%d lines), holodisks %d (%d lines)", at_pb_quests, at_pb_quest_lines, at_pb_holodisks, at_pb_holodisk_lines);
+
+            at_pb_saved_skill_value = at_pb_skill >= 0 ? skill_level(obj_dude, at_pb_skill) : -1;
+            at_pb_saved_perk_level = at_pb_perk >= 0 ? perk_level(at_pb_perk) : -1;
+            at_pb_saved_weapon_pid = inven_right_hand(obj_dude) != NULL ? inven_right_hand(obj_dude)->pid : -1;
+            at_pb_saved_unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+        }
+        at_menu_expected = false;
+        at_no_heal = false;
+        at_phase = 3;
+        at_time_a = SDL_GetTicks();
+        break;
+    case 3:
+        // Reopen with B: the last tab (Data) comes back.
+        at_pb_opens = rt_pipboy_get_state()->opens;
+        at_expect_menu(NULL, NULL);
+        at_press(GAMEPAD_BUTTON_B);
+        at_phase = 4;
+        at_time_a = SDL_GetTicks();
+        at_pb_open_tab = -1;
+        break;
+    case 4:
+        if (rt_pipboy_get_state()->opens > at_pb_opens && at_pb_open_tab == -1) {
+            // Read in the menu loop by the default script; the state keeps
+            // the tab after closing.
+            at_pb_open_tab = rt_pipboy_get_state()->tab;
+        }
+        if (at_menu_seen && SDL_GetTicks() - at_time_a > 300) {
+            at_check(C_PB_REOPEN, rt_pipboy_get_state()->tab == RT_PIPBOY_TAB_DATA,
+                "reopened on tab %d (Data is %d)", rt_pipboy_get_state()->tab, RT_PIPBOY_TAB_DATA);
+            at_menu_expected = false;
+            return true;
+        }
+        if (SDL_GetTicks() - at_time_a > 5000) {
+            at_check(C_PB_REOPEN, false, "B did not reopen the Pip-Boy");
+            at_menu_expected = false;
+            return true;
+        }
+        break;
+    }
+
+    if (timedOut) {
+        at_no_heal = false;
+        at_menu_expected = false;
+    }
+    return false;
+}
+
+// Keyboard and HUD shortcuts (the HUD buttons send these keys) open the
+// Pip-Boy on the matching tab, never the old screens.
+static int at_pb_shortcut_tab = -1;
+static int at_pb_shortcut_page = -1;
+
+static bool at_menu_shortcut_script(unsigned int elapsed)
+{
+    if (elapsed > 600 && rt_pipboy_is_open()) {
+        at_pb_shortcut_tab = rt_pipboy_get_state()->tab;
+        at_pb_shortcut_page = rt_pipboy_get_state()->page;
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+    if (elapsed > 3000) {
+        // Some other screen: back out.
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+    return false;
+}
+
+static bool step_pipboy_shortcuts(unsigned int elapsed, bool first, bool timedOut)
+{
+    static const int keys[] = { KEY_LOWERCASE_I, KEY_LOWERCASE_C, KEY_TAB, KEY_LOWERCASE_P, KEY_LOWERCASE_Z };
+    static const int tabs[] = { RT_PIPBOY_TAB_INVENTORY, RT_PIPBOY_TAB_STATS, RT_PIPBOY_TAB_MAP, RT_PIPBOY_TAB_DATA, RT_PIPBOY_TAB_DATA };
+    static const int pages[] = { -1, -1, RT_PIPBOY_PAGE_MAP_LOCAL, -1, RT_PIPBOY_PAGE_DATA_REST };
+    static const char* names[] = { "i", "c", "Tab", "p", "z" };
+
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_count_a = 0;
+        at_count_b = 0;
+        at_time_a = 0;
+        at_tile_a = (int)now;
+        return false;
+    }
+
+    if (at_count_a >= 5) {
+        at_check(C_PB_SHORTCUTS, at_count_b == 5, "%d of 5 shortcuts opened the Pip-Boy on the right tab", at_count_b);
+        at_menu_expected = false;
+        return true;
+    }
+
+    if (at_time_a == 0) {
+        if (now - (unsigned int)at_tile_a < 700) {
+            return false;
+        }
+        at_pb_opens = rt_pipboy_get_state()->opens;
+        at_pb_shortcut_tab = -1;
+        at_pb_shortcut_page = -1;
+        at_expect_menu(NULL, at_menu_shortcut_script);
+        GNW_add_input_buffer(keys[at_count_a]);
+        at_time_a = now;
+        return false;
+    }
+
+    if ((at_menu_seen && at_menu_done && now - at_time_a > 300) || now - at_time_a > 6000) {
+        bool opened = rt_pipboy_get_state()->opens == at_pb_opens + 1;
+        bool tabOk = at_pb_shortcut_tab == tabs[at_count_a] && (pages[at_count_a] == -1 || at_pb_shortcut_page == pages[at_count_a]);
+        at_log("shortcut %s: Pip-Boy opened=%d tab %d page %d (expected %d/%d)",
+            names[at_count_a], opened, at_pb_shortcut_tab, at_pb_shortcut_page, tabs[at_count_a], pages[at_count_a]);
+        if (opened && tabOk) {
+            at_count_b++;
+        }
+        at_menu_expected = false;
+        at_count_a++;
+        at_time_a = 0;
+        at_tile_a = (int)now;
+    }
+    return false;
+}
+
+// After the save/load steps: what was changed in the Pip-Boy came back.
+static bool step_pipboy_persist(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!first) {
+        return true;
+    }
+
+    if (at_pb_saved_weapon_pid == -1 && at_pb_saved_skill_value == -1) {
+        at_check(C_PB_PERSIST, false, "the Pip-Boy step did not record anything");
+        return true;
+    }
+
+    int skill = at_pb_skill >= 0 ? skill_level(obj_dude, at_pb_skill) : -1;
+    int perk = at_pb_perk >= 0 ? perk_level(at_pb_perk) : -1;
+    int weapon = inven_right_hand(obj_dude) != NULL ? inven_right_hand(obj_dude)->pid : -1;
+    int unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+    at_check(C_PB_PERSIST,
+        skill == at_pb_saved_skill_value && perk == at_pb_saved_perk_level && weapon == at_pb_saved_weapon_pid && unspent == at_pb_saved_unspent,
+        "after load: skill %d (saved %d), perk level %d (saved %d), right hand pid %d (saved %d), unspent %d (saved %d)",
+        skill, at_pb_saved_skill_value, perk, at_pb_saved_perk_level, weapon, at_pb_saved_weapon_pid, unspent, at_pb_saved_unspent);
+    return true;
+}
+
+// After the map transition: the map left behind is in the saved automaps,
+// and the world map shows the land the game has revealed.
+static bool at_menu_pipboy_maps_script(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_log("pipboy maps script: phase %d timed out", at_pb_phase);
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        at_pb_next(at_pb_phase < 5 ? 5 : 9);
+        return false;
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_goto_page(1) && at_pb_ready(400)) {
+            at_pb_saved_maps = state->listCount;
+            if (state->listCount > 0) {
+                at_pb_tap(GAMEPAD_BUTTON_A);
+                at_pb_next(2);
+            } else {
+                at_pb_next(5);
+            }
+        }
+        break;
+    case 2:
+        if (at_pb_ready(400)) {
+            at_pb_saved_pixels = state->mode == RT_PIPBOY_MODE_SAVED_MAP ? state->mapPixels : 0;
+            at_screenshot("pb_10_map_saved");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(300) && at_pb_goto_page(2) && at_pb_ready(400)) {
+            at_pb_world_pixels = state->mapPixels;
+            at_pb_world_drawn = state->mapPlayer;
+            at_screenshot("pb_11_map_world");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        return true;
+    }
+    return false;
+}
+
+static bool step_pipboy_maps(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        // What entering the world map does: reveal the land around the party.
+        worldmap_rt_reveal_around_party();
+        at_pb_saved_maps = -1;
+        at_pb_saved_pixels = 0;
+        at_pb_world_pixels = 0;
+        at_pb_world_drawn = false;
+        at_pb_phase = 0;
+        at_pb_tries = 0;
+        at_pb_phase_time = SDL_GetTicks();
+        at_expect_menu(NULL, at_menu_pipboy_maps_script);
+        GNW_add_input_buffer(KEY_TAB);
+        return false;
+    }
+
+    if ((at_menu_seen && at_menu_done && elapsed > 300) || timedOut) {
+        at_check(C_PB_MAP_SAVED, at_pb_saved_maps > 0 && at_pb_saved_pixels > 0 && at_pb_world_drawn && at_pb_world_pixels > 0,
+            "saved automaps %d (shown %d px); world map drawn=%d with %d px of revealed land",
+            at_pb_saved_maps, at_pb_saved_pixels, at_pb_world_drawn, at_pb_world_pixels);
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -4523,7 +5481,7 @@ static const AtStep at_steps[] = {
     { "walk after exhaustion", step_exhausted, 5000 },
     { "AP regeneration", step_regen, 5000 },
     { "run again after new click", step_run_again, 5000 },
-    { "inventory (B)", step_inventory, 10000 },
+    { "Pip-Boy (B)", step_inventory, 10000 },
     { "D-pad screens", step_screens, 30000 },
     { "Y and LB", step_y_lb, 5000 },
     { "pause menu navigation", step_pause_menu, 15000 },
@@ -4553,9 +5511,13 @@ static const AtStep at_steps[] = {
     { "chems and no healing on A", step_chem, 30000 },
     { "controller disconnect", step_disconnect, 12000 },
     { "focus loss", step_focus, 12000 },
+    { "Pip-Boy shortcuts", step_pipboy_shortcuts, 40000 },
+    { "Pip-Boy tabs and actions", step_pipboy, 120000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
+    { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
     { "map transition", step_map_change, 30000 },
+    { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },
     { "camera edge scrolling (Vault 13)", step_camera_vault, 40000 },
 };

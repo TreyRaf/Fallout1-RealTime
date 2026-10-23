@@ -18,6 +18,7 @@
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/rt_pipboy.h"
 #include "game/queue.h"
 #include "game/roll.h"
 #include "game/skill.h"
@@ -1835,7 +1836,8 @@ int item_m_use_charged_item(Object* critter, Object* miscItem)
     } else if (pid == PROTO_ID_MOTION_SENSOR) {
         // NOTE: Uninline.
         if (item_m_dec_charges(miscItem) == 0) {
-            automap(true, true);
+            // RT: the motion sensor shows on the Pip-Boy map.
+            rt_pipboy_show_scanner();
         } else {
             MessageListItem messageListItem;
             // %s has no charges left.

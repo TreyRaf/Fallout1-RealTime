@@ -204,6 +204,7 @@ typedef struct InventoryCursorData {
 } InventoryCursorData;
 
 static int inventry_msg_load();
+static void inven_explosive_alert();
 static int inventry_msg_unload();
 static void display_inventory_info(Object* item, int quantity, unsigned char* dest, int pitch, bool a5);
 static void inven_update_lighting(Object* a1);
@@ -1277,42 +1278,47 @@ void exit_inventory(bool shouldEnableIso)
     gmouse_enable();
 
     if (dropped_explosive) {
-        Attack v1;
-        combat_ctd_init(&v1, obj_dude, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
-        v1.attackerFlags = DAM_HIT;
-        v1.tile = obj_dude->tile;
-        compute_explosion_on_extras(&v1, 0, 0, 1);
-
-        Object* v2 = NULL;
-        for (int index = 0; index < v1.extrasLength; index++) {
-            Object* critter = v1.extras[index];
-            if (critter != obj_dude
-                && critter->data.critter.combat.team != obj_dude->data.critter.combat.team
-                && stat_result(critter, STAT_PERCEPTION, 0, NULL) >= ROLL_SUCCESS) {
-                critter_set_who_hit_me(critter, obj_dude);
-
-                if (v2 == NULL) {
-                    v2 = critter;
-                }
-            }
-        }
-
-        if (v2 != NULL) {
-            if (!isInCombat()) {
-                STRUCT_664980 v3;
-                v3.attacker = v2;
-                v3.defender = obj_dude;
-                v3.actionPointsBonus = 0;
-                v3.accuracyBonus = 0;
-                v3.damageBonus = 0;
-                v3.minDamage = 0;
-                v3.maxDamage = INT_MAX;
-                v3.field_1C = 0;
-                scripts_request_combat(&v3);
-            }
-        }
-
+        inven_explosive_alert();
         dropped_explosive = false;
+    }
+}
+
+// Dropping an armed explosive alerts critters nearby that notice it.
+static void inven_explosive_alert()
+{
+    Attack v1;
+    combat_ctd_init(&v1, obj_dude, NULL, HIT_MODE_PUNCH, HIT_LOCATION_TORSO);
+    v1.attackerFlags = DAM_HIT;
+    v1.tile = obj_dude->tile;
+    compute_explosion_on_extras(&v1, 0, 0, 1);
+
+    Object* v2 = NULL;
+    for (int index = 0; index < v1.extrasLength; index++) {
+        Object* critter = v1.extras[index];
+        if (critter != obj_dude
+            && critter->data.critter.combat.team != obj_dude->data.critter.combat.team
+            && stat_result(critter, STAT_PERCEPTION, 0, NULL) >= ROLL_SUCCESS) {
+            critter_set_who_hit_me(critter, obj_dude);
+
+            if (v2 == NULL) {
+                v2 = critter;
+            }
+        }
+    }
+
+    if (v2 != NULL) {
+        if (!isInCombat()) {
+            STRUCT_664980 v3;
+            v3.attacker = v2;
+            v3.defender = obj_dude;
+            v3.actionPointsBonus = 0;
+            v3.accuracyBonus = 0;
+            v3.damageBonus = 0;
+            v3.minDamage = 0;
+            v3.maxDamage = INT_MAX;
+            v3.field_1C = 0;
+            scripts_request_combat(&v3);
+        }
     }
 }
 
@@ -5396,6 +5402,280 @@ int inven_set_timer(Object* a1)
     }
 
     return seconds;
+}
+
+
+// -----------------------------------------------------------------------------
+// RT: player inventory operations for the unified Pip-Boy (rt_pipboy.cc)
+// -----------------------------------------------------------------------------
+//
+// These work on the live inventory, where equipped items are entries carrying
+// OBJECT_IN_LEFT_HAND, OBJECT_IN_RIGHT_HAND or OBJECT_WORN (the state the
+// inventory screen restores on exit), with the same rules as the screen:
+// one item of a stack goes into a hand or is worn, armor bonuses follow
+// `adjust_ac`, used items follow `inven_action_cursor`.
+
+static int inven_rt_index(Object* item)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        if (inventory->items[index].item == item) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+int inven_rt_quantity(Object* item)
+{
+    int index = inven_rt_index(item);
+    return index != -1 ? obj_dude->data.inventory.items[index].quantity : 0;
+}
+
+// The player's sprite after equipment changes, as `adjust_fid` computes it
+// when the inventory screen closes, plus the interface.
+void inven_rt_refresh_appearance()
+{
+    int base = art_vault_guy_num;
+    Object* armor = inven_worn(obj_dude);
+    if (armor != NULL) {
+        Proto* proto;
+        proto_ptr(armor->pid, &proto);
+        int armorFid = stat_level(obj_dude, STAT_GENDER) == GENDER_FEMALE
+            ? proto->item.data.armor.femaleFid
+            : proto->item.data.armor.maleFid;
+        if (armorFid != -1) {
+            base = armorFid;
+        }
+    }
+
+    Object* active = intface_is_item_right_hand() ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
+    int animationCode = active != NULL && item_get_type(active) == ITEM_TYPE_WEAPON ? item_w_anim_code(active) : 0;
+
+    int fid = art_id(OBJ_TYPE_CRITTER, base, 0, animationCode, 0);
+    if (fid != obj_dude->fid) {
+        Rect rect;
+        obj_change_fid(obj_dude, fid, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+
+    intface_update_items(false);
+    intface_update_ac(false);
+    intface_update_hit_points(false);
+}
+
+int inven_rt_unequip(Object* item)
+{
+    int quantity = inven_rt_quantity(item);
+    if (quantity == 0 || (item->flags & OBJECT_EQUIPPED) == 0) {
+        return -1;
+    }
+
+    bool wasWorn = (item->flags & OBJECT_WORN) != 0;
+    if (item_remove_mult(obj_dude, item, quantity) != 0) {
+        return -1;
+    }
+
+    if (wasWorn) {
+        adjust_ac(obj_dude, item, NULL);
+    }
+
+    item_add_force(obj_dude, item, quantity);
+    inven_rt_refresh_appearance();
+    return 0;
+}
+
+int inven_rt_equip(Object* item, int slot)
+{
+    if (inven_rt_index(item) == -1) {
+        return -1;
+    }
+
+    if (slot == INVEN_RT_SLOT_ARMOR) {
+        if (item_get_type(item) != ITEM_TYPE_ARMOR) {
+            return -1;
+        }
+
+        Object* worn = inven_worn(obj_dude);
+        if (worn == item) {
+            return 0;
+        }
+        if (worn != NULL) {
+            inven_rt_unequip(worn);
+        }
+
+        // One item of the stack is worn.
+        if (item_remove_mult(obj_dude, item, 1) != 0) {
+            return -1;
+        }
+        item->flags |= OBJECT_WORN;
+        item_add_force(obj_dude, item, 1);
+        adjust_ac(obj_dude, NULL, item);
+        inven_rt_refresh_appearance();
+        return 0;
+    }
+
+    Object* current = slot == INVEN_RT_SLOT_LEFT_HAND ? inven_left_hand(obj_dude) : inven_right_hand(obj_dude);
+    if (current == item) {
+        return 0;
+    }
+
+    // From the other hand or from a stack: back to the inventory first.
+    if ((item->flags & OBJECT_EQUIPPED) != 0) {
+        inven_rt_unequip(item);
+    }
+    if (current != NULL) {
+        inven_rt_unequip(current);
+    }
+
+    if (inven_rt_index(item) == -1 || item_remove_mult(obj_dude, item, 1) != 0) {
+        return -1;
+    }
+    item->flags |= slot == INVEN_RT_SLOT_LEFT_HAND ? OBJECT_IN_LEFT_HAND : OBJECT_IN_RIGHT_HAND;
+    item_add_force(obj_dude, item, 1);
+    inven_rt_refresh_appearance();
+    return 0;
+}
+
+// Uses one item on the player. Returns 1 if it was used up, 0 if used, -1 if
+// nothing happened.
+int inven_rt_use(Object* item)
+{
+    int type = item_get_type(item);
+    bool inHand = (item->flags & OBJECT_IN_ANY_HAND) != 0;
+    int rc = -1;
+
+    switch (type) {
+    case ITEM_TYPE_DRUG:
+        if (item_d_take_drug(obj_dude, item)) {
+            item_remove_mult(obj_dude, item, 1);
+            obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
+            obj_destroy(item);
+            rc = 1;
+        } else {
+            rc = 0;
+        }
+        intface_update_hit_points(true);
+        break;
+    case ITEM_TYPE_WEAPON:
+    case ITEM_TYPE_MISC: {
+        if (!proto_action_can_use(item->pid) && !proto_action_can_use_on(item->pid)) {
+            return -1;
+        }
+
+        // Items not in a hand are taken out of their stack while used.
+        if (!inHand) {
+            item_remove_mult(obj_dude, item, 1);
+        }
+
+        int used;
+        if (proto_action_can_use(item->pid)) {
+            used = protinst_use_item(obj_dude, item);
+        } else {
+            used = protinst_use_item_on(obj_dude, obj_dude, item);
+        }
+
+        if (used == 1) {
+            if (inHand) {
+                item_remove_mult(obj_dude, item, 1);
+            }
+            obj_connect(item, obj_dude->tile, obj_dude->elevation, NULL);
+            obj_destroy(item);
+            rc = 1;
+        } else {
+            if (!inHand) {
+                item_add_force(obj_dude, item, 1);
+            }
+            rc = used == -1 ? -1 : 0;
+        }
+        break;
+    }
+    default:
+        return -1;
+    }
+
+    inven_rt_refresh_appearance();
+    return rc;
+}
+
+// Drops `quantity` items of the stack on the ground (equipped items are put
+// back into the inventory first). Caps are not handled here.
+int inven_rt_drop(Object* item, int quantity)
+{
+    if (item->pid == PROTO_ID_MONEY) {
+        return -1;
+    }
+
+    if ((item->flags & OBJECT_EQUIPPED) != 0) {
+        inven_rt_unequip(item);
+    }
+
+    int index = inven_rt_index(item);
+    if (index == -1) {
+        return -1;
+    }
+
+    Inventory* inventory = &(obj_dude->data.inventory);
+    int available = inventory->items[index].quantity;
+    if (quantity > available) {
+        quantity = available;
+    }
+
+    int pid = item->pid;
+    bool explosive = pid == PROTO_ID_DYNAMITE_II || pid == PROTO_ID_PLASTIC_EXPLOSIVES_II;
+
+    // As the inventory screen does: one at a time, each time from the stack.
+    int dropped = 0;
+    for (int count = 0; count < quantity; count++) {
+        if (index >= inventory->length) {
+            break;
+        }
+        Object* next = inventory->items[index].item;
+        if (next->pid != pid) {
+            break;
+        }
+        obj_drop(obj_dude, next);
+        dropped++;
+    }
+
+    if (explosive && dropped > 0) {
+        inven_explosive_alert();
+    }
+
+    inven_rt_refresh_appearance();
+    return dropped;
+}
+
+int inven_rt_unload(Object* weapon)
+{
+    if (item_get_type(weapon) != ITEM_TYPE_WEAPON || !item_w_can_unload(weapon)) {
+        return -1;
+    }
+
+    bool inHand = (weapon->flags & OBJECT_IN_ANY_HAND) != 0;
+    if (!inHand) {
+        item_remove_mult(obj_dude, weapon, 1);
+    }
+
+    int unloaded = 0;
+    for (;;) {
+        Object* ammo = item_w_unload(weapon);
+        if (ammo == NULL) {
+            break;
+        }
+
+        Rect rect;
+        obj_disconnect(ammo, &rect);
+        item_add_force(obj_dude, ammo, 1);
+        unloaded++;
+    }
+
+    if (!inHand) {
+        item_add_force(obj_dude, weapon, 1);
+    }
+
+    inven_rt_refresh_appearance();
+    return unloaded;
 }
 
 } // namespace fallout

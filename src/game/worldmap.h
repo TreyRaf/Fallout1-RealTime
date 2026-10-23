@@ -160,6 +160,18 @@ int worldmap_script_jump(int city, int a2);
 int xlate_mapidx_to_town(int map_idx);
 int PlayCityMapMusic();
 
+// RT: read-only world map state for the unified Pip-Boy (no travel).
+#define WORLDMAP_RT_GRID_ROWS 31
+#define WORLDMAP_RT_GRID_COLUMNS 29
+#define WORLDMAP_RT_CELL_SIZE 50
+#define WORLDMAP_RT_WIDTH 1400
+// 0 unexplored, 1 seen, 2 visited.
+int worldmap_rt_cell(int row, int column);
+void worldmap_rt_position(int* x, int* y);
+bool worldmap_rt_town_visited(int town);
+void worldmap_rt_town_position(int town, int* x, int* y);
+void worldmap_rt_reveal_around_party();
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_WORLDMAP_H_ */

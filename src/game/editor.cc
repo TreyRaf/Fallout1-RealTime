@@ -6209,4 +6209,129 @@ static int is_supper_bonus()
     return 0;
 }
 
+
+// -----------------------------------------------------------------------------
+// RT: character progression for the unified Pip-Boy (see rt_pipboy.cc)
+// -----------------------------------------------------------------------------
+
+// The level-up bookkeeping `UpdateLevel` does when the character screen
+// opens (skill points per level, perk every 3 or 4 levels), without the
+// screen. The perk itself is chosen with `editor_rt_take_perk`.
+void editor_rt_update_level()
+{
+    int level = stat_pc_get(PC_STAT_LEVEL);
+    if (level != last_level && level <= PC_LEVEL_MAX) {
+        for (int nextLevel = last_level + 1; nextLevel <= level; nextLevel++) {
+            int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+            sp += 5;
+            sp += stat_get_base(obj_dude, STAT_INTELLIGENCE) * 2;
+            sp += perk_level(PERK_EDUCATED) * 2;
+            if (trait_level(TRAIT_GIFTED)) {
+                sp -= 5;
+                if (sp < 0) {
+                    sp = 0;
+                }
+            }
+            if (sp > 99) {
+                sp = 99;
+            }
+
+            stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp);
+
+            // NOTE: Uninline.
+            int selectedPerksCount = PerkCount();
+            if (selectedPerksCount < 7) {
+                int progression = 3;
+                if (trait_level(TRAIT_SKILLED)) {
+                    progression += 1;
+                }
+
+                if (nextLevel % progression == 0) {
+                    free_perk = 1;
+                }
+            }
+        }
+    }
+
+    last_level = level;
+}
+
+bool editor_rt_has_free_perk()
+{
+    return free_perk != 0;
+}
+
+// Takes `perk` as the perk dialog does, with the same follow-ups: Tag! tags
+// `choiceA` as the 4th tag skill; Mutate! drops trait `choiceA` (one of the
+// current traits, or -1 with none) and adds trait `choiceB`; Lifegiver adds 4
+// hit points, Educated 2 skill points. Returns 0 on success.
+int editor_rt_take_perk(int perk, int choiceA, int choiceB)
+{
+    if (free_perk == 0) {
+        return -1;
+    }
+
+    int tagSkill = choiceA;
+    int trait1;
+    int trait2;
+    trait_get(&trait1, &trait2);
+    if (perk == PERK_MUTATE) {
+        bool hasTraits = trait1 != -1 || trait2 != -1;
+        if (choiceB < 0 || choiceB >= TRAIT_COUNT || choiceB == trait1 || choiceB == trait2) {
+            return -3;
+        }
+        if (hasTraits && (choiceA == -1 || (choiceA != trait1 && choiceA != trait2))) {
+            return -3;
+        }
+    }
+
+    int tagBefore = perk_level(PERK_TAG);
+    int lifegiverBefore = perk_level(PERK_LIFEGIVER);
+    int educatedBefore = perk_level(PERK_EDUCATED);
+
+    if (perk == PERK_TAG && tagBefore == 0) {
+        int tags[NUM_TAGGED_SKILLS];
+        skill_get_tags(tags, NUM_TAGGED_SKILLS);
+        if (tagSkill < 0 || tagSkill >= SKILL_COUNT
+            || tagSkill == tags[0] || tagSkill == tags[1] || tagSkill == tags[2] || tagSkill == tags[3]) {
+            return -3;
+        }
+    }
+
+    if (perk_add(perk) == -1) {
+        return -1;
+    }
+
+    if (perk == PERK_MUTATE) {
+        if (choiceA != -1 && choiceA == trait1) {
+            trait1 = trait2;
+            trait2 = -1;
+        } else if (choiceA != -1 && choiceA == trait2) {
+            trait2 = -1;
+        }
+        if (trait1 == -1) {
+            trait1 = choiceB;
+        } else {
+            trait2 = choiceB;
+        }
+        trait_set(trait1, trait2);
+        stat_recalc_derived(obj_dude);
+    } else     if (perk_level(PERK_TAG) != 0 && tagBefore == 0) {
+        int tags[NUM_TAGGED_SKILLS];
+        skill_get_tags(tags, NUM_TAGGED_SKILLS);
+        tags[3] = tagSkill;
+        skill_set_tags(tags, NUM_TAGGED_SKILLS);
+    } else if (perk_level(PERK_LIFEGIVER) != lifegiverBefore) {
+        int maxHp = stat_get_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+        stat_set_bonus(obj_dude, STAT_MAXIMUM_HIT_POINTS, maxHp + 4);
+        critter_adjust_hits(obj_dude, 4);
+    } else if (perk_level(PERK_EDUCATED) != educatedBefore) {
+        int sp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+        stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);
+    }
+
+    free_perk = 0;
+    return 0;
+}
+
 } // namespace fallout

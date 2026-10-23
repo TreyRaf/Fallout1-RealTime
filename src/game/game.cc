@@ -34,6 +34,7 @@
 #include "game/perk.h"
 #include "game/pipboy.h"
 #include "game/proto.h"
+#include "game/rt_pipboy.h"
 #include "game/queue.h"
 #include "game/roll.h"
 #include "game/scripts.h"
@@ -523,12 +524,19 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         gsound_play_sfx_file("ib1p1xx1");
         game_quit_with_confirm();
         break;
+    case RT_PIPBOY_KEY_OPEN:
+        // RT: B on the controller, the Pip-Boy on its last tab.
+        if (intface_is_enabled()) {
+            gsound_play_sfx_file("ib1p1xx1");
+            rt_pipboy_open(RT_PIPBOY_TAB_LAST, RT_PIPBOY_PAGE_DEFAULT);
+        }
+        break;
     case KEY_TAB:
         if (intface_is_enabled()
             && keys[SDL_SCANCODE_LALT] == 0
             && keys[SDL_SCANCODE_RALT] == 0) {
             gsound_play_sfx_file("ib1p1xx1");
-            automap(true, false);
+            rt_pipboy_open(RT_PIPBOY_TAB_MAP, RT_PIPBOY_PAGE_MAP_LOCAL);
         }
         break;
     case KEY_CTRL_P:
@@ -566,11 +574,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
     case KEY_LOWERCASE_C:
         if (intface_is_enabled()) {
             gsound_play_sfx_file("ib1p1xx1");
-            bool isoWasEnabled = map_disable_bk_processes();
-            editor_design(false);
-            if (isoWasEnabled) {
-                map_enable_bk_processes();
-            }
+            rt_pipboy_open(RT_PIPBOY_TAB_STATS, RT_PIPBOY_PAGE_DEFAULT);
         }
         break;
     case KEY_UPPERCASE_I:
@@ -578,7 +582,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
         // open inventory
         if (intface_is_enabled()) {
             gsound_play_sfx_file("ib1p1xx1");
-            handle_inventory();
+            rt_pipboy_open(RT_PIPBOY_TAB_INVENTORY, RT_PIPBOY_PAGE_DEFAULT);
         }
         break;
     case KEY_ESCAPE:
@@ -604,7 +608,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
                 dialog_out(title, NULL, 0, 192, 116, colorTable[32328], NULL, colorTable[32328], 0);
             } else {
                 gsound_play_sfx_file("ib1p1xx1");
-                pipboy(false);
+                rt_pipboy_open(RT_PIPBOY_TAB_DATA, RT_PIPBOY_PAGE_DEFAULT);
             }
         }
         break;
@@ -672,7 +676,7 @@ int game_handle_input(int eventCode, bool isInCombatMode)
                 dialog_out(title, NULL, 0, 192, 116, colorTable[32328], NULL, colorTable[32328], 0);
             } else {
                 gsound_play_sfx_file("ib1p1xx1");
-                pipboy(true);
+                rt_pipboy_open(RT_PIPBOY_TAB_DATA, RT_PIPBOY_PAGE_DATA_REST);
             }
         }
         break;

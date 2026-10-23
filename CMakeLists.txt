@@ -64,6 +64,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/realtime.h"
     "src/game/rt_context.cc"
     "src/game/rt_context.h"
+    "src/game/rt_pipboy.cc"
+    "src/game/rt_pipboy.h"
     "src/game/rt_autotest.cc"
     "src/game/rt_autotest.h"
     "src/game/config.cc"
