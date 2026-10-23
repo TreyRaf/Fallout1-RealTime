@@ -62,6 +62,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/combatai.h"
     "src/game/realtime.cc"
     "src/game/realtime.h"
+    "src/game/rt_context.cc"
+    "src/game/rt_context.h"
     "src/game/rt_autotest.cc"
     "src/game/rt_autotest.h"
     "src/game/config.cc"

@@ -18,6 +18,7 @@
 #include "game/party.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/realtime.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
 #include "game/tile.h"
@@ -916,6 +917,9 @@ void obj_render_post_roof(Rect* rect, int elevation)
         }
         objectListNode = objectListNode->next;
     }
+
+    // RT: lock-on indicator, on top of everything.
+    rt_render_overlay(back_buf, buf_full, &updatedRect);
 }
 
 // 0x47B878
@@ -1966,6 +1970,8 @@ int obj_erase_object(Object* object, Rect* rect)
     }
 
     gmouse_remove_item_outline(object);
+    // RT: the real-time layer forgets the object as well.
+    rt_object_erased(object);
 
     ObjectListNode* node;
     ObjectListNode* previousNode;

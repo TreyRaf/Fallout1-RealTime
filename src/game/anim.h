@@ -119,6 +119,8 @@ int register_clear(Object* a1);
 int register_end();
 int check_registry(Object* obj);
 bool anim_rt_is_locked(Object* obj, char* description, size_t size);
+int anim_rt_end_unprioritized(Object* obj);
+int anim_rt_end_all(Object* obj);
 int anim_busy(Object* a1);
 int register_object_move_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay);

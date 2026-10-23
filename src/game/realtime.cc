@@ -32,13 +32,18 @@
 #include "game/perk.h"
 #include "game/proto.h"
 #include "game/roll.h"
+#include "game/rt_context.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
 #include "platform_compat.h"
+#include "plib/color/color.h"
 #include "plib/gnw/gamepad.h"
+#include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
+#include "plib/gnw/svga.h"
+#include "plib/gnw/text.h"
 
 namespace fallout {
 
@@ -50,9 +55,34 @@ namespace fallout {
 
 #define RT_PENDING_ATTACK_TIMEOUT 6000
 #define RT_TARGET_MAX_DISTANCE 25
-#define RT_AHEAD_CONE_COS 0.5f
 #define RT_ATTACK_BUFFER_MS 1200
 #define RT_PLAYER_RECOVERY_MS 700
+// RT held this long after a press starts repeating (automatic weapons only).
+#define RT_HOLD_REPEAT_MS 250
+// Right stick target switching: candidates within 60 degrees of the flick.
+#define RT_SWITCH_CONE_COS 0.5f
+// Player attack slot: a waiting enemy that stops asking for this long (moved,
+// lost its shot) leaves the queue; a queue head that can't start its attack
+// for this long goes to the back so it never blocks the others.
+#define RT_SLOT_STALE_MS 1000
+// Queue entries count as ready to attack when they asked this recently.
+#define RT_SLOT_READY_MS 300
+#define RT_SLOT_HEAD_TIMEOUT_MS 1500
+// Reload without put-away/draw art: the weapon is busy this long instead.
+#define RT_RELOAD_FALLBACK_MS 1000
+// Right stick panning: time between scroll steps at full deflection.
+#define RT_CAMERA_PAN_STEP_MS 40
+// An RT press with a chem waits this long for an attack involving the player.
+#define RT_CHEM_BUFFER_MS 1500
+// A walk that hasn't moved a critter for this long is stalled.
+#define RT_MOVE_STALL_MS 1500
+// A reload press waits this long for an attack involving the player to end.
+#define RT_RELOAD_BUFFER_MS 1500
+
+// Results of `rt_reload`.
+#define RT_RELOAD_STARTED 0
+#define RT_RELOAD_WAIT 1
+#define RT_RELOAD_FAILED 2
 
 // Results of `rt_player_attack`.
 #define RT_PLAYER_ATTACK_STARTED 0
@@ -72,11 +102,20 @@ typedef struct RtCritterState {
     int moveTargetTile;
     unsigned int knockedDownAt;
     unsigned int lastDebugAt;
+    // Last time this critter was ready to attack the player (slot queue).
+    unsigned int slotRequestAt;
+    // Walk progress (see the stall check in `rt_ai_act`).
+    int progressTile;
+    unsigned int progressAt;
 } RtCritterState;
 
 typedef struct RtPendingAttack {
     Attack attack;
     unsigned int startedAt;
+    // Deaths decided by a critical hit effect rather than by the damage
+    // (attacker, defender, extras), see `rt_refresh_death_flags`.
+    bool criticalDeath[2 + EXPLOSION_TARGET_COUNT];
+    bool slowLogged;
 } RtPendingAttack;
 
 static void rt_init();
@@ -87,6 +126,9 @@ static bool rt_is_alive(Object* critter);
 static bool rt_is_player_team(Object* critter);
 static bool rt_obj_in_attack(Object* obj);
 static int rt_attack(Object* attacker, Object* defender, int hitMode);
+static void rt_note_critical_deaths(RtPendingAttack* pending);
+static void rt_stop_for_attack(Object* obj);
+static void rt_refresh_death_flags(RtPendingAttack* pending);
 static void rt_resolve_attacks();
 static void rt_engage(Object* critter, Object* target, const char* reason);
 static void rt_update_engagements();
@@ -108,16 +150,25 @@ static float rt_facing_cos(Object* obj, float fx, float fy);
 static bool rt_is_hostile_to_player(Object* critter);
 static bool rt_lock_is_valid(Object* target);
 static Object* rt_find_lock_candidate();
-static Object* rt_find_hostile_ahead();
 static void rt_set_lock(Object* target);
-static void rt_update_lock_marker();
+static bool rt_is_lock_candidate(Object* critter);
+static bool rt_screen_pos(Object* obj, int* x, int* y);
+static void rt_switch_lock(float dx, float dy);
+static void rt_update_indicator();
+static void rt_update_player_slot();
+static bool rt_player_slot_may_attack(Object* critter, RtCritterState* state);
+static int rt_reload_commit(void* a1, void* a2);
+static int rt_reload_finish(void* a1, void* a2);
+static void rt_update_reload();
+static bool rt_get_play_area(int* width, int* height);
 static bool rt_is_automatic(int hitMode);
+static void rt_update_chem_input(bool pressAttack, Object* chem);
 static void rt_update_attack_input(bool pressAttack);
 static int rt_player_attack(bool explicitPress);
 static int rt_player_hit_mode(int* hitMode);
 static Object* rt_find_interactable();
 static void rt_interact(Object* obj);
-static void rt_reload();
+static int rt_reload();
 static void rt_set_interact_highlight(Object* obj);
 static void rt_set_outline(Object** slot, Object* obj, int outlineType);
 static void rt_update_camera();
@@ -127,7 +178,8 @@ static int rt_hits(Object* obj);
 
 static bool rt_initialized = false;
 static bool rt_is_enabled = true;
-static bool rt_camera_follow = true;
+static bool rt_camera_edge_scroll = true;
+static int rt_camera_margin_pct = 25;
 static int rt_run_drain_ms = 400;
 static int rt_ap_regen_ms = 800;
 static int rt_ms_per_ap = 110;
@@ -154,14 +206,58 @@ static int rt_move_dir = -1;
 static bool rt_move_run = false;
 static int rt_move_dest = -1;
 static unsigned int rt_next_move_issue_at = 0;
+static int rt_move_progress_tile = -1;
+static unsigned int rt_move_progress_at = 0;
 static unsigned int rt_dude_next_attack_at = 0;
 static Object* rt_lock = NULL;
-static Object* rt_lock_marker = NULL;
+// Lock-on indicator: crosshair art plus hit chance, drawn over the map.
+static RtIndicator rt_indicator;
+static Rect rt_indicator_rect;
+// Camera position when the indicator was drawn: map scrolling shifts the
+// drawn screen (indicator included), so the old image moves with it.
+static int rt_indicator_ref_tile = -1;
+static int rt_indicator_ref_x = 0;
+static int rt_indicator_ref_y = 0;
+static bool rt_indicator_drawn = false;
+static unsigned char* rt_indicator_buf = NULL;
+static int rt_indicator_width = 0;
+static int rt_indicator_height = 0;
+static int rt_indicator_cross_width = 0;
+static int rt_indicator_cross_height = 0;
+static char rt_indicator_built_text[32] = "";
+static int rt_indicator_built_color = -1;
 static unsigned int rt_attack_buffered_until = 0;
 static bool rt_fire_hold = false;
+static unsigned int rt_fire_pressed_at = 0;
+// The attack of the latest RT press has started; only then can a hold repeat.
+static bool rt_fire_press_done = false;
 static unsigned int rt_player_recovery_until = 0;
 static Object* rt_interact_outlined = NULL;
-static int rt_last_camera_tile = -1;
+static Object* rt_interact_target = NULL;
+static int rt_last_camera_elevation = -1;
+static bool rt_camera_scrolling = false;
+// The right stick moved the view away from the player.
+static bool rt_camera_free = false;
+static unsigned int rt_camera_next_pan_at = 0;
+
+// Player attack slot: one committed enemy attack on the player at a time,
+// granted first come, first served.
+static Object* rt_slot_holder = NULL;
+static std::vector<Object*> rt_slot_queue;
+static unsigned int rt_slot_head_since = 0;
+static std::unordered_map<Object*, unsigned int> rt_slot_wait_start;
+
+// Reload in progress (holster, ammo transfer, draw).
+static bool rt_reload_active = false;
+static bool rt_reload_committed = false;
+static bool rt_reload_finished = false;
+static Object* rt_reload_weapon = NULL;
+static unsigned int rt_reload_until = 0;
+static unsigned int rt_reload_requested_until = 0;
+
+// Chem use with RT (see `rt_update_chem_input`).
+static bool rt_chem_active = false;
+static unsigned int rt_chem_requested_until = 0;
 
 bool rt_enabled()
 {
@@ -179,8 +275,11 @@ static void rt_init()
     if (config_get_value(&game_config, RT_CONFIG_SECTION, "enabled", &value)) {
         rt_is_enabled = value != 0;
     }
-    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_follow", &value)) {
-        rt_camera_follow = value != 0;
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_edge_scroll", &value)) {
+        rt_camera_edge_scroll = value != 0;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_margin_pct", &value) && value >= 5 && value <= 45) {
+        rt_camera_margin_pct = value;
     }
     if (config_get_value(&game_config, RT_CONFIG_SECTION, "run_drain_ms_per_ap", &value) && value > 0) {
         rt_run_drain_ms = value;
@@ -195,8 +294,8 @@ static void rt_init()
     rt_open_log();
 
     rt_log("Fallout1-RealTime: real-time layer %s", rt_is_enabled ? "ENABLED" : "disabled");
-    rt_log("config: camera_follow=%d run_drain_ms_per_ap=%d ap_regen_ms_per_ap=%d attack_cooldown_ms_per_ap=%d",
-        rt_camera_follow, rt_run_drain_ms, rt_ap_regen_ms, rt_ms_per_ap);
+    rt_log("config: camera_edge_scroll=%d camera_margin_pct=%d run_drain_ms_per_ap=%d ap_regen_ms_per_ap=%d attack_cooldown_ms_per_ap=%d",
+        rt_camera_edge_scroll, rt_camera_margin_pct, rt_run_drain_ms, rt_ap_regen_ms, rt_ms_per_ap);
     rt_log("controllers detected at startup: %d%s%s",
         gamepad_get_detected_count(),
         gamepad_get_detected_count() > 0 ? ", using: " : "",
@@ -312,19 +411,88 @@ void rt_reset()
     rt_move_active = false;
     rt_move_dir = -1;
     rt_move_dest = -1;
-    // The marker object is destroyed with the old map.
     rt_lock = NULL;
-    rt_lock_marker = NULL;
+    rt_indicator.visible = false;
+    rt_indicator_drawn = false;
     rt_attack_buffered_until = 0;
     rt_fire_hold = false;
+    rt_fire_press_done = false;
     rt_interact_outlined = NULL;
-    rt_last_camera_tile = -1;
+    rt_interact_target = NULL;
+    rt_last_camera_elevation = -1;
+    rt_camera_free = false;
+    rt_camera_scrolling = false;
+    rt_slot_holder = NULL;
+    rt_slot_queue.clear();
+    rt_slot_wait_start.clear();
+    // An unfinished reload never transferred ammo (that happens mid-sequence
+    // in an animation callback), so dropping it loses nothing.
+    rt_chem_active = false;
+    rt_chem_requested_until = 0;
+    rt_reload_requested_until = 0;
+    rt_reload_active = false;
+    rt_reload_weapon = NULL;
     rt_dude_next_attack_at = 0;
     rt_player_recovery_until = 0;
 
     gamepad_reset_gameplay_input();
 
     rt_log("reset (map load)");
+}
+
+void rt_object_erased(Object* obj)
+{
+    if (!rt_initialized || obj == NULL) {
+        return;
+    }
+
+    if (rt_interact_outlined == obj) {
+        rt_interact_outlined = NULL;
+    }
+    if (rt_interact_target == obj) {
+        rt_interact_target = NULL;
+    }
+    if (rt_lock == obj) {
+        rt_lock = NULL;
+        rt_fire_hold = false;
+        rt_attack_buffered_until = 0;
+        rt_log("lock: cleared (target removed)");
+    }
+    if (rt_reload_weapon == obj) {
+        rt_reload_weapon = NULL;
+    }
+    if (rt_slot_holder == obj) {
+        rt_slot_holder = NULL;
+    }
+    rt_slot_queue.erase(std::remove(rt_slot_queue.begin(), rt_slot_queue.end(), obj), rt_slot_queue.end());
+    rt_slot_wait_start.erase(obj);
+    rt_states.erase(obj);
+    for (auto& entry : rt_states) {
+        if (entry.second.target == obj) {
+            entry.second.engaged = false;
+            entry.second.target = NULL;
+        }
+    }
+    rt_critter_set.erase(obj);
+    rt_critters.erase(std::remove(rt_critters.begin(), rt_critters.end(), obj), rt_critters.end());
+
+    // Attacks involving it can't land any more.
+    for (size_t index = 0; index < rt_pending.size();) {
+        Attack* attack = &(rt_pending[index]->attack);
+        bool involved = attack->attacker == obj || attack->defender == obj;
+        for (int extra = 0; extra < attack->extrasLength && !involved; extra++) {
+            involved = attack->extras[extra] == obj;
+        }
+
+        if (involved) {
+            rt_log("attack dropped: participant removed");
+            rt_stats.attacksDropped++;
+            delete rt_pending[index];
+            rt_pending.erase(rt_pending.begin() + index);
+        } else {
+            index++;
+        }
+    }
 }
 
 const RtStats* rt_get_stats()
@@ -337,9 +505,46 @@ Object* rt_get_lock()
     return rt_lock;
 }
 
-Object* rt_get_lock_marker()
+const RtIndicator* rt_get_indicator()
 {
-    return rt_lock_marker;
+    return &rt_indicator;
+}
+
+bool rt_is_reloading()
+{
+    return rt_reload_active;
+}
+
+Object* rt_get_player_slot_holder()
+{
+    return rt_slot_holder;
+}
+
+int rt_get_player_slot_queue_length()
+{
+    return (int)rt_slot_queue.size();
+}
+
+Object* rt_get_interact_target()
+{
+    return rt_interact_target;
+}
+
+int rt_get_camera_margin_pct()
+{
+    return rt_camera_margin_pct;
+}
+
+int rt_get_player_slot_queue(Object** critters, int capacity)
+{
+    int count = 0;
+    for (Object* critter : rt_slot_queue) {
+        if (count >= capacity) {
+            break;
+        }
+        critters[count++] = critter;
+    }
+    return count;
 }
 
 bool rt_is_hostile(Object* critter)
@@ -378,7 +583,7 @@ void rt_tick()
         return;
     }
 
-    // Controller gameplay: no 3D map cursor, no edge scrolling.
+    // Controller gameplay: no 3D map cursor, no mouse edge scrolling.
     gmouse_set_rt_controller_mode(true);
 
     unsigned int realTick = SDL_GetTicks();
@@ -402,11 +607,13 @@ void rt_tick()
 
     rt_rebuild_critter_list();
     rt_resolve_attacks();
+    rt_update_player_slot();
     rt_update_engagements();
     rt_update_knockdowns();
     rt_update_dude((float)realDelta);
     rt_update_ai();
     rt_update_camera();
+    rt_update_indicator();
 }
 
 static void rt_rebuild_critter_list()
@@ -516,6 +723,16 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
         }
     }
 
+    // Attacker and targets stop what they were doing (a walk, a reload) for
+    // the attack, as they would be standing still in the original turn-based
+    // game. Otherwise the attack would only land once they stopped by
+    // themselves.
+    rt_stop_for_attack(attacker);
+    rt_stop_for_attack(defender);
+    for (int index = 0; index < attack->extrasLength; index++) {
+        rt_stop_for_attack(attack->extras[index]);
+    }
+
     if (action_attack(attack) == -1) {
         // An object is still in a prioritized animation sequence.
         static unsigned int lastLockLog = 0;
@@ -537,6 +754,15 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
         return RT_ATTACK_BUSY;
     }
 
+    if (defender == obj_dude) {
+        for (RtPendingAttack* other : rt_pending) {
+            if (other->attack.defender == obj_dude && other->attack.attacker != attacker) {
+                rt_stats.playerSlotOverlaps++;
+            }
+        }
+    }
+
+    rt_note_critical_deaths(pending);
     pending->startedAt = rt_now;
     rt_pending.push_back(pending);
 
@@ -544,6 +770,13 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
     if (attacker == obj_dude) {
         rt_stats.playerAttacks++;
         critter_set_who_hit_me(attacker, defender);
+
+        // Attacking someone who wasn't fighting (a neutral NPC) makes them and
+        // their nearby teammates hostile, hit or miss, as starting combat does
+        // in the original game. Locking on alone never gets here.
+        if (FID_TYPE(defender->fid) == OBJ_TYPE_CRITTER && !rt_is_hostile_to_player(defender)) {
+            rt_engage(defender, obj_dude, "attacked by player");
+        }
 
         switch (item_w_anim(attacker, attack->hitMode)) {
         case ANIM_THROW_PUNCH:
@@ -560,6 +793,9 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
         case ANIM_FIRE_BURST:
         case ANIM_FIRE_CONTINUOUS:
             rt_stats.playerBurst++;
+            break;
+        case ANIM_THROW_ANIM:
+            rt_stats.playerThrow++;
             break;
         default:
             rt_stats.playerOther++;
@@ -594,6 +830,85 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
     return 0;
 }
 
+static void rt_stop_for_attack(Object* obj)
+{
+    if (obj == NULL || FID_TYPE(obj->fid) != OBJ_TYPE_CRITTER || !anim_busy(obj)) {
+        return;
+    }
+
+    // Only walks, runs and the player's reload; anything else (standing up,
+    // dying) plays out.
+    int anim = FID_ANIM_TYPE(obj->fid);
+    bool reloading = obj == obj_dude && rt_reload_active;
+    if (anim != ANIM_WALK && anim != ANIM_RUNNING && !reloading) {
+        return;
+    }
+
+    // Only its own sequences: an attack it is already part of keeps playing.
+    if (anim_rt_end_unprioritized(obj) == 0) {
+        return;
+    }
+
+    if (obj == obj_dude) {
+        rt_move_active = false;
+    } else {
+        auto it = rt_states.find(obj);
+        if (it != rt_states.end()) {
+            it->second.moving = false;
+        }
+    }
+}
+
+// The vanilla attack calculation decides death up front: a hit that takes
+// the target to 0 hit points gets DAM_DEAD (see `check_for_death`), and
+// applying the damage later never kills by itself. In real time the hit lands
+// when its animation finishes, so hit points can change in between (healing,
+// another attack landing first). Deaths caused by the damage are therefore
+// re-decided when the hit lands; deaths from critical hit effects stand.
+static bool rt_death_by_damage(Object* obj, int damage)
+{
+    return obj != NULL && damage > 0 && critter_get_hits(obj) - damage <= 0;
+}
+
+static void rt_note_critical_deaths(RtPendingAttack* pending)
+{
+    Attack* attack = &(pending->attack);
+    pending->criticalDeath[0] = (attack->attackerFlags & DAM_DEAD) != 0 && !rt_death_by_damage(attack->attacker, attack->attackerDamage);
+    pending->criticalDeath[1] = (attack->defenderFlags & DAM_DEAD) != 0 && !rt_death_by_damage(attack->defender, attack->defenderDamage);
+    for (int index = 0; index < attack->extrasLength; index++) {
+        pending->criticalDeath[2 + index] = (attack->extrasFlags[index] & DAM_DEAD) != 0 && !rt_death_by_damage(attack->extras[index], attack->extrasDamage[index]);
+    }
+}
+
+static void rt_refresh_death_flag(Object* obj, int damage, int* flags, bool criticalDeath)
+{
+    // Same exclusions as `check_for_death`.
+    if (obj == NULL || FID_TYPE(obj->fid) != OBJ_TYPE_CRITTER || obj->pid == 0x1000008) {
+        return;
+    }
+
+    int before = *flags;
+    *flags &= ~DAM_DEAD;
+    if (criticalDeath || rt_death_by_damage(obj, damage)) {
+        *flags |= DAM_DEAD;
+    }
+
+    if (*flags != before) {
+        rt_log("death re-decided for %s: %s (hp %d, damage %d)",
+            critter_name(obj), (*flags & DAM_DEAD) != 0 ? "dies" : "survives", critter_get_hits(obj), damage);
+    }
+}
+
+static void rt_refresh_death_flags(RtPendingAttack* pending)
+{
+    Attack* attack = &(pending->attack);
+    rt_refresh_death_flag(attack->attacker, attack->attackerDamage, &(attack->attackerFlags), pending->criticalDeath[0]);
+    rt_refresh_death_flag(attack->defender, attack->defenderDamage, &(attack->defenderFlags), pending->criticalDeath[1]);
+    for (int index = 0; index < attack->extrasLength; index++) {
+        rt_refresh_death_flag(attack->extras[index], attack->extrasDamage[index], &(attack->extrasFlags[index]), pending->criticalDeath[2 + index]);
+    }
+}
+
 static void rt_resolve_attacks()
 {
     for (size_t index = 0; index < rt_pending.size();) {
@@ -605,14 +920,38 @@ static void rt_resolve_attacks()
         bool defenderValid = FID_TYPE(attack->defender->fid) != OBJ_TYPE_CRITTER || rt_is_known_critter(attack->defender);
         if (!rt_is_known_critter(attack->attacker) || !defenderValid) {
             rt_log("attack dropped: participant left the map");
+            rt_stats.attacksDropped++;
             delete pending;
             rt_pending.erase(rt_pending.begin() + index);
             continue;
         }
 
+        // A target that started walking meanwhile (e.g. moved by its script)
+        // stops to take the hit.
+        rt_stop_for_attack(attack->defender);
+        for (int extra = 0; extra < attack->extrasLength; extra++) {
+            if (rt_is_known_critter(attack->extras[extra])) {
+                rt_stop_for_attack(attack->extras[extra]);
+            }
+        }
+
         bool busy = anim_busy(attack->attacker) || anim_busy(attack->defender);
         for (int extra = 0; extra < attack->extrasLength && !busy; extra++) {
             busy = rt_is_known_critter(attack->extras[extra]) && anim_busy(attack->extras[extra]);
+        }
+
+        if (busy && !pending->slowLogged && rt_now - pending->startedAt > 2500) {
+            // Diagnostics: which participant keeps the attack from resolving.
+            pending->slowLogged = true;
+            rt_log("attack slow: %s -> %s, attacker busy=%d (anim %d), defender busy=%d (anim %d)",
+                critter_name(attack->attacker), rt_name(attack->defender),
+                anim_busy(attack->attacker) != 0, FID_ANIM_TYPE(attack->attacker->fid),
+                anim_busy(attack->defender) != 0, FID_ANIM_TYPE(attack->defender->fid));
+            for (int extra = 0; extra < attack->extrasLength; extra++) {
+                Object* obj = attack->extras[extra];
+                rt_log("attack slow: extra %s busy=%d (anim %d, dead %d)", rt_name(obj),
+                    rt_is_known_critter(obj) && anim_busy(obj) != 0, FID_ANIM_TYPE(obj->fid), !rt_is_alive(obj));
+            }
         }
 
         if (busy && rt_now - pending->startedAt < RT_PENDING_ATTACK_TIMEOUT) {
@@ -635,6 +974,9 @@ static void rt_resolve_attacks()
 
         bool defenderWasAlive = rt_is_alive(attack->defender);
         int defenderHpBefore = rt_hits(attack->defender);
+
+        // Death from damage depends on the hit points when the hit lands.
+        rt_refresh_death_flags(pending);
 
         combat_display(attack);
         apply_damage(attack, true);
@@ -1062,19 +1404,46 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
             state->moving = false;
         }
 
-        if (target == obj_dude && rt_now < rt_player_recovery_until) {
-            state->nextActionAt = rt_player_recovery_until + roll_random(0, 200);
-            return;
-        }
+        if (target == obj_dude) {
+            // Enemies ready to hit the player line up for the single attack
+            // slot. Waiting ones keep polling so their place stays valid.
+            bool mayAttack = rt_player_slot_may_attack(critter, state);
 
-        // The player gets the next window when an attack of theirs is waiting.
-        if (target == obj_dude && rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until) {
-            state->nextActionAt = rt_now + 150;
-            return;
+            if (rt_now < rt_player_recovery_until) {
+                state->nextActionAt = rt_now + 100;
+                return;
+            }
+
+            // The player gets the next window when an attack, a reload or a
+            // chem use of theirs is waiting.
+            if ((rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until)
+                || (rt_reload_requested_until != 0 && rt_now <= rt_reload_requested_until)
+                || (rt_chem_requested_until != 0 && rt_now <= rt_chem_requested_until)) {
+                state->nextActionAt = rt_now + 100;
+                return;
+            }
+
+            if (!mayAttack) {
+                rt_ai_debug(critter, state, "waiting for the player attack slot (queue %d)", (int)rt_slot_queue.size());
+                state->nextActionAt = rt_now + 100;
+                return;
+            }
         }
 
         int rc = rt_attack(critter, target, hitMode);
         if (rc == 0) {
+            if (target == obj_dude) {
+                rt_slot_holder = critter;
+                rt_slot_queue.erase(std::remove(rt_slot_queue.begin(), rt_slot_queue.end(), critter), rt_slot_queue.end());
+                unsigned int waited = rt_now - rt_slot_wait_start[critter];
+                rt_slot_wait_start.erase(critter);
+                if ((int)waited > rt_stats.playerSlotMaxWaitMs) {
+                    rt_stats.playerSlotMaxWaitMs = (int)waited;
+                }
+                rt_stats.playerSlotGrants++;
+                rt_slot_head_since = rt_now;
+                rt_log("slot: %s attacks the player (waited %u ms, %d queued)", critter_name(critter), waited, (int)rt_slot_queue.size());
+            }
             state->nextActionAt = rt_now + rt_attack_cooldown(critter, hitMode);
         } else if (rc == RT_ATTACK_BUSY) {
             rt_ai_debug(critter, state, "attack on %s busy", critter_name(target));
@@ -1090,6 +1459,22 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
         rt_ai_debug(critter, state, "can't attack %s (bad shot %d)", critter_name(target), shot);
         state->nextActionAt = rt_now + 1000;
         return;
+    }
+
+    // A walk that makes no progress is dropped and planned again: in real
+    // time two critters stepping toward each other can each wait for the
+    // other's next tile forever (turn-based play only ever moves one).
+    if (state->moving) {
+        if (critter->tile != state->progressTile) {
+            state->progressTile = critter->tile;
+            state->progressAt = rt_now;
+        } else if (rt_now - state->progressAt > RT_MOVE_STALL_MS) {
+            rt_log("ai: %s: walk stalled at tile %d, planning again", critter_name(critter), critter->tile);
+            anim_rt_end_unprioritized(critter);
+            state->moving = false;
+            state->nextActionAt = rt_now + roll_random(100, 400);
+            return;
+        }
     }
 
     // Keep the current path unless the target moved away from its end.
@@ -1129,7 +1514,113 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
     rt_ai_debug(critter, state, "moving towards %s (dist %d, steps %d, run %d)", critter_name(target), distance, steps, run);
     state->moving = true;
     state->moveTargetTile = target->tile;
+    state->progressTile = critter->tile;
+    state->progressAt = rt_now;
     state->nextActionAt = rt_now + 200;
+}
+
+// -----------------------------------------------------------------------------
+// Player attack slot
+// -----------------------------------------------------------------------------
+
+// Marks `critter` as ready to attack the player and tells whether it may do
+// so now: the slot must be free and every enemy that queued earlier and is
+// still ready goes first.
+static bool rt_player_slot_may_attack(Object* critter, RtCritterState* state)
+{
+    state->slotRequestAt = rt_now;
+
+    if (std::find(rt_slot_queue.begin(), rt_slot_queue.end(), critter) == rt_slot_queue.end()) {
+        if (rt_slot_queue.empty()) {
+            rt_slot_head_since = rt_now;
+        }
+        rt_slot_queue.push_back(critter);
+        rt_slot_wait_start[critter] = rt_now;
+        if ((int)rt_slot_queue.size() > rt_stats.playerSlotMaxQueue) {
+            rt_stats.playerSlotMaxQueue = (int)rt_slot_queue.size();
+        }
+    }
+
+    if (rt_slot_holder != NULL && rt_slot_holder != critter) {
+        return false;
+    }
+
+    // Entries that are not ready right now (e.g. stepping back into range)
+    // don't hold up the ones behind them.
+    for (Object* queued : rt_slot_queue) {
+        if (queued == critter) {
+            return true;
+        }
+
+        auto it = rt_states.find(queued);
+        if (it != rt_states.end() && rt_now - it->second.slotRequestAt <= RT_SLOT_READY_MS) {
+            return false;
+        }
+    }
+
+    return false;
+}
+
+static void rt_update_player_slot()
+{
+    // The slot is released when the holder's attack on the player resolved
+    // (after its animation) or was dropped (attacker died or left the map).
+    if (rt_slot_holder != NULL) {
+        bool active = false;
+        for (RtPendingAttack* pending : rt_pending) {
+            if (pending->attack.attacker == rt_slot_holder && pending->attack.defender == obj_dude) {
+                active = true;
+                break;
+            }
+        }
+
+        if (!active) {
+            rt_log("slot: released by %s", rt_is_known_critter(rt_slot_holder) ? critter_name(rt_slot_holder) : "(gone)");
+            rt_slot_holder = NULL;
+            rt_slot_head_since = rt_now;
+        }
+    }
+
+    Object* head = rt_slot_queue.empty() ? NULL : rt_slot_queue.front();
+
+    for (size_t index = 0; index < rt_slot_queue.size();) {
+        Object* queued = rt_slot_queue[index];
+        bool keep = rt_is_known_critter(queued) && rt_is_alive(queued);
+        if (keep) {
+            auto it = rt_states.find(queued);
+            keep = it != rt_states.end()
+                && it->second.engaged
+                && it->second.target == obj_dude
+                && rt_now - it->second.slotRequestAt <= RT_SLOT_STALE_MS;
+        }
+
+        if (keep) {
+            index++;
+        } else {
+            rt_slot_wait_start.erase(queued);
+            rt_slot_queue.erase(rt_slot_queue.begin() + index);
+        }
+    }
+
+    if (rt_slot_queue.empty()) {
+        return;
+    }
+
+    if (rt_slot_queue.front() != head) {
+        rt_slot_head_since = rt_now;
+    }
+
+    // A head that can't start its attack (its animation is blocked, etc.)
+    // moves to the back instead of stalling everyone.
+    if (rt_slot_holder == NULL
+        && rt_slot_queue.size() > 1
+        && rt_now - rt_slot_head_since > RT_SLOT_HEAD_TIMEOUT_MS) {
+        Object* stuck = rt_slot_queue.front();
+        rt_slot_queue.erase(rt_slot_queue.begin());
+        rt_slot_queue.push_back(stuck);
+        rt_slot_head_since = rt_now;
+        rt_log("slot: %s could not attack in time, moved to the back", critter_name(stuck));
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1194,13 +1685,24 @@ static void rt_update_dude(float dtMs)
     // Y is reserved; R3 is unused.
     gamepad_consume_press(GAMEPAD_BUTTON_Y);
     gamepad_consume_press(GAMEPAD_BUTTON_RIGHT_STICK);
+    float flickX;
+    float flickY;
+    bool flick = gamepad_consume_flick(&flickX, &flickY);
 
     // The lock follows its target and drops it when it becomes invalid.
     if (rt_lock != NULL && !rt_lock_is_valid(rt_lock)) {
         rt_log("lock: cleared (%s)", rt_is_known_critter(rt_lock) && !rt_is_alive(rt_lock) ? "target died" : "target invalid");
         rt_set_lock(NULL);
     }
-    rt_update_lock_marker();
+
+    rt_update_reload();
+
+    // A chem use ends with its animation.
+    if (rt_chem_active && !anim_busy(obj_dude)) {
+        rt_chem_active = false;
+        intface_update_items(false);
+        intface_update_hit_points(false);
+    }
 
     if (pressStart) {
         // Pause menu (vanilla options window); handled on the next frame.
@@ -1219,7 +1721,11 @@ static void rt_update_dude(float dtMs)
         GNW_add_input_buffer(KEY_LOWERCASE_I);
     }
     if (pressRB) {
-        GNW_add_input_buffer(KEY_LOWERCASE_B);
+        if (rt_reload_active) {
+            rt_log("input: RB ignored while reloading");
+        } else {
+            GNW_add_input_buffer(KEY_LOWERCASE_B);
+        }
     }
     if (pressBack) {
         GNW_add_input_buffer(KEY_LOWERCASE_N);
@@ -1265,23 +1771,40 @@ static void rt_update_dude(float dtMs)
             if (target != NULL) {
                 rt_set_lock(target);
             } else {
-                rt_print("No hostile target nearby.");
+                rt_print("No target nearby.");
             }
         }
     }
 
+    if (flick) {
+        if (rt_lock != NULL) {
+            rt_switch_lock(flickX, flickY);
+        }
+    }
+
     if (pressX) {
-        rt_reload();
+        rt_reload_requested_until = rt_now + RT_RELOAD_BUFFER_MS;
+    }
+    if (rt_reload_requested_until != 0) {
+        if (rt_reload() != RT_RELOAD_WAIT) {
+            rt_reload_requested_until = 0;
+        } else if (rt_now > rt_reload_requested_until) {
+            rt_reload_requested_until = 0;
+            rt_print("You can't reload right now.");
+        }
     }
 
     rt_update_attack_input(pressAttack);
 
     // Interaction.
     Object* interactable = rt_find_interactable();
+    rt_interact_target = interactable;
     rt_set_interact_highlight(interactable);
 
     if (pressA) {
-        if (interactable != NULL) {
+        if (rt_reload_active) {
+            rt_log("interact: ignored while reloading");
+        } else if (interactable != NULL) {
             rt_interact(interactable);
         } else {
             rt_log("interact: nothing nearby");
@@ -1435,7 +1958,15 @@ static void rt_update_movement(bool canAct)
     gamepad_get_move_stick(&stickX, &stickY);
     bool stick = stickX != 0.0f || stickY != 0.0f;
 
-    if (!canAct || rt_obj_in_attack(obj_dude)) {
+    // No walking during a reload: the holster and draw animations play in place.
+    if (!canAct || rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active) {
+        if (stick) {
+            static unsigned int lastBlockedLog = 0;
+            if (rt_now - lastBlockedLog >= 500) {
+                lastBlockedLog = rt_now;
+                rt_log("move: held off (can act=%d, in attack=%d, reloading=%d)", canAct, rt_obj_in_attack(obj_dude), rt_reload_active);
+            }
+        }
         rt_move_active = false;
         return;
     }
@@ -1477,10 +2008,23 @@ static void rt_update_movement(bool canAct)
 
     // Only re-path when something changed or the current path ended: one
     // movement request at a time, no needless animation restarts.
+    // A walk that stopped making progress (blocked by a critter that is
+    // itself waiting) is planned again.
+    if (obj_dude->tile != rt_move_progress_tile) {
+        rt_move_progress_tile = obj_dude->tile;
+        rt_move_progress_at = rt_now;
+    }
+    bool stalled = rt_move_active && busy && rt_now - rt_move_progress_at > RT_MOVE_STALL_MS;
+    if (stalled) {
+        rt_log("move: stalled at tile %d, planning again", obj_dude->tile);
+        rt_move_progress_at = rt_now;
+    }
+
     bool needIssue = !rt_move_active
         || dir != rt_move_dir
         || wantRun != rt_move_run
-        || !busy;
+        || !busy
+        || stalled;
 
     if (!needIssue || rt_now < rt_next_move_issue_at) {
         return;
@@ -1506,6 +2050,7 @@ static void rt_update_movement(bool canAct)
     }
 
     if (dest == -1) {
+        rt_log("move: no free tile toward direction %d", dir);
         // Blocked: just face the requested direction.
         if (!busy && obj_dude->rotation != dir) {
             Rect rect;
@@ -1542,6 +2087,8 @@ static void rt_update_movement(bool canAct)
     rt_move_dir = dir;
     rt_move_run = wantRun;
     rt_move_dest = dest;
+    rt_move_progress_tile = obj_dude->tile;
+    rt_move_progress_at = rt_now;
     rt_next_move_issue_at = rt_now + 80;
     rt_stats.moveRequests++;
 }
@@ -1582,24 +2129,69 @@ static bool rt_lock_is_valid(Object* target)
         && obj_dist(obj_dude, target) <= RT_DISENGAGE_DISTANCE;
 }
 
+// The visible gameplay area: the map window above the interface bar.
+static bool rt_get_play_area(int* width, int* height)
+{
+    *width = scr_size.lrx - scr_size.ulx + 1;
+    *height = scr_size.lry - scr_size.uly + 1 - INTERFACE_BAR_HEIGHT;
+    return *width > 0 && *height > 0;
+}
+
+// Screen position of the center of the object's hex; true if it is inside
+// the gameplay area.
+static bool rt_screen_pos(Object* obj, int* x, int* y)
+{
+    if (tile_coord(obj->tile, x, y, obj->elevation) != 0) {
+        return false;
+    }
+
+    *x += 16;
+    *y += 8;
+
+    int width;
+    int height;
+    if (!rt_get_play_area(&width, &height)) {
+        return false;
+    }
+
+    return *x >= 0 && *x < width && *y >= 0 && *y < height;
+}
+
+// Enemies and neutral NPCs that are close and on screen can be locked.
+// Companions never can.
+static bool rt_is_lock_candidate(Object* critter)
+{
+    if (critter == obj_dude || !rt_lock_is_valid(critter)) {
+        return false;
+    }
+
+    if (obj_dist(obj_dude, critter) > RT_TARGET_MAX_DISTANCE) {
+        return false;
+    }
+
+    int x;
+    int y;
+    return rt_screen_pos(critter, &x, &y);
+}
+
 static Object* rt_find_lock_candidate()
 {
-    // Nearest living hostile; ones in plain view win over blocked ones.
+    // The nearest enemy; the nearest neutral NPC only when no enemy is
+    // around. Targets in plain view win over blocked ones.
     Object* best = NULL;
     int bestScore = 0;
     for (Object* critter : rt_critters) {
-        if (!rt_is_hostile_to_player(critter) || (critter->flags & OBJECT_HIDDEN) != 0) {
+        if (!rt_is_lock_candidate(critter)) {
             continue;
         }
 
-        int distance = obj_dist(obj_dude, critter);
-        if (distance > RT_TARGET_MAX_DISTANCE) {
-            continue;
-        }
-
-        int score = distance;
+        int score = obj_dist(obj_dude, critter);
         if (combat_is_shot_blocked(obj_dude, obj_dude->tile, critter->tile, critter, NULL)) {
             score += 100;
+        }
+
+        if (!rt_is_hostile_to_player(critter)) {
+            score += 1000;
         }
 
         if (best == NULL || score < bestScore) {
@@ -1611,40 +2203,54 @@ static Object* rt_find_lock_candidate()
     return best;
 }
 
-static Object* rt_find_hostile_ahead()
+// Moves the lock to the nearest candidate in the flicked screen direction,
+// or keeps it when there is none.
+static void rt_switch_lock(float fx, float fy)
 {
-    float fx;
-    float fy;
-    if (!rt_facing_vector(&fx, &fy)) {
-        return NULL;
-    }
+    int cx;
+    int cy;
+    rt_screen_pos(rt_lock, &cx, &cy);
 
     Object* best = NULL;
-    int bestDistance = 0;
+    float bestScore = 0.0f;
     for (Object* critter : rt_critters) {
-        if (!rt_is_hostile_to_player(critter) || (critter->flags & OBJECT_HIDDEN) != 0) {
+        if (critter == rt_lock || !rt_is_lock_candidate(critter)) {
             continue;
         }
 
-        int distance = obj_dist(obj_dude, critter);
-        if (distance > RT_TARGET_MAX_DISTANCE) {
+        int x;
+        int y;
+        rt_screen_pos(critter, &x, &y);
+
+        float dx = (float)(x - cx);
+        float dy = (float)(y - cy);
+        float length = sqrtf(dx * dx + dy * dy);
+        if (length < 1.0f) {
             continue;
         }
 
-        // Directly ahead: within about 60 degrees of the facing direction.
-        // Adjacent enemies count as ahead when the player isn't steering.
-        float facing = rt_facing_cos(critter, fx, fy);
-        if (facing < RT_AHEAD_CONE_COS && distance > 1) {
+        float cosine = (dx * fx + dy * fy) / length;
+        if (cosine < RT_SWITCH_CONE_COS) {
             continue;
         }
 
-        if (best == NULL || distance < bestDistance) {
+        // Close targets well aligned with the flick win.
+        float score = length * (2.0f - cosine);
+        if (best == NULL || score < bestScore) {
             best = critter;
-            bestDistance = distance;
+            bestScore = score;
         }
     }
 
-    return best;
+    if (best == NULL) {
+        rt_stats.lockSwitchMisses++;
+        rt_log("lock: no target in direction (%.2f, %.2f), keeping %s", fx, fy, critter_name(rt_lock));
+        return;
+    }
+
+    rt_stats.lockSwitches++;
+    rt_log("lock: switch (%.2f, %.2f)", fx, fy);
+    rt_set_lock(best);
 }
 
 static void rt_set_lock(Object* target)
@@ -1653,9 +2259,10 @@ static void rt_set_lock(Object* target)
         return;
     }
 
+    // Held fire and a buffered press never carry over to another target.
     rt_lock = target;
     rt_fire_hold = false;
-    rt_update_lock_marker();
+    rt_attack_buffered_until = 0;
 
     if (target == NULL) {
         rt_log("lock: none");
@@ -1664,16 +2271,11 @@ static void rt_set_lock(Object* target)
 
     rt_stats.locks++;
 
-    int hitMode;
-    if (rt_player_hit_mode(&hitMode) == 0) {
-        // Vanilla hit chance, the same value the attack roll uses.
-        int toHit = determine_to_hit(obj_dude, target, HIT_LOCATION_UNCALLED, hitMode);
-        rt_print("Locked: %s (%d%% to hit)", critter_name(target), toHit);
-    } else {
-        rt_print("Locked: %s", critter_name(target));
-    }
-    rt_log("lock: %s at distance %d", critter_name(target), obj_dist(obj_dude, target));
+    bool hostile = rt_is_hostile_to_player(target);
+    rt_print("Locked: %s%s", critter_name(target), hostile ? "" : " (not hostile)");
+    rt_log("lock: %s at distance %d (%s)", critter_name(target), obj_dist(obj_dude, target), hostile ? "hostile" : "neutral");
 
+    // Turning to face the target is not an attack and alerts no one.
     if (!anim_busy(obj_dude) && !rt_obj_in_attack(obj_dude)) {
         register_begin(ANIMATION_REQUEST_RESERVED);
         register_object_turn_towards(obj_dude, target->tile);
@@ -1681,48 +2283,192 @@ static void rt_set_lock(Object* target)
     }
 }
 
-// The red hex marker: the same flat hex art and red outline as the vanilla
-// 3D mouse cursor, placed under the locked target.
-static void rt_update_lock_marker()
-{
-    Rect rect;
+// -----------------------------------------------------------------------------
+// Lock-on indicator
+// -----------------------------------------------------------------------------
 
-    if (rt_lock == NULL) {
-        if (rt_lock_marker != NULL && (rt_lock_marker->flags & OBJECT_HIDDEN) == 0) {
-            if (obj_turn_off(rt_lock_marker, &rect) == 0) {
-                tile_refresh_rect(&rect, rt_lock_marker->elevation);
+// The original crosshair cursor art with the hit chance to its right, as the
+// vanilla combat cursor shows it (see `gmouse_3d_build_to_hit_frame`).
+static bool rt_indicator_build(const char* text, int color)
+{
+    if (rt_indicator_buf == NULL) {
+        CacheEntry* handle;
+        Art* art = art_ptr_lock(gmouse_get_crosshair_fid(), &handle);
+        if (art == NULL) {
+            return false;
+        }
+
+        rt_indicator_cross_width = art_frame_width(art, 0, 0);
+        rt_indicator_cross_height = art_frame_length(art, 0, 0);
+        art_ptr_unlock(handle);
+
+        int oldFont = text_curr();
+        text_font(101);
+        int textHeight = text_height();
+        text_font(oldFont);
+
+        rt_indicator_width = rt_indicator_cross_width + 90;
+        rt_indicator_height = std::max(rt_indicator_cross_height, textHeight + 2);
+        rt_indicator_buf = new unsigned char[rt_indicator_width * rt_indicator_height];
+        rt_indicator_built_color = -1;
+    }
+
+    if (color == rt_indicator_built_color && strcmp(text, rt_indicator_built_text) == 0) {
+        return true;
+    }
+
+    memset(rt_indicator_buf, 0, rt_indicator_width * rt_indicator_height);
+
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(gmouse_get_crosshair_fid(), &handle);
+    if (art == NULL) {
+        return false;
+    }
+
+    buf_to_buf(art_frame_data(art, 0, 0),
+        rt_indicator_cross_width,
+        rt_indicator_cross_height,
+        rt_indicator_cross_width,
+        rt_indicator_buf + rt_indicator_width * ((rt_indicator_height - rt_indicator_cross_height) / 2),
+        rt_indicator_width);
+    art_ptr_unlock(handle);
+
+    int oldFont = text_curr();
+    text_font(101);
+    int textY = (rt_indicator_height - text_height()) / 2;
+    int textX = rt_indicator_cross_width + 2;
+    text_to_buf(rt_indicator_buf + rt_indicator_width * textY + textX,
+        text,
+        rt_indicator_width - textX - 1,
+        rt_indicator_width,
+        color);
+    buf_outline(rt_indicator_buf + rt_indicator_cross_width,
+        rt_indicator_width - rt_indicator_cross_width,
+        rt_indicator_height,
+        rt_indicator_width,
+        colorTable[0]);
+    text_font(oldFont);
+
+    SDL_strlcpy(rt_indicator_built_text, text, sizeof(rt_indicator_built_text));
+    rt_indicator_built_color = color;
+    return true;
+}
+
+static void rt_update_indicator()
+{
+    RtIndicator next;
+    memset(&next, 0, sizeof(next));
+    next.toHit = -1;
+
+    int color = colorTable[32767];
+    if (rt_lock != NULL && rt_is_known_critter(rt_lock) && obj_dude->elevation == map_elevation) {
+        Rect bounds;
+        obj_bound(rt_lock, &bounds);
+        next.visible = true;
+        next.x = (bounds.ulx + bounds.lrx) / 2;
+        next.y = (bounds.uly + bounds.lry) / 2;
+
+        // The same checks and hit chance the attack itself uses, for the
+        // equipped weapon and the selected attack mode.
+        int hitMode;
+        if (rt_player_hit_mode(&hitMode) != 0) {
+            next.badShot = -1;
+            SDL_strlcpy(next.text, "No weapon", sizeof(next.text));
+        } else {
+            next.badShot = rt_check_shot(obj_dude, rt_lock, hitMode);
+            switch (next.badShot) {
+            case COMBAT_BAD_SHOT_OK:
+                next.toHit = determine_to_hit(obj_dude, rt_lock, HIT_LOCATION_UNCALLED, hitMode);
+                snprintf(next.text, sizeof(next.text), "%d%%", next.toHit);
+                break;
+            case COMBAT_BAD_SHOT_OUT_OF_RANGE:
+                SDL_strlcpy(next.text, "Out of range", sizeof(next.text));
+                break;
+            case COMBAT_BAD_SHOT_AIM_BLOCKED:
+                SDL_strlcpy(next.text, "Blocked", sizeof(next.text));
+                break;
+            case COMBAT_BAD_SHOT_NO_AMMO:
+                SDL_strlcpy(next.text, "No ammo", sizeof(next.text));
+                break;
+            default:
+                SDL_strlcpy(next.text, "Can't attack", sizeof(next.text));
+                break;
             }
         }
+
+        if (next.toHit < 0) {
+            color = colorTable[31744];
+        }
+    }
+
+    Rect rect = { 0, 0, -1, -1 };
+    if (next.visible) {
+        if (!rt_indicator_build(next.text, color)) {
+            next.visible = false;
+        } else {
+            rect.ulx = next.x - rt_indicator_cross_width / 2;
+            rect.uly = next.y - rt_indicator_height / 2;
+            rect.lrx = rect.ulx + rt_indicator_width - 1;
+            rect.lry = rect.uly + rt_indicator_height - 1;
+        }
+    }
+
+    bool scrolled = rt_indicator_drawn && rt_indicator_ref_tile != tile_center_tile;
+    bool changed = scrolled
+        || next.visible != rt_indicator_drawn
+        || (next.visible
+            && (rect.ulx != rt_indicator_rect.ulx
+                || rect.uly != rt_indicator_rect.uly
+                || strcmp(next.text, rt_indicator.text) != 0));
+    rt_indicator = next;
+
+    if (!changed) {
         return;
     }
 
-    if (rt_lock_marker == NULL) {
-        int fid = art_id(OBJ_TYPE_INTERFACE, 1, 0, 0, 0);
-        if (obj_new(&rt_lock_marker, fid, -1) != 0) {
-            rt_lock_marker = NULL;
-            return;
-        }
+    if (rt_indicator_drawn) {
+        // Erase: the overlay must not be drawn while its old area redraws.
+        rt_indicator_drawn = false;
+        tile_refresh_rect(&rt_indicator_rect, map_elevation);
 
-        rt_lock_marker->flags |= OBJECT_LIGHT_THRU | OBJECT_NO_SAVE | OBJECT_SHOOT_THRU | OBJECT_NO_BLOCK;
-        obj_outline_object(rt_lock_marker, OUTLINE_PALETTED | OUTLINE_TYPE_2, NULL);
-        obj_toggle_flat(rt_lock_marker, NULL);
-        obj_turn_off(rt_lock_marker, NULL);
-    }
-
-    if (rt_lock_marker->tile != rt_lock->tile || rt_lock_marker->elevation != rt_lock->elevation) {
-        Rect oldRect;
-        obj_bound(rt_lock_marker, &oldRect);
-        if (obj_move_to_tile(rt_lock_marker, rt_lock->tile, rt_lock->elevation, &rect) == 0) {
-            rect_min_bound(&rect, &oldRect, &rect);
-            tile_refresh_rect(&rect, rt_lock->elevation);
+        // Where scrolling moved the old image to.
+        int x;
+        int y;
+        if (scrolled && tile_coord(rt_indicator_ref_tile, &x, &y, map_elevation) == 0) {
+            Rect shifted = rt_indicator_rect;
+            rectOffset(&shifted, x - rt_indicator_ref_x, y - rt_indicator_ref_y);
+            tile_refresh_rect(&shifted, map_elevation);
         }
     }
 
-    if ((rt_lock_marker->flags & OBJECT_HIDDEN) != 0) {
-        if (obj_turn_on(rt_lock_marker, &rect) == 0) {
-            tile_refresh_rect(&rect, rt_lock_marker->elevation);
-        }
+    rt_indicator_drawn = next.visible;
+    if (next.visible) {
+        rt_indicator_rect = rect;
+        rt_indicator_ref_tile = tile_center_tile;
+        tile_coord(rt_indicator_ref_tile, &rt_indicator_ref_x, &rt_indicator_ref_y, map_elevation);
+        tile_refresh_rect(&rt_indicator_rect, map_elevation);
     }
+}
+
+void rt_render_overlay(unsigned char* buffer, int pitch, Rect* rect)
+{
+    if (!rt_indicator_drawn || rt_indicator_buf == NULL) {
+        return;
+    }
+
+    Rect clipped;
+    if (rect_inside_bound(&rt_indicator_rect, rect, &clipped) != 0) {
+        return;
+    }
+
+    int srcX = clipped.ulx - rt_indicator_rect.ulx;
+    int srcY = clipped.uly - rt_indicator_rect.uly;
+    trans_buf_to_buf(rt_indicator_buf + rt_indicator_width * srcY + srcX,
+        clipped.lrx - clipped.ulx + 1,
+        clipped.lry - clipped.uly + 1,
+        rt_indicator_width,
+        buffer + pitch * clipped.uly + clipped.ulx,
+        pitch);
 }
 
 // -----------------------------------------------------------------------------
@@ -1744,8 +2490,56 @@ static bool rt_is_automatic(int hitMode)
     return anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS;
 }
 
+// RT with a chem (drug) in the active item slot uses it on the player,
+// through the same action as using it on yourself in the original game (the
+// hands animation, then one item from the stack is taken). One use per press.
+static void rt_update_chem_input(bool pressAttack, Object* chem)
+{
+    if (pressAttack) {
+        rt_chem_requested_until = rt_now + RT_CHEM_BUFFER_MS;
+    }
+
+    if (rt_chem_requested_until == 0) {
+        return;
+    }
+
+    // An attack involving the player, a reload or a chem still being used:
+    // the press waits for it to end.
+    if (rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active) {
+        if (rt_now > rt_chem_requested_until) {
+            rt_chem_requested_until = 0;
+            rt_print("You can't use that right now.");
+        }
+        return;
+    }
+
+    rt_chem_requested_until = 0;
+    rt_move_active = false;
+    rt_set_interact_highlight(NULL);
+
+    if (action_use_an_item_on_object(obj_dude, obj_dude, chem) == -1) {
+        rt_log("chem: could not use %s", object_name(chem));
+        rt_print("You can't use that right now.");
+        return;
+    }
+
+    rt_chem_active = true;
+    rt_stats.chemUses++;
+    rt_print("You use the %s.", object_name(chem));
+    rt_log("chem: using %s (%d in the stack)", object_name(chem), item_count(obj_dude, chem));
+}
+
 static void rt_update_attack_input(bool pressAttack)
 {
+    Object* activeItem = NULL;
+    if (intface_get_current_item(&activeItem) == 0 && activeItem != NULL && item_get_type(activeItem) == ITEM_TYPE_DRUG) {
+        rt_fire_hold = false;
+        rt_attack_buffered_until = 0;
+        rt_update_chem_input(pressAttack, activeItem);
+        return;
+    }
+    rt_chem_requested_until = 0;
+
     bool held = gamepad_is_held(GAMEPAD_BUTTON_RIGHT_TRIGGER);
 
     if (pressAttack) {
@@ -1753,6 +2547,8 @@ static void rt_update_attack_input(bool pressAttack)
         rt_log("input: RT pressed (lock=%s)", rt_lock != NULL ? critter_name(rt_lock) : "none");
         rt_attack_buffered_until = rt_now + RT_ATTACK_BUFFER_MS;
         rt_fire_hold = true;
+        rt_fire_pressed_at = rt_now;
+        rt_fire_press_done = false;
     }
 
     if (!held) {
@@ -1763,7 +2559,14 @@ static void rt_update_attack_input(bool pressAttack)
     bool automatic = rt_player_hit_mode(&hitMode) == 0 && rt_is_automatic(hitMode);
 
     bool buffered = rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until;
-    bool repeat = rt_fire_hold && automatic && !pressAttack;
+    // A hold repeats only automatic attacks, and only once the press's own
+    // attack has started and the trigger stayed down past the hold threshold,
+    // so the press itself never turns into an extra shot or burst.
+    bool repeat = rt_fire_hold
+        && automatic
+        && !buffered
+        && rt_fire_press_done
+        && rt_now - rt_fire_pressed_at >= RT_HOLD_REPEAT_MS;
     if (!buffered && !repeat) {
         rt_attack_buffered_until = 0;
         return;
@@ -1772,6 +2575,7 @@ static void rt_update_attack_input(bool pressAttack)
     int rc = rt_player_attack(pressAttack);
     if (rc == RT_PLAYER_ATTACK_STARTED) {
         rt_attack_buffered_until = 0;
+        rt_fire_press_done = true;
     } else if (rc == RT_PLAYER_ATTACK_FAILED) {
         // Nothing to retry: no target, out of range, empty...
         rt_attack_buffered_until = 0;
@@ -1787,14 +2591,18 @@ static int rt_player_attack(bool explicitPress)
         return RT_PLAYER_ATTACK_FAILED;
     }
 
+    // No lock, no attack: RT never picks a target by itself.
     Object* target = rt_lock;
     if (target == NULL) {
-        target = rt_find_hostile_ahead();
-        if (target == NULL) {
-            rt_print("No hostile target ahead.");
-            rt_stats.playerRejected++;
-            return RT_PLAYER_ATTACK_FAILED;
-        }
+        rt_print("No target locked. Press LT to lock on.");
+        rt_stats.playerRejected++;
+        rt_stats.lastRejectReason = -1;
+        return RT_PLAYER_ATTACK_FAILED;
+    }
+
+    // No firing until a reload is complete.
+    if (rt_reload_active) {
+        return RT_PLAYER_ATTACK_WAIT;
     }
 
     // The lock never bypasses range, line of sight or ammunition rules.
@@ -1902,22 +2710,13 @@ static Object* rt_find_interactable()
             continue;
         }
 
-        switch (FID_TYPE(obj->fid)) {
-        case OBJ_TYPE_ITEM:
-            break;
-        case OBJ_TYPE_CRITTER:
-            if (rt_is_alive(obj)) {
-                if (!obj_action_can_talk_to(obj) || rt_is_engaged(obj)) {
-                    continue;
-                }
-            }
-            break;
-        case OBJ_TYPE_SCENERY:
-            if (!proto_action_can_use(obj->pid)) {
-                continue;
-            }
-            break;
-        default:
+        int type = FID_TYPE(obj->fid);
+        if (type != OBJ_TYPE_ITEM && type != OBJ_TYPE_CRITTER && type != OBJ_TYPE_SCENERY) {
+            continue;
+        }
+
+        // Anything with an ordinary or skill interaction (see `rt_context.h`).
+        if (!rt_context_is_interactable(obj)) {
             continue;
         }
 
@@ -1936,26 +2735,7 @@ static void rt_interact(Object* obj)
 {
     rt_set_interact_highlight(NULL);
     rt_move_active = false;
-
-    switch (FID_TYPE(obj->fid)) {
-    case OBJ_TYPE_ITEM:
-        rt_log("interact: pick up/open %s", object_name(obj));
-        action_get_an_object(obj_dude, obj);
-        break;
-    case OBJ_TYPE_CRITTER:
-        if (rt_is_alive(obj)) {
-            rt_log("interact: talk to %s", critter_name(obj));
-            action_talk_to(obj_dude, obj);
-        } else {
-            rt_log("interact: loot %s", critter_name(obj));
-            action_loot_container(obj_dude, obj);
-        }
-        break;
-    case OBJ_TYPE_SCENERY:
-        rt_log("interact: use %s", object_name(obj));
-        action_use_an_object(obj_dude, obj);
-        break;
-    }
+    rt_context_interact(obj);
 }
 
 static void rt_set_interact_highlight(Object* obj)
@@ -1968,53 +2748,329 @@ static void rt_set_interact_highlight(Object* obj)
     rt_set_outline(&rt_interact_outlined, obj, outlineType);
 }
 
-static void rt_reload()
+static bool rt_has_ammo_for(Object* weapon)
 {
+    int index = -1;
+    Object* ammo;
+    while ((ammo = inven_find_type(obj_dude, ITEM_TYPE_AMMO, &index)) != NULL) {
+        if (item_w_can_reload(weapon, ammo)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool rt_weapon_in_hand(Object* weapon)
+{
+    return weapon != NULL && (inven_right_hand(obj_dude) == weapon || inven_left_hand(obj_dude) == weapon);
+}
+
+// The single place where a player reload moves ammunition into the weapon.
+static int rt_reload_transfer(Object* weapon)
+{
+    int before = item_w_curr_ammo(weapon);
+    while (item_w_try_reload(obj_dude, weapon) != -1) {
+    }
+
+    rt_stats.reloadAmmoTransfers++;
+    gsound_play_sfx_file(gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_READY, weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY, NULL));
+    intface_update_items(false);
+    intface_update_ammo_lights();
+
+    int loaded = item_w_curr_ammo(weapon) - before;
+    rt_log("reload: ammo transferred (+%d, now %d/%d)", loaded, item_w_curr_ammo(weapon), item_w_max_ammo(weapon));
+    return loaded;
+}
+
+// Reloading plays the weapon's own holster animation, moves the ammunition
+// once the weapon is put away, then draws it again. The weapon stays
+// equipped throughout. If the sequence is cut short (e.g. by an enemy hit)
+// before the ammunition moved, nothing moved; afterwards, the reload counts.
+static int rt_reload()
+{
+    if (rt_reload_active) {
+        rt_log("reload: already reloading");
+        return RT_RELOAD_FAILED;
+    }
+
     Object* item = NULL;
     if (intface_get_current_item(&item) != 0 || item == NULL || item_get_type(item) != ITEM_TYPE_WEAPON || item_w_max_ammo(item) <= 0) {
         rt_print("The active item doesn't use ammo.");
-        return;
+        return RT_RELOAD_FAILED;
     }
 
     if (item_w_curr_ammo(item) >= item_w_max_ammo(item)) {
         rt_print("Your weapon is fully loaded.");
-        return;
+        return RT_RELOAD_FAILED;
     }
 
-    bool reloaded = false;
-    while (item_w_try_reload(obj_dude, item) != -1) {
-        reloaded = true;
-    }
-
-    if (!reloaded) {
+    if (!rt_has_ammo_for(item)) {
         rt_print("You have no ammo for this weapon.");
-        return;
+        return RT_RELOAD_FAILED;
     }
 
-    gsound_play_sfx_file(gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_READY, item, HIT_MODE_RIGHT_WEAPON_PRIMARY, NULL));
-    intface_update_items(false);
-    intface_update_ammo_lights();
-
-    // Reloading takes time: no attacks for a moment.
-    if (rt_dude_next_attack_at < rt_now + 1000) {
-        rt_dude_next_attack_at = rt_now + 1000;
+    // An attack involving the player (theirs, or an enemy hit on them) is
+    // still playing: the reload starts as soon as it is over.
+    if (rt_obj_in_attack(obj_dude)) {
+        return RT_RELOAD_WAIT;
     }
 
-    rt_log("reload: %d/%d", item_w_curr_ammo(item), item_w_max_ammo(item));
+    rt_reload_active = true;
+    rt_reload_committed = false;
+    rt_reload_finished = false;
+    rt_reload_weapon = item;
+    rt_reload_until = 0;
+    rt_stats.reloadsStarted++;
+    rt_move_active = false;
+    rt_set_interact_highlight(NULL);
+
+    int code = item_w_anim_code(item);
+    int putAwayFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_PUT_AWAY, code, obj_dude->rotation + 1);
+    int takeOutFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_TAKE_OUT, code, obj_dude->rotation + 1);
+    bool animated = code != 0 && art_exists(putAwayFid) && art_exists(takeOutFid);
+
+    if (animated) {
+        if (anim_busy(obj_dude)) {
+            register_clear(obj_dude);
+        }
+
+        register_begin(ANIMATION_REQUEST_RESERVED);
+        register_object_play_sfx(obj_dude, gsnd_build_character_sfx_name(obj_dude, ANIM_PUT_AWAY, CHARACTER_SOUND_EFFECT_UNUSED), 0);
+        register_object_animate(obj_dude, ANIM_PUT_AWAY, 0);
+        register_object_call(item, NULL, (AnimationCallback*)rt_reload_commit, -1);
+        register_object_take_out(obj_dude, code, -1);
+        register_object_call(item, NULL, (AnimationCallback*)rt_reload_finish, -1);
+        if (register_end() == 0) {
+            rt_log("reload: started (%s %d/%d)", object_name(item), item_w_curr_ammo(item), item_w_max_ammo(item));
+            return RT_RELOAD_STARTED;
+        }
+
+        rt_log("reload: animation could not start, using a timed reload");
+    } else {
+        rt_log("reload: no holster/draw animation for %s (weapon code %d), using a timed reload", object_name(item), code);
+    }
+
+    // Fallback: no animation; the weapon is busy for a moment instead.
+    rt_stats.reloadFallbacks++;
+    rt_reload_committed = true;
+    rt_reload_transfer(item);
+    rt_reload_until = rt_now + RT_RELOAD_FALLBACK_MS;
+    return RT_RELOAD_STARTED;
 }
 
+static int rt_reload_commit(void* a1, void* a2)
+{
+    Object* weapon = (Object*)a1;
+    if (!rt_reload_active || rt_reload_committed || weapon != rt_reload_weapon) {
+        return 0;
+    }
+
+    rt_reload_committed = true;
+    if (!rt_weapon_in_hand(weapon)) {
+        rt_log("reload: weapon left the hand, nothing loaded");
+        return 0;
+    }
+
+    rt_reload_transfer(weapon);
+    return 0;
+}
+
+static int rt_reload_finish(void* a1, void* a2)
+{
+    if (rt_reload_active && a1 == rt_reload_weapon) {
+        rt_reload_finished = true;
+    }
+    return 0;
+}
+
+static void rt_update_reload()
+{
+    if (!rt_reload_active) {
+        return;
+    }
+
+    if (rt_reload_until != 0) {
+        if (rt_now < rt_reload_until) {
+            return;
+        }
+
+        rt_reload_until = 0;
+        rt_reload_active = false;
+        rt_reload_weapon = NULL;
+        rt_stats.reloadsCompleted++;
+        rt_log("reload: complete (timed)");
+        return;
+    }
+
+    if (!rt_reload_finished && anim_busy(obj_dude)) {
+        return;
+    }
+
+    rt_reload_active = false;
+    rt_reload_weapon = NULL;
+
+    if (rt_reload_finished) {
+        rt_stats.reloadsCompleted++;
+        rt_log("reload: complete");
+    } else if (rt_reload_committed) {
+        // Loaded, but the draw animation was cut short; the weapon sprite is
+        // restored by `rt_sync_weapon_sprite`.
+        rt_stats.reloadsCompleted++;
+        rt_log("reload: complete (draw interrupted)");
+    } else {
+        rt_stats.reloadsInterrupted++;
+        rt_print("Reload interrupted.");
+        rt_log("reload: interrupted before the ammo moved (nothing loaded)");
+    }
+}
+
+// One engine scroll step (32x24 px), which respects the map's scroll limits;
+// a blocked diagonal step falls back to either axis. Returns `map_scroll`'s
+// result.
+static int rt_camera_step(int dx, int dy)
+{
+    int rc = map_scroll(dx, dy);
+    if (rc == -1 && dx != 0 && dy != 0) {
+        rc = map_scroll(dx, 0);
+        if (rc == -1) {
+            rc = map_scroll(0, dy);
+        }
+    }
+    return rc;
+}
+
+// Right stick camera panning while nothing is locked (with a lock the right
+// stick switches targets instead). The view may leave the player behind; it
+// stays where it was put until the player moves again. Returns true while
+// the stick pans.
+static bool rt_update_camera_pan()
+{
+    float sx;
+    float sy;
+    gamepad_get_look_stick(&sx, &sy);
+    float magnitude = sqrtf(sx * sx + sy * sy);
+    if (rt_lock != NULL || magnitude <= 0.0f) {
+        return false;
+    }
+
+    // Eight directions; a fuller push scrolls faster.
+    int dx = sx > 0.38f * magnitude ? 1 : (sx < -0.38f * magnitude ? -1 : 0);
+    int dy = sy > 0.38f * magnitude ? 1 : (sy < -0.38f * magnitude ? -1 : 0);
+    if (dx == 0 && dy == 0) {
+        return false;
+    }
+
+    if (!rt_camera_free) {
+        rt_camera_free = true;
+        rt_log("camera: panning with the right stick");
+    }
+
+    if (rt_now < rt_camera_next_pan_at) {
+        return true;
+    }
+
+    int rc = rt_camera_step(dx, dy);
+    if (rc == 0) {
+        rt_stats.cameraPans++;
+        rt_camera_next_pan_at = rt_now + (unsigned int)(RT_CAMERA_PAN_STEP_MS / magnitude);
+    }
+    return true;
+}
+
+// Edge scrolling. The camera stays still while the player is inside an
+// inner box of the gameplay area (the map above the interface bar). Near an
+// edge it scrolls toward that edge in the engine's own scroll steps, which
+// respect the map's scroll limits, until the player is back inside the box.
+// The right stick can pan the view away (see `rt_update_camera_pan`); once
+// the player moves again, the same scrolling brings the view back.
 static void rt_update_camera()
 {
-    if (!rt_camera_follow) {
+    if (!rt_camera_edge_scroll || obj_dude->elevation != map_elevation) {
         return;
     }
 
-    if (obj_dude->elevation != map_elevation || obj_dude->tile == rt_last_camera_tile) {
+    int width;
+    int height;
+    if (!rt_get_play_area(&width, &height)) {
         return;
     }
 
-    rt_last_camera_tile = obj_dude->tile;
-    tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+    if (rt_update_camera_pan()) {
+        rt_camera_scrolling = false;
+        return;
+    }
+
+    if (rt_camera_free) {
+        float mx;
+        float my;
+        gamepad_get_move_stick(&mx, &my);
+        if (mx == 0.0f && my == 0.0f) {
+            return;
+        }
+        rt_camera_free = false;
+        rt_log("camera: player moves, following again");
+    }
+
+    int x;
+    int y;
+    bool known = tile_coord(obj_dude->tile, &x, &y, obj_dude->elevation) == 0;
+    x += 16;
+    y += 8;
+
+    // A new map or elevation (or a player far away after a scripted move)
+    // gets the camera centered on the player; otherwise it scrolls.
+    bool far = !known || x < -width || x > 2 * width || y < -height || y > 2 * height;
+    if (rt_last_camera_elevation != map_elevation || far) {
+        bool onScreen = known && x >= 0 && x < width && y >= 0 && y < height;
+        rt_last_camera_elevation = map_elevation;
+        if (!onScreen && tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW) != -1) {
+            rt_stats.cameraRecenters++;
+            rt_log("camera: player off screen, centered");
+        }
+        rt_camera_scrolling = false;
+        return;
+    }
+
+    int marginX = width * rt_camera_margin_pct / 100;
+    int marginY = height * rt_camera_margin_pct / 100;
+
+    // Once scrolling, continue until the player is a little further inside,
+    // so the camera doesn't stop and start right at the boundary.
+    int insetX = rt_camera_scrolling ? 16 : 0;
+    int insetY = rt_camera_scrolling ? 12 : 0;
+
+    int dx = 0;
+    if (x < marginX + insetX) {
+        dx = -1;
+    } else if (x > width - marginX - insetX) {
+        dx = 1;
+    }
+
+    int dy = 0;
+    if (y < marginY + insetY) {
+        dy = -1;
+    } else if (y > height - marginY - insetY) {
+        dy = 1;
+    }
+
+    if (dx == 0 && dy == 0) {
+        rt_camera_scrolling = false;
+        return;
+    }
+
+    int rc = rt_camera_step(dx, dy);
+
+    if (rc == 0) {
+        rt_stats.cameraScrolls++;
+        rt_camera_scrolling = true;
+    } else if (rc == -1) {
+        // At the map's scroll limit: stay put.
+        if (rt_camera_scrolling) {
+            rt_stats.cameraLimitStops++;
+            rt_log("camera: stopped at the map scroll limit");
+        }
+        rt_camera_scrolling = false;
+    }
 }
 
 } // namespace fallout

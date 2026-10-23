@@ -29,6 +29,7 @@ static void gamepad_interrupt_gameplay_input();
 static void gamepad_handle_menu_press(int button);
 static void gamepad_handle_menu_repeat(unsigned int now);
 static void gamepad_menu_navigate(int button);
+static void gamepad_update_flick();
 
 static bool gamepad_initialized = false;
 static SDL_GameController* gamepad_controller = NULL;
@@ -49,6 +50,14 @@ static bool gamepad_previous_buttons[GAMEPAD_BUTTON_COUNT];
 static bool gamepad_pending_presses[GAMEPAD_BUTTON_COUNT];
 static bool gamepad_hold_valid[GAMEPAD_BUTTON_COUNT];
 static bool gamepad_stick_gated = false;
+// Right stick flicks (gameplay): armed only after a neutral reading.
+// Right stick panning (gameplay): like the left stick, held back until it
+// returns to neutral after a menu, focus loss or reconnect.
+static bool gamepad_look_gated = false;
+static bool gamepad_flick_armed = false;
+static bool gamepad_flick_pending = false;
+static float gamepad_flick_x = 0.0f;
+static float gamepad_flick_y = 0.0f;
 static int gamepad_interruptions = 0;
 
 static float gamepad_cursor_accum_x = 0.0f;
@@ -190,6 +199,9 @@ static void gamepad_interrupt_gameplay_input()
     memset(gamepad_pending_presses, 0, sizeof(gamepad_pending_presses));
     memset(gamepad_hold_valid, 0, sizeof(gamepad_hold_valid));
     gamepad_stick_gated = true;
+    gamepad_look_gated = true;
+    gamepad_flick_armed = false;
+    gamepad_flick_pending = false;
 }
 
 void gamepad_update()
@@ -261,6 +273,15 @@ void gamepad_update()
         // unfocused controller reads as neutral too).
         gamepad_stick_gated = false;
     }
+
+    if (!gamepad_gameplay_mode) {
+        gamepad_look_gated = true;
+    } else if (gamepad_state.connected && gamepad_focused
+        && gamepad_state.rightX == 0.0f && gamepad_state.rightY == 0.0f) {
+        gamepad_look_gated = false;
+    }
+
+    gamepad_update_flick();
 
     for (int button = 0; button < GAMEPAD_BUTTON_COUNT; button++) {
         bool down = gamepad_state.buttons[button];
@@ -479,6 +500,56 @@ void gamepad_get_move_stick(float* x, float* y)
 
     *x = gamepad_state.leftX;
     *y = gamepad_state.leftY;
+}
+
+// A flick is a push of the right stick past FLICK_ON from its neutral zone;
+// the stick has to return inside FLICK_OFF before the next one counts.
+#define GAMEPAD_FLICK_ON 0.7f
+#define GAMEPAD_FLICK_OFF 0.3f
+
+static void gamepad_update_flick()
+{
+    if (!gamepad_gameplay_mode || !gamepad_state.connected || !gamepad_focused) {
+        gamepad_flick_armed = false;
+        gamepad_flick_pending = false;
+        return;
+    }
+
+    float x = gamepad_state.rightX;
+    float y = gamepad_state.rightY;
+    float magnitude = sqrtf(x * x + y * y);
+    if (magnitude <= GAMEPAD_FLICK_OFF) {
+        gamepad_flick_armed = true;
+    } else if (magnitude >= GAMEPAD_FLICK_ON && gamepad_flick_armed) {
+        gamepad_flick_armed = false;
+        gamepad_flick_pending = true;
+        gamepad_flick_x = x / magnitude;
+        gamepad_flick_y = y / magnitude;
+    }
+}
+
+void gamepad_get_look_stick(float* x, float* y)
+{
+    if (gamepad_look_gated) {
+        *x = 0.0f;
+        *y = 0.0f;
+        return;
+    }
+
+    *x = gamepad_state.rightX;
+    *y = gamepad_state.rightY;
+}
+
+bool gamepad_consume_flick(float* x, float* y)
+{
+    if (!gamepad_flick_pending) {
+        return false;
+    }
+
+    gamepad_flick_pending = false;
+    *x = gamepad_flick_x;
+    *y = gamepad_flick_y;
+    return true;
 }
 
 void gamepad_reset_gameplay_input()

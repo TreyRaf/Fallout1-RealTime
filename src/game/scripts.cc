@@ -546,6 +546,23 @@ Program* loadProgram(const char* name)
     return allocateProgram(path);
 }
 
+// RT: Path of the compiled script for a scripts.lst index (read-only use).
+bool scr_rt_script_path(int scriptIndex, char* path, size_t size)
+{
+    char name[16];
+    if (scr_list_str(scriptIndex, name, sizeof(name)) == -1) {
+        return false;
+    }
+
+    char* pch = strchr(name, '.');
+    if (pch != NULL) {
+        *pch = '\0';
+    }
+
+    snprintf(path, size, "%s%s%s.int", cd_path_base, script_path_base, name);
+    return true;
+}
+
 // 0x491F20
 static void doBkProcesses()
 {

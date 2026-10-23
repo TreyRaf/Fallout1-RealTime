@@ -78,6 +78,15 @@ bool gamepad_is_held(GamepadButton button);
 // after a menu, focus loss or reconnect.
 void gamepad_get_move_stick(float* x, float* y);
 
+// Returns true once per right stick flick in the gameplay context, with the
+// unit direction (Y points down). The stick must return to neutral between
+// flicks; menus, focus loss and disconnects drop pending flicks.
+bool gamepad_consume_flick(float* x, float* y);
+
+// Right stick for camera panning; zero until it returns to neutral after a
+// menu, focus loss or reconnect.
+void gamepad_get_look_stick(float* x, float* y);
+
 // Drops pending presses and holds and gates the stick (e.g. on map load).
 void gamepad_reset_gameplay_input();
 

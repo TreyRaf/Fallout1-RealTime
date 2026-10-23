@@ -406,6 +406,12 @@ void gmouse_set_rt_controller_mode(bool enabled)
     gmouse_rt_controller_mode = enabled;
 }
 
+// RT: The combat crosshair cursor art (used by the lock-on indicator).
+int gmouse_get_crosshair_fid()
+{
+    return art_id(OBJ_TYPE_INTERFACE, gmouse_3d_mode_nums[GAME_MOUSE_MODE_CROSSHAIR], 0, 0, 0);
+}
+
 // 0x4430B4
 int gmouse_is_enabled()
 {

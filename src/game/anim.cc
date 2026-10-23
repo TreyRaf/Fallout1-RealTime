@@ -35,9 +35,17 @@
 
 namespace fallout {
 
-#define ANIMATION_SEQUENCE_LIST_CAPACITY 21
+// RT: Raised from 21 sequences and 16 running animations: in real time every
+// critter can walk, attack and react at once, which turn-based play never
+// needed. When these ran out, new animations (a walk, an attack, the draw
+// step of a reload) silently failed. Nothing is saved with these.
+#define ANIMATION_SEQUENCE_LIST_CAPACITY 64
 #define ANIMATION_DESCRIPTION_LIST_CAPACITY 40
-#define ANIMATION_SAD_LIST_CAPACITY 16
+#define ANIMATION_SAD_LIST_CAPACITY 64
+
+// Unreserved requests (e.g. critters walking around) can use all but this
+// many sequences; vanilla kept 8 of its 21 for reserved requests.
+#define ANIMATION_SEQUENCE_RESERVED_SLOTS 8
 
 #define ANIMATION_SEQUENCE_FORCED 0x01
 
@@ -402,7 +410,7 @@ static int anim_free_slot(int requestOptions)
         }
 
         return -1;
-    } else if ((requestOptions & ANIMATION_REQUEST_RESERVED) != 0 || v2 < 13) {
+    } else if ((requestOptions & ANIMATION_REQUEST_RESERVED) != 0 || v2 < ANIMATION_SEQUENCE_LIST_CAPACITY - ANIMATION_SEQUENCE_RESERVED_SLOTS) {
         return v1;
     }
 
@@ -526,6 +534,54 @@ static void anim_cleanup()
     }
 
     curr_anim_set = -1;
+}
+
+// RT: Ends every sequence of `obj` that is not prioritized (unlike
+// `register_clear`, which stops at the first sequence it finds). Used to stop
+// a walk that would otherwise keep an attack on `obj` from landing. Returns
+// the number of sequences ended.
+// RT: Ends every sequence `obj` is part of, prioritized or not (for objects
+// about to be removed by the automated test harness).
+int anim_rt_end_all(Object* obj)
+{
+    int ended = 0;
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        for (int animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (obj == animationDescription->owner && animationDescription->kind != ANIM_KIND_CALLBACK) {
+                anim_set_end(animationSequenceIndex);
+                ended++;
+                break;
+            }
+        }
+    }
+    return ended;
+}
+
+int anim_rt_end_unprioritized(Object* obj)
+{
+    int ended = 0;
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000 || (animationSequence->flags & ANIM_SEQ_PRIORITIZED) != 0) {
+            continue;
+        }
+
+        for (int animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (obj == animationDescription->owner && animationDescription->kind != ANIM_KIND_CALLBACK) {
+                anim_set_end(animationSequenceIndex);
+                ended++;
+                break;
+            }
+        }
+    }
+    return ended;
 }
 
 // 0x41390C
