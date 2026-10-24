@@ -2136,6 +2136,37 @@ static void pb_handle_key(int key)
     }
 }
 
+// The HUD's LEVEL indicator (PC_FLAG_LEVEL_UP_AVAILABLE). The original
+// cleared it whenever the character screen closed, which the Pip-Boy
+// replaced, so nothing cleared it any more. It now follows what is still
+// to do: on while a perk can be chosen; off once the level's skill points
+// are all spent, or once the player has looked at the Stats tab and closed
+// the Pip-Boy with points left (those are banked, as the original allowed).
+static bool pb_stats_seen = false;
+
+static bool pb_perk_pending()
+{
+    int perks[PERK_COUNT];
+    return editor_rt_has_free_perk() && perk_make_list(perks) > 0;
+}
+
+static void pb_update_level_flag(bool closing)
+{
+    bool before = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+    if (pb_perk_pending()) {
+        pc_flag_on(PC_FLAG_LEVEL_UP_AVAILABLE);
+    } else if (before && (stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == 0 || (closing && pb_stats_seen))) {
+        pc_flag_off(PC_FLAG_LEVEL_UP_AVAILABLE);
+    }
+
+    bool after = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+    if (after != before) {
+        refresh_box_bar_win();
+        rt_log("pipboy: level-up indicator %s (perk pending %d, unspent skill points %d)",
+            after ? "on" : "off", pb_perk_pending(), stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS));
+    }
+}
+
 static void pb_loop()
 {
     unsigned int lastPan = SDL_GetTicks();
@@ -2169,6 +2200,11 @@ static void pb_loop()
             }
             lastPan = now;
         }
+
+        if (pb_tab == RT_PIPBOY_TAB_STATS) {
+            pb_stats_seen = true;
+        }
+        pb_update_level_flag(false);
 
         if (!pb_close) {
             pb_render();
@@ -2214,6 +2250,7 @@ void rt_pipboy_open(int tab, int page)
     pb_world_centered = false;
     pb_message[0] = '\0';
     memset(pb_skill_added, 0, sizeof(pb_skill_added));
+    pb_stats_seen = false;
     pb_map_buf = new unsigned char[AUTOMAP_RT_SIZE * AUTOMAP_RT_SIZE];
 
     pb_line = text_height() + 2;
@@ -2241,6 +2278,7 @@ void rt_pipboy_open(int tab, int page)
     gamepad_set_menu_key_mode(true);
 
     pb_render();
+    Object* activeBefore = pb_active_item();
     pb_loop();
 
     if (!cursorWasHidden) {
@@ -2261,12 +2299,18 @@ void rt_pipboy_open(int tab, int page)
     pb_scanner = false;
     pb_state.open = false;
     pb_state.closes++;
+    pb_update_level_flag(true);
 
     if (isoWasEnabled) {
         map_enable_bk_processes();
     }
 
     inven_rt_refresh_appearance();
+    // A weapon newly readied in the Pip-Boy is drawn, as from favorites.
+    Object* activeAfter = pb_active_item();
+    if (activeAfter != activeBefore && activeAfter != NULL) {
+        rt_play_draw(activeAfter);
+    }
     intface_redraw();
     rt_log("pipboy: closed");
 }

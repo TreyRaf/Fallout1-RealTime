@@ -671,6 +671,8 @@ int rt_favorites_activate(int slot)
             return RT_FAVORITES_DONE;
         }
         if (inven_rt_equip(item, right ? INVEN_RT_SLOT_RIGHT_HAND : INVEN_RT_SLOT_LEFT_HAND) == 0) {
+            // The draw animation, as readying a weapon does.
+            rt_play_draw(item);
             gsound_play_sfx_file("ib1p1xx1");
             fav_print("You ready the %s.", name);
             return RT_FAVORITES_DONE;

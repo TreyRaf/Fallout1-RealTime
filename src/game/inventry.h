@@ -137,6 +137,45 @@ typedef struct InvenRtLootState {
 
 const InvenRtLootState* inven_rt_loot_state();
 
+// RT: controller layer of the barter screen. Four columns: the player's
+// items, the player's offer, the trader's offer, the trader's items. It
+// opens on the trader's items; LT jumps to the player's items, RT to the
+// trader's, LB/RB to the player's/trader's offer, D-pad left/right step
+// between columns, up/down move. A puts the selected item on the offer (or
+// takes it back off an offer); stacks ask how many. X offers the trade (the
+// original acceptance rules decide), Y reviews the exchange in the reply
+// window, Back returns to talking, B leaves (offers go back to their owners,
+// as the original does).
+#define INVEN_RT_BARTER_PLAYER_ITEMS 0
+#define INVEN_RT_BARTER_PLAYER_OFFER 1
+#define INVEN_RT_BARTER_TRADER_OFFER 2
+#define INVEN_RT_BARTER_TRADER_ITEMS 3
+
+typedef struct InvenRtBarterState {
+    bool open;
+    int column;
+    int selected[4];
+    int offset[4];
+    int count[4];
+    Object* selectedItem;
+    int selectedQuantity;
+    // The player's offer, what the trader asks for its offer (Barter skill,
+    // reaction, perks applied), and whether the trader would accept now.
+    int offerValue;
+    int askValue;
+    bool accepts;
+    int trades;
+    int rejections;
+    int reviews;
+    char lastMessage[160];
+} InvenRtBarterState;
+
+const InvenRtBarterState* inven_rt_barter_state();
+
+// Automated tests: the barter screen with `trader`, outside dialogue (offer
+// tables made and returned as the dialogue does).
+void inven_rt_debug_barter(Object* trader);
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_INVENTRY_H_ */

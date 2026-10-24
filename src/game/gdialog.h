@@ -31,6 +31,9 @@ int scr_dialogue_init(int headFid, int reaction);
 int scr_dialogue_exit();
 void gdialog_set_background(int a1);
 void gdialog_display_msg(char* msg);
+// RT: the dialogue reply window exists (the barter screen also runs in tests,
+// outside dialogue).
+bool gdialog_rt_has_reply_window();
 int gDialogStart();
 int gDialogSayMessage();
 int gDialogOption(int messageListId, int messageId, const char* proc, int reaction);

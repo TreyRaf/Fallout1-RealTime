@@ -170,6 +170,10 @@ static void rt_update_player_slot();
 static bool rt_player_slot_may_attack(Object* critter, RtCritterState* state);
 static int rt_reload_commit(void* a1, void* a2);
 static int rt_reload_finish(void* a1, void* a2);
+static void rt_update_x_button(bool pressX);
+static void rt_update_holster();
+static void rt_update_draw();
+static int rt_holster_commit(void* a1, void* a2);
 static void rt_update_reload();
 static bool rt_get_play_area(int* width, int* height);
 static bool rt_is_automatic(int hitMode);
@@ -201,6 +205,8 @@ static int rt_camera_margin_pct = 25;
 static int rt_run_drain_ms = 400;
 static int rt_ap_regen_ms = 800;
 static int rt_ms_per_ap = 110;
+// X held this long holsters the weapon (shorter: a reload).
+static int rt_holster_hold_ms = 400;
 
 static FILE* rt_log_stream = NULL;
 static char rt_log_dir[COMPAT_MAX_PATH] = "";
@@ -281,6 +287,19 @@ static Object* rt_reload_weapon = NULL;
 static unsigned int rt_reload_until = 0;
 static unsigned int rt_reload_requested_until = 0;
 
+// X (see `rt_update_x_button`) and holstering (see `rt_update_holster`).
+static bool rt_x_pending = false;
+static unsigned int rt_x_pressed_at = 0;
+static unsigned int rt_x_seen_at = 0;
+static int rt_x_interruptions = 0;
+static bool rt_holster_active = false;
+static bool rt_holster_committed = false;
+static Object* rt_holster_weapon = NULL;
+static unsigned int rt_holster_requested_until = 0;
+// A draw animation waiting for the player's current animation to end.
+static Object* rt_draw_pending = NULL;
+static unsigned int rt_draw_until = 0;
+
 // Chem use with RT or a favorite (see `rt_update_chem_request`).
 static bool rt_chem_active = false;
 static unsigned int rt_chem_requested_until = 0;
@@ -343,6 +362,9 @@ static void rt_init()
     }
     if (config_get_value(&game_config, RT_CONFIG_SECTION, "attack_cooldown_ms_per_ap", &value) && value >= 0) {
         rt_ms_per_ap = value;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "holster_hold_ms", &value) && value >= 100 && value <= 2000) {
+        rt_holster_hold_ms = value;
     }
 
     rt_open_log();
@@ -492,6 +514,11 @@ void rt_reset()
     rt_player_recovery_until = 0;
     rt_chem_request_item = NULL;
     rt_fav_pending_slot = -1;
+    rt_x_pending = false;
+    rt_holster_active = false;
+    rt_holster_weapon = NULL;
+    rt_draw_pending = NULL;
+    rt_holster_requested_until = 0;
     rt_interact_manual = NULL;
     rt_interact_candidates.clear();
     rt_reach_cache.clear();
@@ -531,6 +558,12 @@ void rt_object_erased(Object* obj)
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
         rt_log("lock: cleared (target removed)");
+    }
+    if (rt_holster_weapon == obj) {
+        rt_holster_weapon = NULL;
+    }
+    if (rt_draw_pending == obj) {
+        rt_draw_pending = NULL;
     }
     if (rt_reload_weapon == obj) {
         rt_reload_weapon = NULL;
@@ -1917,9 +1950,9 @@ static void rt_update_dude(float dtMs)
         }
     }
 
-    if (pressX) {
-        rt_reload_requested_until = rt_now + RT_RELOAD_BUFFER_MS;
-    }
+    rt_update_x_button(pressX);
+    rt_update_holster();
+    rt_update_draw();
     if (rt_reload_requested_until != 0) {
         if (rt_reload() != RT_RELOAD_WAIT) {
             rt_reload_requested_until = 0;
@@ -2146,7 +2179,7 @@ static void rt_update_movement(bool canAct)
     bool stick = stickX != 0.0f || stickY != 0.0f;
 
     // No walking during a reload: the holster and draw animations play in place.
-    if (!canAct || rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active) {
+    if (!canAct || rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active || rt_holster_active) {
         if (stick) {
             static unsigned int lastBlockedLog = 0;
             if (rt_now - lastBlockedLog >= 500) {
@@ -2930,7 +2963,7 @@ static int rt_player_attack(bool explicitPress)
     }
 
     // No firing until a reload is complete.
-    if (rt_reload_active) {
+    if (rt_reload_active || rt_holster_active) {
         return RT_PLAYER_ATTACK_WAIT;
     }
 
@@ -3049,7 +3082,7 @@ bool rt_aim_player_in_attack()
 
 int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost)
 {
-    if (rt_reload_active || rt_chem_active) {
+    if (rt_reload_active || rt_chem_active || rt_holster_active) {
         return RT_AIM_ATTACK_WAIT;
     }
 
@@ -3092,7 +3125,13 @@ bool rt_player_can_change_equipment()
     return !rt_obj_in_attack(obj_dude)
         && !rt_reload_active
         && !rt_chem_active
+        && !rt_holster_active
         && !rt_aimed_is_executing();
+}
+
+bool rt_is_holstering()
+{
+    return rt_holster_active;
 }
 
 void rt_use_item_on_self(Object* item)
@@ -3378,6 +3417,11 @@ static int rt_reload()
         return RT_RELOAD_FAILED;
     }
 
+    // A holster in progress finishes first.
+    if (rt_holster_active) {
+        return RT_RELOAD_WAIT;
+    }
+
     Object* item = NULL;
     if (intface_get_current_item(&item) != 0 || item == NULL || item_get_type(item) != ITEM_TYPE_WEAPON || item_w_max_ammo(item) <= 0) {
         rt_print("The active item doesn't use ammo.");
@@ -3506,6 +3550,186 @@ static void rt_update_reload()
         rt_stats.reloadsInterrupted++;
         rt_print("Reload interrupted.");
         rt_log("reload: interrupted before the ammo moved (nothing loaded)");
+    }
+}
+
+// X: a tap reloads, a hold (rt_holster_hold_ms) holsters. Nothing happens
+// on the press itself; a hold acts once when it reaches the threshold and
+// its release does nothing. A press interrupted on the way (a menu, focus
+// loss, a disconnect: no gameplay tick for a while, or the hold no longer
+// valid while the button is still down) is dropped.
+static void rt_update_x_button(bool pressX)
+{
+    unsigned int now = SDL_GetTicks();
+    if (pressX) {
+        rt_x_pending = true;
+        rt_x_pressed_at = now;
+        rt_x_seen_at = now;
+        rt_x_interruptions = gamepad_get_interruption_count();
+        return;
+    }
+
+    if (!rt_x_pending) {
+        return;
+    }
+
+    bool gap = now - rt_x_seen_at > 250;
+    rt_x_seen_at = now;
+    if (gap || rt_x_interruptions != gamepad_get_interruption_count()) {
+        rt_x_pending = false;
+        rt_log("input: X press dropped (interrupted)");
+        return;
+    }
+
+    if (gamepad_is_held(GAMEPAD_BUTTON_X)) {
+        if (now - rt_x_pressed_at >= (unsigned int)rt_holster_hold_ms) {
+            rt_x_pending = false;
+            rt_holster_requested_until = rt_now + RT_RELOAD_BUFFER_MS;
+            rt_log("input: X held %u ms: holster", now - rt_x_pressed_at);
+        }
+        return;
+    }
+
+    rt_x_pending = false;
+    if (gamepad_get_state()->buttons[GAMEPAD_BUTTON_X]) {
+        // Still down but no longer a valid hold: interrupted.
+        rt_log("input: X press dropped (hold interrupted)");
+        return;
+    }
+
+    rt_stats.reloadTaps++;
+    rt_reload_requested_until = rt_now + RT_RELOAD_BUFFER_MS;
+}
+
+// Holstering plays the weapon's own put-away animation and then puts the
+// weapon back in the inventory (with its ammunition; favorites point at the
+// item type, so they still find it). Unarmed afterwards. Cut short before
+// the weapon was put away, nothing changes.
+static void rt_update_holster()
+{
+    if (rt_holster_active) {
+        if (rt_holster_committed || !anim_busy(obj_dude)) {
+            if (!rt_holster_committed) {
+                rt_print("Holster interrupted.");
+                rt_log("holster: interrupted before the weapon was put away");
+            }
+            if (!anim_busy(obj_dude)) {
+                rt_holster_active = false;
+                rt_holster_weapon = NULL;
+            }
+        }
+        return;
+    }
+
+    if (rt_holster_requested_until == 0) {
+        return;
+    }
+
+    Object* item = NULL;
+    if (intface_get_current_item(&item) != 0 || item == NULL || item_get_type(item) != ITEM_TYPE_WEAPON || !rt_weapon_in_hand(item)) {
+        // Nothing in hand: holding X does nothing.
+        rt_holster_requested_until = 0;
+        rt_log("holster: nothing in hand");
+        return;
+    }
+
+    if (rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active || rt_aimed_is_executing()) {
+        if (rt_now > rt_holster_requested_until) {
+            rt_holster_requested_until = 0;
+            rt_print("You can't holster right now.");
+        }
+        return;
+    }
+
+    rt_holster_requested_until = 0;
+    rt_holster_active = true;
+    rt_holster_committed = false;
+    rt_holster_weapon = item;
+    rt_stats.holstersStarted++;
+    rt_stop_walking();
+    rt_set_interact_highlight(NULL);
+
+    int code = item_w_anim_code(item);
+    int putAwayFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_PUT_AWAY, code, obj_dude->rotation + 1);
+    if (code != 0 && art_exists(putAwayFid)) {
+        if (anim_busy(obj_dude)) {
+            register_clear(obj_dude);
+        }
+        register_begin(ANIMATION_REQUEST_RESERVED);
+        register_object_play_sfx(obj_dude, gsnd_build_character_sfx_name(obj_dude, ANIM_PUT_AWAY, CHARACTER_SOUND_EFFECT_UNUSED), 0);
+        register_object_animate(obj_dude, ANIM_PUT_AWAY, 0);
+        register_object_call(item, NULL, (AnimationCallback*)rt_holster_commit, -1);
+        if (register_end() == 0) {
+            rt_stats.holsterAnimations++;
+            rt_log("holster: putting away %s", object_name(item));
+            return;
+        }
+    }
+
+    // No put-away art (or it couldn't start): put away at once.
+    rt_log("holster: no put-away animation for %s (weapon code %d)", object_name(item), code);
+    rt_holster_commit(item, NULL);
+}
+
+static int rt_holster_commit(void* a1, void* a2)
+{
+    Object* weapon = (Object*)a1;
+    if (!rt_holster_active || rt_holster_committed || weapon != rt_holster_weapon) {
+        return 0;
+    }
+
+    rt_holster_committed = true;
+    if (!rt_weapon_in_hand(weapon)) {
+        rt_log("holster: the weapon left the hand meanwhile");
+        return 0;
+    }
+
+    inven_rt_unequip(weapon);
+    rt_stats.holstersCompleted++;
+    rt_print("You put away the %s.", object_name(weapon));
+    rt_log("holster: %s put away (%d/%d rounds)", object_name(weapon), item_w_curr_ammo(weapon), item_w_max_ammo(weapon));
+    return 0;
+}
+
+static void rt_update_draw()
+{
+    if (rt_draw_pending == NULL) {
+        return;
+    }
+    if (rt_now > rt_draw_until || !rt_weapon_in_hand(rt_draw_pending)) {
+        rt_draw_pending = NULL;
+        return;
+    }
+    if (!anim_busy(obj_dude) && !rt_obj_in_attack(obj_dude)) {
+        rt_play_draw(rt_draw_pending);
+    }
+}
+
+void rt_play_draw(Object* weapon)
+{
+    if (weapon == NULL || item_get_type(weapon) != ITEM_TYPE_WEAPON) {
+        return;
+    }
+    if (anim_busy(obj_dude) || rt_obj_in_attack(obj_dude)) {
+        // Played once the current animation is over (see `rt_update_draw`).
+        rt_draw_pending = weapon;
+        rt_draw_until = rt_now + RT_RELOAD_BUFFER_MS;
+        return;
+    }
+    rt_draw_pending = NULL;
+
+    int code = item_w_anim_code(weapon);
+    int takeOutFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_TAKE_OUT, code, obj_dude->rotation + 1);
+    if (code == 0 || !art_exists(takeOutFid)) {
+        rt_log("draw: no take-out art for %s (weapon code %d)", object_name(weapon), code);
+        return;
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_object_take_out(obj_dude, code, -1);
+    if (register_end() == 0) {
+        rt_stats.drawsPlayed++;
+        rt_log("draw: taking out %s", object_name(weapon));
     }
 }
 

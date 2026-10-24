@@ -957,6 +957,11 @@ static int gdialog_unhide_reply()
 // Renders supplementary message in reply area of the dialog.
 //
 // 0x43E524
+bool gdialog_rt_has_reply_window()
+{
+    return gd_replyWin != -1 && gReplyWin != -1;
+}
+
 void gdialog_display_msg(char* msg)
 {
     if (gd_replyWin == -1) {

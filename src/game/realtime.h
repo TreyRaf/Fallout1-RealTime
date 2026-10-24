@@ -79,6 +79,13 @@ typedef struct RtStats {
     // Interaction candidates cycled with the D-pad.
     int interactCycles;
     int favoritesOpened;
+    // X: taps that asked for a reload; holsters started, completed and
+    // animated; draw animations played when a weapon is readied again.
+    int reloadTaps;
+    int holstersStarted;
+    int holstersCompleted;
+    int holsterAnimations;
+    int drawsPlayed;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -152,6 +159,10 @@ bool rt_player_can_change_equipment();
 // Uses a chem on the player, as RT with a chem does (waits for a moment
 // when nothing else involves the player).
 void rt_use_item_on_self(Object* item);
+// Plays the weapon's draw (take out) animation after it was readied.
+void rt_play_draw(Object* weapon);
+// A holster (X held) is in progress.
+bool rt_is_holstering();
 
 // Interaction candidates (A): what is highlighted and how many there are.
 int rt_get_interact_candidate_count();

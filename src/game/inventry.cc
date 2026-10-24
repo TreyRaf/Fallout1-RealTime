@@ -4895,6 +4895,302 @@ static void display_table_inventories(int win, Object* a2, Object* a3, int a4)
     text_font(oldFont);
 }
 
+// -----------------------------------------------------------------------------
+// RT: barter screen controller layer
+// -----------------------------------------------------------------------------
+
+static InvenRtBarterState barter_rt;
+static unsigned int barter_rt_message_until = 0;
+
+const InvenRtBarterState* inven_rt_barter_state()
+{
+    return &barter_rt;
+}
+
+static void barter_rt_say(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(barter_rt.lastMessage, sizeof(barter_rt.lastMessage), format, args);
+    va_end(args);
+    barter_rt_message_until = SDL_GetTicks() + 3500;
+    rt_log("barter: %s", barter_rt.lastMessage);
+}
+
+static Inventory* barter_rt_list(int column)
+{
+    switch (column) {
+    case INVEN_RT_BARTER_PLAYER_ITEMS:
+        return pud;
+    case INVEN_RT_BARTER_PLAYER_OFFER:
+        return ptable_pud;
+    case INVEN_RT_BARTER_TRADER_OFFER:
+        return btable_pud;
+    default:
+        return target_pud;
+    }
+}
+
+static int* barter_rt_offset(int column)
+{
+    switch (column) {
+    case INVEN_RT_BARTER_PLAYER_ITEMS:
+        return &(stack_offset[curr_stack]);
+    case INVEN_RT_BARTER_PLAYER_OFFER:
+        return &ptable_offset;
+    case INVEN_RT_BARTER_TRADER_OFFER:
+        return &btable_offset;
+    default:
+        return &(target_stack_offset[target_curr_stack]);
+    }
+}
+
+// Whether the trader would accept the current offer: the conditions of
+// `barter_attempt_transaction`, without making the exchange.
+static bool barter_rt_would_accept()
+{
+    return ptable->data.inventory.length != 0
+        && !item_queued(ptable)
+        && barter_compute_value(inven_dude, target_stack[0]) <= item_total_cost(ptable);
+}
+
+static void barter_rt_clamp()
+{
+    for (int column = 0; column < 4; column++) {
+        Inventory* list = barter_rt_list(column);
+        int count = list->length;
+        int* offset = barter_rt_offset(column);
+        int* selected = &(barter_rt.selected[column]);
+
+        *selected = std::clamp(*selected, 0, std::max(count - 1, 0));
+        *offset = std::clamp(*offset, 0, std::max(count - inven_cur_disp, 0));
+        if (count > 0) {
+            if (*selected < *offset) {
+                *offset = *selected;
+            } else if (*selected >= *offset + inven_cur_disp) {
+                *offset = *selected - inven_cur_disp + 1;
+            }
+        }
+
+        barter_rt.offset[column] = *offset;
+        barter_rt.count[column] = count;
+    }
+
+    Inventory* list = barter_rt_list(barter_rt.column);
+    if (list->length > 0) {
+        InventoryItem* entry = &(list->items[barter_rt.selected[barter_rt.column]]);
+        barter_rt.selectedItem = entry->item;
+        barter_rt.selectedQuantity = entry->quantity;
+    } else {
+        barter_rt.selectedItem = NULL;
+        barter_rt.selectedQuantity = 0;
+    }
+
+    barter_rt.offerValue = item_total_cost(ptable);
+    barter_rt.askValue = barter_compute_value(inven_dude, target_stack[0]);
+    barter_rt.accepts = barter_rt_would_accept();
+}
+
+// The four lists with the selection boxes (bright in the focused column,
+// dim in the others) and the status line.
+static void barter_rt_draw()
+{
+    barter_rt_clamp();
+    display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_TRADE);
+    display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_TRADE);
+    display_table_inventories(barter_back_win, ptable, btable, -1);
+
+    static const int xs[4] = { INVENTORY_TRADE_LEFT_SCROLLER_X, INVENTORY_TRADE_INNER_LEFT_SCROLLER_X_PAD, INVENTORY_TRADE_INNER_RIGHT_SCROLLER_X_PAD, INVENTORY_TRADE_RIGHT_SCROLLER_X_PAD };
+    static const int ys[4] = { INVENTORY_TRADE_LEFT_SCROLLER_Y, INVENTORY_TRADE_INNER_LEFT_SCROLLER_Y_PAD, INVENTORY_TRADE_INNER_RIGHT_SCROLLER_Y_PAD, INVENTORY_TRADE_RIGHT_SCROLLER_Y };
+
+    unsigned char* buffer = win_get_buf(i_wid);
+    int bright = colorTable[32747];
+    int dim = colorTable[8804];
+    for (int column = 0; column < 4; column++) {
+        if (barter_rt.count[column] == 0) {
+            continue;
+        }
+        bool table = column == INVEN_RT_BARTER_PLAYER_OFFER || column == INVEN_RT_BARTER_TRADER_OFFER;
+        int width = table ? INVENTORY_SLOT_WIDTH_PAD : INVENTORY_SLOT_WIDTH;
+        int height = table ? INVENTORY_SLOT_HEIGHT_PAD : INVENTORY_SLOT_HEIGHT;
+        int x = xs[column];
+        int y = ys[column] + INVENTORY_SLOT_HEIGHT * (barter_rt.selected[column] - barter_rt.offset[column]);
+        bool focused = column == barter_rt.column;
+        draw_box(buffer, INVENTORY_TRADE_WINDOW_WIDTH, x, y, x + width - 1, y + height - 1, focused ? bright : dim);
+        if (focused) {
+            draw_box(buffer, INVENTORY_TRADE_WINDOW_WIDTH, x + 1, y + 1, x + width - 2, y + height - 2, bright);
+        }
+    }
+
+    // Above the two offers (the board between them): whether the trader
+    // accepts now, and the actions.
+    const int panelX = 152;
+    const int panelWidth = 184;
+    const int panelHeight = INVENTORY_TRADE_INNER_LEFT_SCROLLER_Y;
+    unsigned char* background = win_get_buf(barter_back_win);
+    buf_to_buf(background + INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH * 0 + panelX + INVENTORY_TRADE_WINDOW_OFFSET, panelWidth, panelHeight,
+        INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH, buffer + panelX, INVENTORY_TRADE_WINDOW_WIDTH);
+
+    int oldFont = text_curr();
+    text_font(101);
+    char text[96];
+    int color;
+    if (barter_rt.accepts) {
+        snprintf(text, sizeof(text), "Deal: $%d for $%d", barter_rt.offerValue, barter_rt.askValue);
+        color = colorTable[992];
+    } else if (ptable_pud->length == 0 && btable_pud->length == 0) {
+        snprintf(text, sizeof(text), "Nothing on offer");
+        color = colorTable[32747];
+    } else {
+        snprintf(text, sizeof(text), "No deal: $%d of $%d", barter_rt.offerValue, barter_rt.askValue);
+        color = colorTable[31744];
+    }
+    if (barter_rt.lastMessage[0] != '\0' && SDL_GetTicks() < barter_rt_message_until) {
+        SDL_strlcpy(text, barter_rt.lastMessage, sizeof(text));
+        color = colorTable[32747];
+    }
+    int lineHeight = text_height();
+    text_to_buf(buffer + panelX + (panelWidth - std::min(text_width(text), panelWidth)) / 2, text, panelWidth, INVENTORY_TRADE_WINDOW_WIDTH, color);
+    const char* prompts = "X Trade  Y Review  B Leave";
+    text_to_buf(buffer + INVENTORY_TRADE_WINDOW_WIDTH * (lineHeight - 1) + panelX + (panelWidth - text_width(prompts)) / 2,
+        prompts, panelWidth, INVENTORY_TRADE_WINDOW_WIDTH, colorTable[992]);
+    text_font(oldFont);
+
+    win_draw(i_wid);
+}
+
+// A: the selected item onto the offer, or off it back to its owner; a stack
+// asks how many. The same moves as dragging it with the mouse.
+static void barter_rt_select()
+{
+    barter_rt_clamp();
+    int column = barter_rt.column;
+    Inventory* list = barter_rt_list(column);
+    if (list->length == 0) {
+        barter_rt_say("Nothing there.");
+        return;
+    }
+
+    InventoryItem* entry = &(list->items[barter_rt.selected[column]]);
+    Object* item = entry->item;
+    int quantity = entry->quantity;
+    char name[64];
+    SDL_strlcpy(name, object_name(item), sizeof(name));
+
+    int amount = 1;
+    if (quantity > 1) {
+        amount = do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, item, quantity);
+        if (amount == -1) {
+            barter_rt_say("Nothing moved.");
+            return;
+        }
+    }
+
+    Object* trader = target_stack[0];
+    Object* from;
+    Object* to;
+    switch (column) {
+    case INVEN_RT_BARTER_PLAYER_ITEMS:
+        from = inven_dude;
+        to = ptable;
+        break;
+    case INVEN_RT_BARTER_PLAYER_OFFER:
+        from = ptable;
+        to = inven_dude;
+        break;
+    case INVEN_RT_BARTER_TRADER_OFFER:
+        from = btable;
+        to = trader;
+        break;
+    default:
+        from = trader;
+        to = btable;
+        break;
+    }
+
+    MessageListItem messageListItem;
+    if (item_move_force(from, to, item, amount) == -1) {
+        // There is no space left for that item.
+        messageListItem.num = 26;
+        if (message_search(&inventry_message_file, &messageListItem)) {
+            display_print(messageListItem.text);
+        }
+        barter_rt_say("That doesn't fit.");
+        return;
+    }
+
+    gsound_play_sfx_file("iputdown");
+    bool onOffer = to == ptable || to == btable;
+    if (amount > 1) {
+        barter_rt_say(onOffer ? "Offered %d x %s." : "Took back %d x %s.", amount, name);
+    } else {
+        barter_rt_say(onOffer ? "Offered the %s." : "Took back the %s.", name);
+    }
+}
+
+// Y: what each side offers, their values and whether it's a deal, in the
+// trader's reply window.
+static void barter_rt_review()
+{
+    barter_rt_clamp();
+    barter_rt.reviews++;
+    char text[256];
+    snprintf(text, sizeof(text), "You offer %d item(s) worth $%d. %s offers %d item(s); you need $%d. %s",
+        ptable_pud->length, barter_rt.offerValue, critter_name(target_stack[0]), btable_pud->length, barter_rt.askValue,
+        barter_rt.accepts ? "The trader would accept (X to trade)." : "The trader would not accept this.");
+    barter_rt_say("%s", text);
+    if (gdialog_rt_has_reply_window()) {
+        gdialog_display_msg(text);
+    }
+}
+
+void inven_rt_debug_barter(Object* trader)
+{
+    Object* playerTable;
+    Object* traderTable;
+    if (obj_new(&playerTable, -1, -1) == -1) {
+        return;
+    }
+    if (obj_new(&traderTable, -1, -1) == -1) {
+        obj_erase_object(playerTable, NULL);
+        return;
+    }
+    playerTable->flags |= OBJECT_HIDDEN;
+    traderTable->flags |= OBJECT_HIDDEN;
+
+    // The barter strip the dialogue screen puts at the bottom (trade.frm).
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(art_id(OBJ_TYPE_INTERFACE, 111, 0, 0, 0), &handle);
+    int height = art != NULL ? art_frame_length(art, 0, 0) : INVENTORY_TRADE_WINDOW_HEIGHT;
+    int win = win_add((screenGetWidth() - INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH) / 2, screenGetHeight() - height,
+        INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH, height, colorTable[0], WINDOW_MODAL);
+    if (win != -1 && art != NULL) {
+        buf_to_buf(art_frame_data(art, 0, 0), INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH, height, INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH,
+            win_get_buf(win), INVENTORY_TRADE_BACKGROUND_WINDOW_WIDTH);
+        win_draw(win);
+    }
+    if (art != NULL) {
+        art_ptr_unlock(handle);
+    }
+    if (win != -1) {
+        barter_inventory(win, trader, playerTable, traderTable, 0);
+        win_delete(win);
+    }
+
+    // As `dialogue_barter_cleanup_tables`: what is still on the tables goes
+    // back to its owner.
+    while (playerTable->data.inventory.length > 0) {
+        Object* item = playerTable->data.inventory.items[0].item;
+        item_move_force(playerTable, obj_dude, item, item_count(playerTable, item));
+    }
+    while (traderTable->data.inventory.length > 0) {
+        Object* item = traderTable->data.inventory.items[0].item;
+        item_move_force(traderTable, trader, item, item_count(traderTable, item));
+    }
+    obj_erase_object(traderTable, NULL);
+    obj_erase_object(playerTable, NULL);
+}
+
 // 0x4684E4
 void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
 {
@@ -4968,6 +5264,17 @@ void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
         assert(false && "Should be unreachable");
     }
 
+    // RT: the controller drives the screen with keys (see `inventry.h`);
+    // the trader's items are focused.
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    gamepad_set_menu_key_mode(true);
+    memset(&barter_rt, 0, sizeof(barter_rt));
+    barter_rt.open = true;
+    barter_rt.column = INVEN_RT_BARTER_TRADER_ITEMS;
+    barter_mod = a5 + modifier;
+    barter_rt_draw();
+    rt_log("barter: open with %s (%d items, %d carried)", critter_name(a2), barter_rt.count[INVEN_RT_BARTER_TRADER_ITEMS], barter_rt.count[INVEN_RT_BARTER_PLAYER_ITEMS]);
+
     int keyCode = -1;
     for (;;) {
         sharedFpsLimiter.mark();
@@ -4987,6 +5294,53 @@ void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
 
         barter_mod = a5 + modifier;
 
+        // RT: controller keys first; X and Back become the original Offer
+        // and Talk keys.
+        bool rtHandled = true;
+        switch (keyCode) {
+        case GAMEPAD_KEY_LT:
+            barter_rt.column = INVEN_RT_BARTER_PLAYER_ITEMS;
+            break;
+        case GAMEPAD_KEY_RT:
+            barter_rt.column = INVEN_RT_BARTER_TRADER_ITEMS;
+            break;
+        case KEY_PAGE_UP:
+            barter_rt.column = INVEN_RT_BARTER_PLAYER_OFFER;
+            break;
+        case KEY_PAGE_DOWN:
+            barter_rt.column = INVEN_RT_BARTER_TRADER_OFFER;
+            break;
+        case KEY_ARROW_LEFT:
+        case KEY_ARROW_RIGHT:
+            barter_rt.column = std::clamp(barter_rt.column + (keyCode == KEY_ARROW_RIGHT ? 1 : -1), 0, 3);
+            break;
+        case KEY_ARROW_UP:
+        case KEY_ARROW_DOWN:
+            barter_rt.selected[barter_rt.column] += keyCode == KEY_ARROW_DOWN ? 1 : -1;
+            break;
+        case KEY_RETURN:
+            barter_rt_select();
+            break;
+        case GAMEPAD_KEY_Y:
+            barter_rt_review();
+            break;
+        default:
+            rtHandled = false;
+            break;
+        }
+        if (rtHandled) {
+            if (keyCode == GAMEPAD_KEY_LT || keyCode == GAMEPAD_KEY_RT || keyCode == KEY_PAGE_UP || keyCode == KEY_PAGE_DOWN
+                || keyCode == KEY_ARROW_LEFT || keyCode == KEY_ARROW_RIGHT) {
+                gsound_play_sfx_file("ib1p1xx1");
+            }
+            barter_rt_draw();
+            keyCode = -1;
+        } else if (keyCode == GAMEPAD_KEY_X) {
+            keyCode = KEY_LOWERCASE_M;
+        } else if (keyCode == GAMEPAD_KEY_BACK) {
+            keyCode = KEY_LOWERCASE_T;
+        }
+
         if (keyCode == KEY_LOWERCASE_T || modifier <= -30) {
             item_move_all(a4, a2);
             item_move_all(a3, obj_dude);
@@ -5002,15 +5356,24 @@ void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
 
                     // Ok, that's a good trade.
                     messageListItem.num = 27;
+                    barter_rt.trades++;
                 } else {
                     //  No, your offer is not good enough.
                     messageListItem.num = 28;
+                    barter_rt.rejections++;
                 }
 
                 if (message_search(&inventry_message_file, &messageListItem)) {
-                    gdialog_display_msg(messageListItem.text);
+                    barter_rt_say("%s", messageListItem.text);
+                    // RT: the reply window exists in dialogue (not in tests).
+                    if (gdialog_rt_has_reply_window()) {
+                        gdialog_display_msg(messageListItem.text);
+                    }
                 }
+            } else {
+                barter_rt_say("Nothing is on offer.");
             }
+            barter_rt_draw();
         } else if (keyCode == KEY_ARROW_UP) {
             if (stack_offset[curr_stack] > 0) {
                 stack_offset[curr_stack] -= 1;
@@ -5195,9 +5558,19 @@ void barter_inventory(int win, Object* a2, Object* a3, Object* a4, int a5)
             }
         }
 
+        // RT: after the original handling (mouse drags, scrolling) the
+        // selection boxes follow.
+        if (keyCode != -1 && keyCode != KEY_ESCAPE && barter_rt.open) {
+            barter_rt_draw();
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    barter_rt.open = false;
+    gamepad_set_menu_key_mode(keyModeWas);
+    rt_log("barter: closed (%d trades, %d refused)", barter_rt.trades, barter_rt.rejections);
 
     item_move_all(a1a, a2);
     obj_erase_object(a1a, NULL);

@@ -41,6 +41,7 @@
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
+#include "game/trait.h"
 #include "platform_compat.h"
 #include "plib/gnw/gamepad.h"
 #include "plib/gnw/input.h"
@@ -179,6 +180,18 @@ typedef enum AutotestCheck {
     C_LOOT_EMPTY,
     C_LOOT_SAFETY,
     C_LOOT_BIG_STACK,
+    C_BARTER_NAV,
+    C_BARTER_OFFER,
+    C_BARTER_REMOVE,
+    C_BARTER_TRADE,
+    C_BARTER_CANCEL,
+    C_BARTER_SAFETY,
+    C_HOLSTER_TAP,
+    C_HOLSTER_HOLD,
+    C_HOLSTER_UNARMED,
+    C_HOLSTER_REDRAW,
+    C_HOLSTER_CONTEXT,
+    C_LEVEL_ICON,
     C_COUNT,
 } AutotestCheck;
 
@@ -305,6 +318,18 @@ static const char* at_check_names[C_COUNT] = {
     "Loot: an empty container is safe (A, X, D-pad), B closes",
     "Loot: no item duplicated or lost; equipped items not offered; no input leaks into gameplay",
     "Loot: a 50,000-cap stack moves in one go (Y = all); RT/LT change the amount by 100, held they repeat",
+    "Barter: opens on the trader's items; LT/RT and LB/RB switch lists, each keeps its selection; up/down move",
+    "Barter: A puts an item (stacks: quantity) on the offer without changing its owner",
+    "Barter: A on an offer takes items back (quantity; B cancels)",
+    "Barter: totals and acceptance shown; X refuses a poor offer (nothing moves) and makes an accepted trade",
+    "Barter: leaving returns every offered item to its owner",
+    "Barter: no item or cap duplicated or lost; no input leaks into gameplay",
+    "X tapped reloads once (no holster)",
+    "X held holsters the weapon once with the put-away animation; no reload before or on release",
+    "After holstering: weapon kept with its ammo and favorite; RT attacks unarmed; X held unarmed does nothing",
+    "Readying the weapon again from favorites plays the draw animation",
+    "X keeps its menu meanings (loot Take All, AIMED SHOT undo); an interrupted hold does nothing",
+    "Level-up icon: on after a level up, stays while a perk is pending, clears when done; persists across save/load",
 };
 
 static int at_results[C_COUNT];
@@ -335,6 +360,7 @@ static void at_expect_menu(const char* screenshot, AtMenuScript* script);
 static void at_finish();
 static void at_clear_hostiles();
 static void at_record_save_state();
+static void at_record_level_state();
 
 static bool at_enabled = false;
 // Optional: only run steps whose name contains this text (development aid).
@@ -7725,11 +7751,33 @@ static bool step_fav_use(unsigned int elapsed, bool first, bool timedOut)
 
 // What the save holds, for the checks after loading (the favorites test
 // changed the hand since the Pip-Boy test).
+// Ammunition and inventory at save time too (checked after loading).
+static int at_save_ammo = -1;
+static int at_save_items = -1;
+static int at_save_weight = -1;
+
 static void at_record_save_state()
 {
+    Object* hand = inven_right_hand(obj_dude);
+    at_save_ammo = hand != NULL && item_get_type(hand) == ITEM_TYPE_WEAPON ? item_w_curr_ammo(hand) : -1;
+    at_save_items = 0;
+    for (int index = 0; index < obj_dude->data.inventory.length; index++) {
+        at_save_items += obj_dude->data.inventory.items[index].quantity;
+    }
+    at_save_weight = item_total_weight(obj_dude);
     at_pb_saved_weapon_pid = inven_right_hand(obj_dude) != NULL ? inven_right_hand(obj_dude)->pid : -1;
+    // Later steps (level-up indicator) change progression after the Pip-Boy
+    // test: compare against what the save holds.
+    if (at_pb_skill >= 0) {
+        at_pb_saved_skill_value = skill_level(obj_dude, at_pb_skill);
+    }
+    if (at_pb_perk >= 0) {
+        at_pb_saved_perk_level = perk_level(at_pb_perk);
+    }
+    at_pb_saved_unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
     memcpy(at_fav_saved, rt_favorites_get_state()->slots, sizeof(at_fav_saved));
     at_fav_saved_valid = true;
+    at_record_level_state();
 }
 
 static bool step_fav_persist(unsigned int elapsed, bool first, bool timedOut)
@@ -9025,6 +9073,969 @@ static bool step_loot(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Steps: barter screen
+// -----------------------------------------------------------------------------
+
+// Fixture: a calm human trader next to the player carrying a knife, a stack
+// of 4 Stimpaks and 200 caps; the player gets 5,000 caps. The barter screen
+// is opened directly (no trader in the maps the test visits).
+static Object* at_barter_trader = NULL;
+static Object* at_barter_knife = NULL;
+static int at_barter_knife_pid = -1;
+static int at_barter_stim_pid = -1;
+static bool at_barter_ok[12];
+static int at_barter_totals[3];
+static int at_barter_dude_before[3];
+static int at_barter_trader_before[3];
+static int at_barter_presses = 0;
+static int at_barter_phase;
+
+static const InvenRtBarterState* at_barter()
+{
+    return inven_rt_barter_state();
+}
+
+static Object* at_barter_new_trader()
+{
+    int tile = -1;
+    for (int rotation = 0; rotation < ROTATION_COUNT && tile == -1; rotation++) {
+        int candidate = tile_num_in_direction(obj_dude->tile, rotation, 1);
+        if (candidate != -1 && obj_blocking_at(NULL, candidate, obj_dude->elevation) == NULL) {
+            tile = candidate;
+        }
+    }
+    if (tile == -1) {
+        return NULL;
+    }
+
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        Object* critter;
+        if (proto_ptr(pid, &proto) == -1 || obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+        if (critter_body_type(critter) != BODY_TYPE_BIPED || critter->data.inventory.length != 0) {
+            Rect rect;
+            obj_erase_object(critter, &rect);
+            continue;
+        }
+        Rect rect;
+        obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        if (critter->sid != -1) {
+            scr_remove(critter->sid);
+            critter->sid = -1;
+        }
+        critter->data.critter.combat.team = 77;
+        return critter;
+    }
+    return NULL;
+}
+
+static void at_barter_give(Object* owner, int pid, int quantity)
+{
+    Object* item;
+    Rect rect;
+    if (obj_pid_new(&item, pid) != -1 && item_add_force(owner, item, quantity) == 0) {
+        obj_disconnect(item, &rect);
+    }
+}
+
+static int at_barter_pids[3];
+
+static void at_barter_count(int* dude, int* trader)
+{
+    for (int index = 0; index < 3; index++) {
+        dude[index] = at_count_pid_in(obj_dude, at_barter_pids[index]);
+        trader[index] = at_count_pid_in(at_barter_trader, at_barter_pids[index]);
+    }
+}
+
+// Selects `pid` in the focused column (down until found); true once there.
+static bool at_barter_goto(int pid)
+{
+    const InvenRtBarterState* state = at_barter();
+    if (state->selectedItem != NULL && state->selectedItem->pid == pid) {
+        return true;
+    }
+    if (at_pb_ready(150) && at_pb_tries++ < 40) {
+        int column = state->column;
+        bool down = state->selected[column] + 1 < state->count[column] && at_pb_tries < 25;
+        at_pb_tap(down ? GAMEPAD_BUTTON_DPAD_DOWN : GAMEPAD_BUTTON_DPAD_UP);
+    }
+    return false;
+}
+
+static bool at_menu_barter_script(unsigned int elapsed)
+{
+    const InvenRtBarterState* state = at_barter();
+    const InvenRtLootState* quantity = inven_rt_loot_state();
+    if (!state->open) {
+        return false;
+    }
+
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_log("barter script: phase %d timed out (column %d, selected %d/%d, quantity open %d)",
+            at_pb_phase, state->column, state->selected[state->column], state->count[state->column], quantity->quantityOpen);
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        return !quantity->quantityOpen;
+    }
+
+    int dude[3];
+    int trader[3];
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 600) {
+            at_barter_ok[0] = state->column == INVEN_RT_BARTER_TRADER_ITEMS && state->selected[INVEN_RT_BARTER_TRADER_ITEMS] == 0
+                && state->count[INVEN_RT_BARTER_TRADER_ITEMS] >= 3;
+            at_screenshot("barter_01_open");
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(250)) {
+            at_barter_ok[0] = at_barter_ok[0] && state->selected[INVEN_RT_BARTER_TRADER_ITEMS] == 1;
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready(250)) {
+            at_barter_ok[0] = at_barter_ok[0] && state->column == INVEN_RT_BARTER_PLAYER_ITEMS;
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (at_pb_ready(250)) {
+            at_barter_ok[0] = at_barter_ok[0] && state->selected[INVEN_RT_BARTER_PLAYER_ITEMS] == 1;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        if (at_pb_ready(250)) {
+            at_barter_ok[0] = at_barter_ok[0] && state->column == INVEN_RT_BARTER_TRADER_OFFER;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(250)) {
+            at_barter_ok[0] = at_barter_ok[0] && state->column == INVEN_RT_BARTER_TRADER_ITEMS && state->selected[INVEN_RT_BARTER_TRADER_ITEMS] == 1;
+            at_log("barter: navigation ok=%d", at_barter_ok[0]);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        // The knife (one) onto the trader's offer.
+        if (!at_barter_goto(at_barter_knife_pid) || !at_pb_ready(200)) {
+            break;
+        }
+        at_barter_count(at_barter_dude_before, at_barter_trader_before);
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(7);
+        break;
+    case 7:
+        if (at_pb_ready(400)) {
+            at_barter_count(dude, trader);
+            // On the table: neither the player's nor in the trader's list.
+            at_barter_ok[1] = !quantity->quantityOpen && state->count[INVEN_RT_BARTER_TRADER_OFFER] == 1
+                && dude[0] == at_barter_dude_before[0] && trader[0] == at_barter_trader_before[0] - 1;
+            at_pb_next(8);
+        }
+        break;
+    case 8:
+        // Two of the four Stimpaks.
+        if (!at_barter_goto(at_barter_stim_pid) || !at_pb_ready(200)) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(9);
+        break;
+    case 9:
+        if (quantity->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            at_pb_next(10);
+        }
+        break;
+    case 10:
+        if (at_pb_ready(300)) {
+            at_barter_ok[1] = at_barter_ok[1] && quantity->quantityValue == 2;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(11);
+        }
+        break;
+    case 11:
+        if (!quantity->quantityOpen && at_pb_ready(400)) {
+            at_barter_count(dude, trader);
+            at_barter_ok[1] = at_barter_ok[1] && dude[1] == at_barter_dude_before[1] && trader[1] == at_barter_trader_before[1] - 2
+                && state->count[INVEN_RT_BARTER_TRADER_OFFER] == 2;
+            at_log("barter: item and 2 Stimpaks on the trader's offer, nothing changed owner=%d", at_barter_ok[1]);
+            // X with nothing offered by the player: refused, nothing moves.
+            at_count_a = state->rejections;
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(12);
+        }
+        break;
+    case 12:
+        if (at_pb_ready(500)) {
+            at_barter_count(dude, trader);
+            at_barter_ok[2] = state->rejections == at_count_a + 1 && !state->accepts && state->trades == 0
+                && dude[0] == at_barter_dude_before[0] && dude[1] == at_barter_dude_before[1];
+            at_log("barter: poor offer refused=%d ('%s'), ask $%d, offer $%d", at_barter_ok[2], state->lastMessage, state->askValue, state->offerValue);
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_next(13);
+        }
+        break;
+    case 13:
+        // All the player's caps (Y in the quantity window) on the offer.
+        if (state->column != INVEN_RT_BARTER_PLAYER_ITEMS || !at_barter_goto(PROTO_ID_MONEY) || !at_pb_ready(200)) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(14);
+        break;
+    case 14:
+        if (quantity->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(15);
+        }
+        break;
+    case 15:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(16);
+        }
+        break;
+    case 16:
+        if (!quantity->quantityOpen && at_pb_ready(400)) {
+            at_barter_count(dude, trader);
+            // Offered caps wait on the offer table: the trader has none of them yet.
+            at_barter_ok[3] = state->accepts && state->offerValue >= state->askValue && trader[2] == at_barter_trader_before[2];
+            at_screenshot("barter_02_offer");
+            at_log("barter: caps offered: offer $%d, ask $%d, accepts=%d, trader's caps still %d (nothing handed over)",
+                state->offerValue, state->askValue, state->accepts, trader[2]);
+            // Take one Stimpak back off the trader's offer: B first, then 1.
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            at_pb_next(17);
+        }
+        break;
+    case 17:
+        if (state->column != INVEN_RT_BARTER_TRADER_OFFER || !at_barter_goto(at_barter_stim_pid) || !at_pb_ready(200)) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(18);
+        break;
+    case 18:
+        if (quantity->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(19);
+        }
+        break;
+    case 19:
+        if (!quantity->quantityOpen && at_pb_ready(400)) {
+            at_barter_count(dude, trader);
+            at_barter_ok[4] = trader[1] == at_barter_trader_before[1] - 2;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(20);
+        }
+        break;
+    case 20:
+        if (quantity->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(21);
+        }
+        break;
+    case 21:
+        if (!quantity->quantityOpen && at_pb_ready(400)) {
+            at_barter_count(dude, trader);
+            at_barter_ok[4] = at_barter_ok[4] && trader[1] == at_barter_trader_before[1] - 1;
+            at_log("barter: one Stimpak taken back off the offer (B in the selector moved nothing)=%d", at_barter_ok[4]);
+            at_count_b = state->reviews;
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(22);
+        }
+        break;
+    case 22:
+        if (at_pb_ready(400)) {
+            at_barter_ok[5] = state->reviews == at_count_b + 1 && strstr(state->lastMessage, "would accept") != NULL;
+            at_log("barter: review: '%s'", state->lastMessage);
+            at_count_a = state->trades;
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(23);
+        }
+        break;
+    case 23:
+        if (at_pb_ready(500)) {
+            at_barter_count(dude, trader);
+            // The exchange: the knife and a Stimpak to the player, the caps to
+            // the trader.
+            at_barter_ok[6] = state->trades == at_count_a + 1 && dude[0] == at_barter_dude_before[0] + 1
+                && dude[1] == at_barter_dude_before[1] + 1 && dude[2] == 0 && trader[2] == at_barter_trader_before[2] + at_barter_dude_before[2];
+            at_screenshot("barter_03_traded");
+            at_log("barter: accepted trade=%d ('%s'): item %d->%d, Stimpaks %d->%d, caps %d->%d (trader %d->%d)",
+                at_barter_ok[6], state->lastMessage, at_barter_dude_before[0], dude[0], at_barter_dude_before[1], dude[1],
+                at_barter_dude_before[2], dude[2], at_barter_trader_before[2], trader[2]);
+            // A new offer, then leave: everything goes back.
+            at_barter_count(at_barter_dude_before, at_barter_trader_before);
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(24);
+        }
+        break;
+    case 24:
+        if (state->column != INVEN_RT_BARTER_TRADER_ITEMS || !at_barter_goto(PROTO_ID_MONEY) || !at_pb_ready(200)) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(25);
+        break;
+    case 25:
+        if (quantity->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(26);
+        }
+        break;
+    case 26:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(27);
+        }
+        break;
+    case 27:
+        if (!quantity->quantityOpen && at_pb_ready(400)) {
+            at_barter_ok[7] = state->count[INVEN_RT_BARTER_TRADER_OFFER] == 1;
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static int at_barter_attacks;
+static int at_barter_reloads;
+static Object* at_barter_lock;
+static int at_barter_interactions;
+
+static bool step_barter(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_move_to_clear_spot();
+        memset(at_barter_ok, 0, sizeof(at_barter_ok));
+        at_barter_trader = at_barter_new_trader();
+        // A misc item the player doesn't carry (a trader keeps its first
+        // weapon out of the trade, as in the original).
+        at_barter_knife = NULL;
+        for (int index = 1; index < 600 && at_barter_knife == NULL; index++) {
+            int pid = (OBJ_TYPE_ITEM << 24) | index;
+            Proto* proto;
+            if (proto_ptr(pid, &proto) != -1 && proto->item.type == ITEM_TYPE_MISC && proto->item.cost > 0
+                && proto->item.weight >= 1 && proto->item.weight <= 3 && at_count_pid_in(obj_dude, pid) == 0) {
+                at_barter_knife_pid = pid;
+                at_barter_knife = obj_dude;
+            }
+        }
+        for (int index = 1; index < 600 && at_chem_pid == -1; index++) {
+            int pid = (OBJ_TYPE_ITEM << 24) | index;
+            Proto* proto;
+            if (proto_ptr(pid, &proto) != -1 && proto->item.type == ITEM_TYPE_DRUG && SDL_strcasecmp(proto_name(pid), "Stimpak") == 0) {
+                at_chem_pid = pid;
+            }
+        }
+        if (at_barter_trader == NULL || at_barter_knife == NULL || at_chem_pid == -1) {
+            at_check(C_BARTER_NAV, false, "fixtures missing (trader %d, knife %d, Stimpak %d)", at_barter_trader != NULL, at_barter_knife != NULL, at_chem_pid != -1);
+            return true;
+        }
+
+        at_log("harness: the trader's item is a %s", proto_name(at_barter_knife_pid));
+        at_barter_stim_pid = at_chem_pid;
+        at_barter_pids[0] = at_barter_knife_pid;
+        at_barter_pids[1] = at_barter_stim_pid;
+        at_barter_pids[2] = PROTO_ID_MONEY;
+        at_barter_give(at_barter_trader, at_barter_knife_pid, 1);
+        at_barter_give(at_barter_trader, at_barter_stim_pid, 4);
+        at_barter_give(at_barter_trader, PROTO_ID_MONEY, 200);
+        // The player's caps: exactly 5,000.
+        int caps = item_caps_total(obj_dude);
+        if (caps < 5000) {
+            at_barter_give(obj_dude, PROTO_ID_MONEY, 5000 - caps);
+        } else if (caps > 5000) {
+            item_caps_adjust(obj_dude, 5000 - caps);
+        }
+        for (int index = 0; index < 3; index++) {
+            at_barter_totals[index] = at_count_pid_in(obj_dude, at_barter_pids[index]) + at_count_pid_in(at_barter_trader, at_barter_pids[index]);
+        }
+        at_log("harness: trader %s with a knife, 4 Stimpaks and 200 caps; the player has %d caps", critter_name(at_barter_trader), item_caps_total(obj_dude));
+        at_barter_attacks = rt_get_stats()->playerAttacks;
+        at_barter_reloads = rt_get_stats()->reloadsStarted;
+        at_barter_lock = rt_get_lock();
+        at_barter_interactions = rt_context_get_stats()->interactions;
+        at_barter_phase = 0;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        at_check(C_BARTER_NAV, at_results[C_BARTER_NAV] == 1, "timed out in phase %d", at_barter_phase);
+        return true;
+    }
+
+    switch (at_barter_phase) {
+    case 0:
+        if (!at_aim_released() || anim_busy(obj_dude)) {
+            break;
+        }
+        at_pb_next(0);
+        at_pb_last_press = SDL_GetTicks();
+        at_expect_menu(NULL, at_menu_barter_script);
+        at_barter_phase = 1;
+        // The barter screen as the dialogue opens it (modal).
+        inven_rt_debug_barter(at_barter_trader);
+        break;
+    case 1: {
+        at_menu_expected = false;
+        int dude[3];
+        int trader[3];
+        at_barter_count(dude, trader);
+        bool returned = dude[2] == at_barter_dude_before[2] && trader[2] == at_barter_trader_before[2];
+        bool conserved = true;
+        for (int index = 0; index < 3; index++) {
+            conserved = conserved && dude[index] + trader[index] == at_barter_totals[index];
+        }
+        bool quiet = rt_get_stats()->playerAttacks == at_barter_attacks && rt_get_stats()->reloadsStarted == at_barter_reloads
+            && rt_get_lock() == at_barter_lock && rt_context_get_stats()->interactions == at_barter_interactions;
+        at_check(C_BARTER_NAV, at_barter_ok[0], "opened on the trader's items; down, LT, down, RB, RT kept each list's selection=%d", at_barter_ok[0]);
+        at_check(C_BARTER_OFFER, at_barter_ok[1], "an item (A) and 2 of 4 Stimpaks (quantity) on the trader's offer, nobody's inventory changed hands=%d", at_barter_ok[1]);
+        at_check(C_BARTER_REMOVE, at_barter_ok[4], "one Stimpak taken back off the offer; B in the selector moved nothing=%d", at_barter_ok[4]);
+        at_check(C_BARTER_TRADE, at_barter_ok[2] && at_barter_ok[3] && at_barter_ok[5] && at_barter_ok[6],
+            "X with no player offer refused, nothing moved=%d; caps offered: acceptance shown=%d; Y review=%d; X traded (item + Stimpak for the caps)=%d",
+            at_barter_ok[2], at_barter_ok[3], at_barter_ok[5], at_barter_ok[6]);
+        at_check(C_BARTER_CANCEL, at_barter_ok[7] && returned,
+            "trader's 200 caps put on its offer, then B: caps back with the trader=%d (player %d, trader %d)", returned, dude[2], trader[2]);
+        at_check(C_BARTER_SAFETY, conserved && quiet,
+            "item/Stimpak/cap totals conserved=%d; no attack, reload, interaction or lock change=%d", conserved, quiet);
+        Rect rect;
+        obj_erase_object(at_barter_trader, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        at_barter_trader = NULL;
+        return true;
+    }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Steps: X tap/hold (reload, holster)
+// -----------------------------------------------------------------------------
+
+static int at_hx_phase;
+static unsigned int at_hx_time;
+static Object* at_hx_pistol = NULL;
+static int at_hx_ammo = 0;
+static int at_hx_reloads = 0;
+static int at_hx_holsters = 0;
+static int at_hx_taps = 0;
+static int at_hx_unarmed = 0;
+static int at_hx_draws = 0;
+static bool at_hx_ok[10];
+static bool at_hx_put_away_seen = false;
+static bool at_hx_take_out_seen = false;
+static Object* at_hx_rat = NULL;
+
+static bool at_menu_hx_close_script(unsigned int elapsed)
+{
+    if (elapsed > 600) {
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+    return false;
+}
+
+static bool step_holster(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_move_to_clear_spot();
+        memset(at_hx_ok, 0, sizeof(at_hx_ok));
+        at_hx_pistol = at_find_inventory("10mm Pistol");
+        at_hx_phase = 0;
+        at_hx_time = now;
+        if (at_hx_pistol == NULL) {
+            at_check(C_HOLSTER_TAP, false, "no pistol");
+            return true;
+        }
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        rt_favorites_debug_set(RT_FAVORITES_UP, -1);
+        at_check(C_HOLSTER_HOLD, at_results[C_HOLSTER_HOLD] == 1, "timed out in phase %d", at_hx_phase);
+        return true;
+    }
+
+    at_heal();
+    const RtStats* stats = rt_get_stats();
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    switch (at_hx_phase) {
+    case 0:
+        // The pistol in hand, two rounds short, ammunition carried.
+        if (!at_aim_released() || !at_wield(at_hx_pistol) || anim_busy(obj_dude) || rt_is_reloading()) {
+            break;
+        }
+        item_w_set_curr_ammo(at_hx_pistol, item_w_max_ammo(at_hx_pistol) - 2);
+        at_hx_reloads = stats->reloadsStarted;
+        at_hx_holsters = stats->holstersStarted;
+        at_hx_taps = stats->reloadTaps;
+        // A tap.
+        at_press(GAMEPAD_BUTTON_X);
+        at_hx_phase = 1;
+        at_hx_time = now;
+        break;
+    case 1:
+        if (now - at_hx_time < 2500 || rt_is_reloading()) {
+            break;
+        }
+        at_hx_ok[0] = stats->reloadsStarted == at_hx_reloads + 1 && stats->reloadTaps == at_hx_taps + 1 && stats->holstersStarted == at_hx_holsters
+            && item_w_curr_ammo(at_hx_pistol) == item_w_max_ammo(at_hx_pistol);
+        at_check(C_HOLSTER_TAP, at_hx_ok[0], "X tapped: reloads +%d, holsters +%d, ammo %d/%d",
+            stats->reloadsStarted - at_hx_reloads, stats->holstersStarted - at_hx_holsters, item_w_curr_ammo(at_hx_pistol), item_w_max_ammo(at_hx_pistol));
+        // A hold, with the pistol a favorite (it must still be after).
+        item_w_set_curr_ammo(at_hx_pistol, item_w_max_ammo(at_hx_pistol) - 3);
+        at_hx_ammo = item_w_curr_ammo(at_hx_pistol);
+        rt_favorites_debug_set(RT_FAVORITES_UP, at_hx_pistol->pid);
+        at_hx_reloads = stats->reloadsStarted;
+        at_hx_holsters = stats->holstersStarted;
+        at_hx_put_away_seen = false;
+        at_pad.buttons[GAMEPAD_BUTTON_X] = true;
+        at_hx_phase = 2;
+        at_hx_time = now;
+        break;
+    case 2:
+        // Before the threshold nothing has happened yet.
+        if (now - at_hx_time < 250) {
+            break;
+        }
+        at_hx_ok[1] = stats->reloadsStarted == at_hx_reloads && stats->holstersStarted == at_hx_holsters;
+        at_hx_phase = 3;
+        break;
+    case 3:
+        if (anim == ANIM_PUT_AWAY) {
+            at_hx_put_away_seen = true;
+        }
+        if (now - at_hx_time < 1400) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_X] = false;
+        at_hx_phase = 4;
+        at_hx_time = now;
+        break;
+    case 4:
+        if (anim == ANIM_PUT_AWAY) {
+            at_hx_put_away_seen = true;
+        }
+        if (now - at_hx_time < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        {
+            bool inHand = inven_right_hand(obj_dude) == at_hx_pistol || inven_left_hand(obj_dude) == at_hx_pistol;
+            bool carried = inven_rt_quantity(at_hx_pistol) >= 1;
+            at_hx_ok[2] = at_hx_ok[1] && stats->holstersStarted == at_hx_holsters + 1 && stats->holstersCompleted >= 1
+                && stats->reloadsStarted == at_hx_reloads && at_hx_put_away_seen && !inHand;
+            at_hx_ok[3] = carried && item_w_curr_ammo(at_hx_pistol) == at_hx_ammo && rt_favorites_find_item(RT_FAVORITES_UP) != NULL
+                && rt_favorites_find_item(RT_FAVORITES_UP)->pid == at_hx_pistol->pid;
+            at_screenshot("holster_01_unarmed");
+            at_check(C_HOLSTER_HOLD, at_hx_ok[2],
+                "X held 1.4 s: nothing before 0.4 s=%d, holsters +%d (put-away animation seen=%d), reloads +%d (none on release), pistol still in hand=%d",
+                at_hx_ok[1], stats->holstersStarted - at_hx_holsters, at_hx_put_away_seen, stats->reloadsStarted - at_hx_reloads, inHand);
+        }
+        // Unarmed RT on a calm rat next to the player.
+        at_hx_rat = at_spawn_rat(1, 1, false);
+        if (at_hx_rat != NULL) {
+            rt_debug_set_lock(at_hx_rat);
+        }
+        at_hx_unarmed = stats->playerUnarmed;
+        at_hx_phase = 5;
+        at_hx_time = now;
+        break;
+    case 5:
+        if (now - at_hx_time < 300) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_hx_phase = 6;
+        at_hx_time = now;
+        break;
+    case 6:
+        if (now - at_hx_time < 2500) {
+            break;
+        }
+        at_hx_ok[4] = stats->playerUnarmed > at_hx_unarmed;
+        // X held while unarmed: nothing.
+        at_hx_holsters = stats->holstersStarted;
+        at_hx_reloads = stats->reloadsStarted;
+        at_pad.buttons[GAMEPAD_BUTTON_X] = true;
+        at_hx_phase = 7;
+        at_hx_time = now;
+        break;
+    case 7:
+        if (now - at_hx_time < 1000) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_X] = false;
+        at_hx_phase = 8;
+        at_hx_time = now;
+        break;
+    case 8:
+        if (now - at_hx_time < 600) {
+            break;
+        }
+        {
+            bool nothing = stats->holstersStarted == at_hx_holsters && stats->reloadsStarted == at_hx_reloads;
+            at_check(C_HOLSTER_UNARMED, at_hx_ok[3] && at_hx_ok[4] && nothing,
+                "pistol in the inventory with its %d rounds and still the Up favorite=%d; RT attacked unarmed=%d; X held unarmed did nothing=%d",
+                at_hx_ammo, at_hx_ok[3], at_hx_ok[4], nothing);
+        }
+        if (at_hx_rat != NULL) {
+            Rect rect;
+            rt_debug_set_lock(NULL);
+            obj_erase_object(at_hx_rat, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_hx_rat = NULL;
+        }
+        // Up (the pistol favorite): readied with the draw animation.
+        at_hx_draws = stats->drawsPlayed;
+        at_hx_take_out_seen = false;
+        at_press(GAMEPAD_BUTTON_DPAD_UP);
+        at_hx_phase = 9;
+        at_hx_time = now;
+        break;
+    case 9:
+        if (anim == ANIM_TAKE_OUT) {
+            at_hx_take_out_seen = true;
+        }
+        if (now - at_hx_time < 1500) {
+            break;
+        }
+        {
+            Object* active = NULL;
+            intface_get_current_item(&active);
+            at_check(C_HOLSTER_REDRAW, active == at_hx_pistol && stats->drawsPlayed == at_hx_draws + 1 && at_hx_take_out_seen,
+                "Up readied %s, draw animations +%d (seen=%d)", active != NULL ? object_name(active) : "(nothing)",
+                stats->drawsPlayed - at_hx_draws, at_hx_take_out_seen);
+        }
+        rt_favorites_debug_set(RT_FAVORITES_UP, -1);
+        // An interrupted hold: X down, the controller pulled, back, released.
+        at_hx_holsters = stats->holstersStarted;
+        at_hx_reloads = stats->reloadsStarted;
+        at_pad.buttons[GAMEPAD_BUTTON_X] = true;
+        at_hx_phase = 10;
+        at_hx_time = now;
+        break;
+    case 10:
+        if (now - at_hx_time < 150) {
+            break;
+        }
+        at_pad.connected = false;
+        at_hx_phase = 11;
+        at_hx_time = now;
+        break;
+    case 11:
+        if (now - at_hx_time < 600) {
+            break;
+        }
+        at_pad.connected = true;
+        at_hx_phase = 12;
+        at_hx_time = now;
+        break;
+    case 12:
+        if (now - at_hx_time < 300) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_X] = false;
+        at_hx_phase = 13;
+        at_hx_time = now;
+        break;
+    case 13:
+        // Again through a menu: X down, B opens the Pip-Boy, it closes, X up.
+        if (now - at_hx_time < 800) {
+            break;
+        }
+        at_hx_ok[5] = stats->holstersStarted == at_hx_holsters && stats->reloadsStarted == at_hx_reloads;
+        at_pad.buttons[GAMEPAD_BUTTON_X] = true;
+        at_hx_phase = 14;
+        at_hx_time = now;
+        break;
+    case 14:
+        if (now - at_hx_time < 150) {
+            break;
+        }
+        at_expect_menu(NULL, at_menu_hx_close_script);
+        at_press(GAMEPAD_BUTTON_B);
+        at_hx_phase = 15;
+        at_hx_time = now;
+        break;
+    case 15:
+        if (!at_menu_seen || !at_menu_done || now - at_hx_time < 300) {
+            if (now - at_hx_time > 5000) {
+                at_hx_phase = 16;
+            }
+            break;
+        }
+        at_menu_expected = false;
+        at_pad.buttons[GAMEPAD_BUTTON_X] = false;
+        at_hx_phase = 16;
+        at_hx_time = now;
+        break;
+    case 16:
+        if (now - at_hx_time < 1000) {
+            break;
+        }
+        {
+            bool menuOk = stats->holstersStarted == at_hx_holsters && stats->reloadsStarted == at_hx_reloads;
+            // X in the loot screen (Take All) and AIMED SHOT (undo), checked in
+            // their own steps earlier.
+            bool menus = at_results[C_LOOT_TAKE_ALL] == 1 && at_results[C_AIM_QUEUE] == 1;
+            at_check(C_HOLSTER_CONTEXT, at_hx_ok[5] && menuOk && (menus || at_only[0] != 0),
+                "X held through a disconnect did nothing=%d; X held through the Pip-Boy did nothing=%d; loot X Take All and AIMED SHOT X undo passed=%d",
+                at_hx_ok[5], menuOk, menus);
+        }
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Steps: level-up indicator
+// -----------------------------------------------------------------------------
+
+static int at_lvl_mode = 0;
+static int at_lvl_phase;
+static unsigned int at_lvl_time;
+static bool at_lvl_ok[8];
+static int at_lvl_unspent = 0;
+static int at_lvl_perk = -1;
+static bool at_lvl_flag_saved = false;
+static bool at_lvl_perk_saved = false;
+
+// Mode 0: Inventory tab only, B. Mode 1: Stats tab, B. Mode 2: choose the
+// due perk on the Perks page, B.
+static bool at_menu_level_script(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        return state->mode == RT_PIPBOY_MODE_NONE;
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 400 && at_pb_goto_tab(at_lvl_mode == 0 ? RT_PIPBOY_TAB_INVENTORY : RT_PIPBOY_TAB_STATS)) {
+            at_pb_next(at_lvl_mode == 2 ? 1 : 9);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(300) && at_pb_goto_page(3)) {
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (state->mode == RT_PIPBOY_MODE_CHOOSE_PERK && at_pb_ready(300)) {
+            at_lvl_perk = -1;
+            for (int index = 0; index < state->choiceCount; index++) {
+                int perk = state->choices[index];
+                if (perk != PERK_TAG && perk != PERK_MUTATE) {
+                    at_lvl_perk = perk;
+                    break;
+                }
+            }
+            at_pb_next(at_lvl_perk != -1 ? 4 : 9);
+        }
+        break;
+    case 4:
+        if (at_pb_goto_choice(at_lvl_perk) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (state->mode == RT_PIPBOY_MODE_CONFIRM_PERK && at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        if (at_pb_ready(500) && state->mode == RT_PIPBOY_MODE_NONE) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static void at_lvl_open(int mode)
+{
+    at_lvl_mode = mode;
+    at_pb_next(0);
+    at_pb_last_press = SDL_GetTicks();
+    at_expect_menu(NULL, at_menu_level_script);
+    at_press(GAMEPAD_BUTTON_B);
+}
+
+static void at_lvl_gain(int levels)
+{
+    int target = stat_pc_get(PC_STAT_LEVEL) + levels;
+    while (stat_pc_get(PC_STAT_LEVEL) < target && stat_pc_get(PC_STAT_LEVEL) < PC_LEVEL_MAX) {
+        stat_pc_add_experience(stat_pc_min_exp() - stat_pc_get(PC_STAT_EXPERIENCE));
+    }
+}
+
+static bool step_level_icon(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        memset(at_lvl_ok, 0, sizeof(at_lvl_ok));
+        at_lvl_phase = 0;
+        at_lvl_time = now;
+        return false;
+    }
+    if (timedOut) {
+        at_menu_expected = false;
+        at_check(C_LEVEL_ICON, false, "timed out in phase %d", at_lvl_phase);
+        return true;
+    }
+
+    bool flag = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+    int progression = 3 + (trait_level(TRAIT_SKILLED) ? 1 : 0);
+    switch (at_lvl_phase) {
+    case 0: {
+        if (!at_aim_released()) {
+            break;
+        }
+        // The next level, one without a perk.
+        int level = stat_pc_get(PC_STAT_LEVEL) + 1;
+        at_lvl_gain(level % progression == 0 ? 2 : 1);
+        at_log("level icon: now level %d, icon on=%d", stat_pc_get(PC_STAT_LEVEL), is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE));
+        at_lvl_ok[0] = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+        at_lvl_open(0);
+        at_lvl_phase = 1;
+        break;
+    }
+    case 1:
+        if (!at_menu_seen || rt_pipboy_is_open()) {
+            break;
+        }
+        at_menu_expected = false;
+        // Points to spend, Stats not looked at: still on.
+        at_lvl_unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+        at_lvl_ok[1] = flag && at_lvl_unspent > 0;
+        at_log("level icon: after the Inventory tab: on=%d (unspent %d)", flag, at_lvl_unspent);
+        at_lvl_open(1);
+        at_lvl_phase = 2;
+        break;
+    case 2:
+        if (!at_menu_seen || rt_pipboy_is_open()) {
+            break;
+        }
+        at_menu_expected = false;
+        // Stats seen, no perk due: off, the points stay (banked).
+        at_lvl_ok[2] = !flag && stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == at_lvl_unspent;
+        at_log("level icon: after the Stats tab: on=%d, unspent %d (was %d)", flag, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS), at_lvl_unspent);
+        // Up to the next perk level.
+        {
+            int level = stat_pc_get(PC_STAT_LEVEL);
+            int levels = progression - level % progression;
+            at_lvl_gain(levels == 0 ? progression : levels);
+        }
+        at_lvl_open(1);
+        at_lvl_phase = 3;
+        break;
+    case 3:
+        if (!at_menu_seen || rt_pipboy_is_open()) {
+            break;
+        }
+        at_menu_expected = false;
+        // A perk due, not chosen: stays on.
+        at_lvl_ok[3] = flag && editor_rt_has_free_perk();
+        at_log("level icon: level %d, perk due=%d, after the Stats tab: on=%d", stat_pc_get(PC_STAT_LEVEL), editor_rt_has_free_perk(), flag);
+        at_lvl_unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+        at_lvl_open(2);
+        at_lvl_phase = 4;
+        break;
+    case 4:
+        if (!at_menu_seen || rt_pipboy_is_open()) {
+            break;
+        }
+        at_menu_expected = false;
+        at_lvl_ok[4] = !flag && !editor_rt_has_free_perk() && at_lvl_perk != -1 && perk_level(at_lvl_perk) >= 1
+            && stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == at_lvl_unspent;
+        at_log("level icon: perk %s chosen: on=%d, unspent %d", at_lvl_perk != -1 ? perk_name(at_lvl_perk) : "(none)", flag, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS));
+        at_screenshot("level_01_cleared");
+        at_check(C_LEVEL_ICON, at_lvl_ok[0] && at_lvl_ok[1] && at_lvl_ok[2] && at_lvl_ok[3] && at_lvl_ok[4],
+            "on after the level up=%d; still on after the Inventory tab with points left=%d; off after the Stats tab, points kept=%d; on while a perk is due=%d; off once chosen=%d (save/load checked later)",
+            at_lvl_ok[0], at_lvl_ok[1], at_lvl_ok[2], at_lvl_ok[3], at_lvl_ok[4]);
+        return true;
+    }
+    return false;
+}
+
+static void at_record_level_state()
+{
+    at_lvl_flag_saved = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+    at_lvl_perk_saved = editor_rt_has_free_perk();
+}
+
+static bool step_level_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!first) {
+        return true;
+    }
+    // Ammunition and inventory as saved (equipment and progression: the
+    // Pip-Boy persistence check).
+    Object* hand = inven_right_hand(obj_dude);
+    int ammo = hand != NULL && item_get_type(hand) == ITEM_TYPE_WEAPON ? item_w_curr_ammo(hand) : -1;
+    int items = 0;
+    for (int index = 0; index < obj_dude->data.inventory.length; index++) {
+        items += obj_dude->data.inventory.items[index].quantity;
+    }
+    if (at_save_items != -1) {
+        at_check(C_LOAD, ammo == at_save_ammo && items == at_save_items && item_total_weight(obj_dude) == at_save_weight,
+            "after load: weapon ammo %d (saved %d), items %d (saved %d), weight %d (saved %d)",
+            ammo, at_save_ammo, items, at_save_items, item_total_weight(obj_dude), at_save_weight);
+    }
+
+    bool same = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE) == at_lvl_flag_saved && editor_rt_has_free_perk() == at_lvl_perk_saved;
+    if (at_results[C_LEVEL_ICON] == 1) {
+        at_check(C_LEVEL_ICON, same, "after load: icon on=%d (saved %d), perk due=%d (saved %d)",
+            is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE), at_lvl_flag_saved, editor_rt_has_free_perk(), at_lvl_perk_saved);
+    }
+    return true;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -9067,6 +10078,8 @@ static const AtStep at_steps[] = {
     { "interaction", step_interact, 20000 },
     { "interaction cycling (D-pad)", step_int_cycle, 40000 },
     { "loot screen (controller)", step_loot, 90000 },
+    { "barter screen (controller)", step_barter, 90000 },
+    { "X tap reload, hold holster", step_holster, 60000 },
     { "contextual skills", step_skills, 60000 },
     { "chems and no healing on A", step_chem, 30000 },
     { "controller disconnect", step_disconnect, 12000 },
@@ -9075,10 +10088,12 @@ static const AtStep at_steps[] = {
     { "Pip-Boy tabs and actions", step_pipboy, 120000 },
     { "favorites assignment (Pip-Boy Y)", step_fav_assign, 90000 },
     { "favorites (direct D-pad)", step_fav_use, 60000 },
+    { "level-up indicator", step_level_icon, 90000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
     { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
     { "favorites after load", step_fav_persist, 3000 },
+    { "level-up indicator after load", step_level_after_load, 3000 },
     { "map transition", step_map_change, 30000 },
     { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },
