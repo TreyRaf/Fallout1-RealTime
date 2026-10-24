@@ -86,6 +86,13 @@ typedef struct RtStats {
     int holstersCompleted;
     int holsterAnimations;
     int drawsPlayed;
+    // Sprinting time (ms) in and out of combat, and the AP it drained.
+    float sprintCombatMs;
+    float sprintCombatAp;
+    float sprintCalmMs;
+    float sprintCalmAp;
+    // AP regenerated while sprinting outside combat.
+    float sprintCalmRegen;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -130,6 +137,10 @@ void rt_debug_set_ap(float ap);
 float rt_get_dude_ap();
 bool rt_is_run_toggled();
 bool rt_is_engaged(Object* critter);
+
+// Whether a hostile critter is engaged with the player team nearby (the
+// real-time equivalent of being in combat).
+bool rt_player_in_combat();
 const char* rt_get_log_dir();
 unsigned int rt_get_time();
 int rt_get_pending_count();

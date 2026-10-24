@@ -61,6 +61,7 @@ void rt_context_interact(Object* obj);
 // Script analysis for the object's script (cached); false if it has none.
 bool rt_context_get_script_skills(Object* obj, RtScriptSkills* out);
 bool rt_context_scan_script_index(int scriptIndex, RtScriptSkills* out);
+int rt_context_dump_opcodes(int scriptIndex, const int* opcodes, int opcodeCount);
 
 // Lists the actions A would offer for `obj`, e.g. "Open/Close | Lockpick".
 void rt_context_describe(Object* obj, char* buffer, size_t size);

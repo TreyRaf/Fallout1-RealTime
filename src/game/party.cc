@@ -16,6 +16,7 @@
 #include "game/message.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/rt_rules.h"
 #include "game/proto.h"
 #include "game/queue.h"
 #include "game/roll.h"
@@ -89,6 +90,14 @@ int partyMemberAdd(Object* object)
     if (partyStatePrepped) {
         debug_printf("\npartyMemberAdd DENIED: %s\n", critter_name(object));
         return -1;
+    }
+
+    // RT: Charisma limits the number of companions. Companions already in the
+    // party stay when Charisma drops; only new ones are refused. Temporary
+    // quest followers don't count and are never refused.
+    if (rt_is_companion(object) && partyMemberCompanionCount() >= rt_companion_limit()) {
+        debug_printf("\npartyMemberAdd REFUSED (companion limit %d): %s\n", rt_companion_limit(), critter_name(object));
+        return PARTY_MEMBER_ADD_COMPANION_LIMIT;
     }
 
     partyMember = &(partyMemberList[partyMemberCount]);
@@ -510,6 +519,17 @@ int getPartyMemberCount()
         }
     }
 
+    return count;
+}
+
+int partyMemberCompanionCount()
+{
+    int count = 0;
+    for (int index = 1; index < partyMemberCount; index++) {
+        if (rt_is_companion(partyMemberList[index].object)) {
+            count++;
+        }
+    }
     return count;
 }
 

@@ -70,6 +70,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/rt_aimed.h"
     "src/game/rt_favorites.cc"
     "src/game/rt_favorites.h"
+    "src/game/rt_rules.cc"
+    "src/game/rt_rules.h"
     "src/game/rt_autotest.cc"
     "src/game/rt_autotest.h"
     "src/game/config.cc"

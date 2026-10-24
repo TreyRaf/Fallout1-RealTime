@@ -1357,11 +1357,9 @@ int item_w_range(Object* critter, int hit_mode)
     }
 
     if (item_w_subtype(weapon, hit_mode) == ATTACK_TYPE_THROW) {
-        if (critter == obj_dude) {
-            max_range = 3 * (stat_level(critter, STAT_STRENGTH) + 2 * perk_level(PERK_HEAVE_HO));
-        } else {
-            max_range = 3 * stat_level(critter, STAT_STRENGTH);
-        }
+        // RT: Heave Ho! improves long-range accuracy instead of range (see
+        // `rt_distance_penalty`).
+        max_range = 3 * stat_level(critter, STAT_STRENGTH);
 
         if (range > max_range) {
             range = max_range;
@@ -1378,7 +1376,6 @@ int item_w_mp_cost(Object* critter, int hit_mode, bool aiming)
 {
     Object* weapon;
     int action_points;
-    int weapon_subtype;
 
     if (hit_mode == HIT_MODE_LEFT_WEAPON_RELOAD || hit_mode == HIT_MODE_RIGHT_WEAPON_RELOAD) {
         return 2;
@@ -1404,21 +1401,8 @@ int item_w_mp_cost(Object* critter, int hit_mode, bool aiming)
         }
     }
 
-    if (critter == obj_dude) {
-        weapon_subtype = item_w_subtype(weapon, hit_mode);
-
-        if (perk_level(PERK_BONUS_HTH_ATTACKS)) {
-            if (weapon_subtype == ATTACK_TYPE_MELEE || weapon_subtype == ATTACK_TYPE_UNARMED) {
-                action_points -= 1;
-            }
-        }
-
-        if (perk_level(PERK_BONUS_RATE_OF_FIRE)) {
-            if (weapon_subtype == ATTACK_TYPE_RANGED) {
-                action_points -= 1;
-            }
-        }
-    }
+    // RT: Bonus HtH Attacks (now reach) and Bonus Rate of Fire (now
+    // long-range accuracy) no longer lower attack costs.
 
     if (aiming) {
         action_points += 1;

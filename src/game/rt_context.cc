@@ -752,4 +752,102 @@ static int rt_context_menu(const char* title, const RtAction* actions, int count
     return choice;
 }
 
+// Diagnostics: logs every call to one of `opcodes` in the script with the
+// procedure it is in and the instructions around it.
+int rt_context_dump_opcodes(int scriptIndex, const int* opcodes, int opcodeCount)
+{
+    char path[COMPAT_MAX_PATH];
+    if (!scr_rt_script_path(scriptIndex, path, sizeof(path))) {
+        return 0;
+    }
+
+    DB_FILE* stream = db_fopen(path, "rb");
+    if (stream == NULL) {
+        return 0;
+    }
+    long size = db_filelength(stream);
+    std::vector<unsigned char> data(size > 0 ? size : 0);
+    if (size > 0) {
+        db_fread(data.data(), 1, size, stream);
+    }
+    db_fclose(stream);
+    if (size < RT_INT_PROCEDURES_OFFSET + 4) {
+        return 0;
+    }
+
+    const unsigned char* procedures = data.data() + RT_INT_PROCEDURES_OFFSET;
+    int procedureCount = rt_be32(procedures);
+    long identifiersOffset = RT_INT_PROCEDURES_OFFSET + 4 + (long)procedureCount * RT_INT_PROCEDURE_SIZE;
+    if (procedureCount <= 0 || identifiersOffset + 4 > size) {
+        return 0;
+    }
+
+    int hits = 0;
+    for (int index = 0; index < procedureCount; index++) {
+        const unsigned char* procedure = procedures + 4 + index * RT_INT_PROCEDURE_SIZE;
+        long nameOffset = rt_be32(procedure);
+        const char* name = identifiersOffset + nameOffset < size ? (const char*)(data.data() + identifiersOffset + nameOffset) : "?";
+        long body = rt_be32(procedure + RT_INT_PROCEDURE_BODY);
+        if (body <= 0 || body >= size) {
+            continue;
+        }
+        long end = size;
+        for (int other = 0; other < procedureCount; other++) {
+            int start = rt_be32(procedures + 4 + other * RT_INT_PROCEDURE_SIZE + RT_INT_PROCEDURE_BODY);
+            if (start > body && start < end) {
+                end = start;
+            }
+        }
+
+        std::vector<RtInstruction> code;
+        long pos = body;
+        while (pos + 2 <= end) {
+            RtInstruction instruction;
+            instruction.opcode = rt_be16(data.data() + pos);
+            instruction.value = 0;
+            pos += 2;
+            if ((instruction.opcode & 0x8000) == 0) {
+                break;
+            }
+            if ((instruction.opcode & 0xF000) != 0x8000) {
+                if (pos + 4 > end) {
+                    break;
+                }
+                instruction.value = rt_be32(data.data() + pos);
+                pos += 4;
+            }
+            code.push_back(instruction);
+        }
+
+        for (size_t at = 0; at < code.size(); at++) {
+            bool match = false;
+            for (int op = 0; op < opcodeCount; op++) {
+                if (code[at].opcode == opcodes[op]) {
+                    match = true;
+                }
+            }
+            if (!match) {
+                continue;
+            }
+            hits++;
+            char line[1024];
+            line[0] = 0;
+            size_t from = at > 24 ? at - 24 : 0;
+            size_t to = std::min(code.size(), at + 8);
+            for (size_t i = from; i < to; i++) {
+                char part[32];
+                if ((code[i].opcode & 0xF000) != 0x8000) {
+                    snprintf(part, sizeof(part), " %X:%d", code[i].opcode, code[i].value);
+                } else {
+                    snprintf(part, sizeof(part), i == at ? " [%X]" : " %X", code[i].opcode);
+                }
+                SDL_strlcat(line, part, sizeof(line));
+            }
+            rt_log("opdump %s %s:%s", path, name, line);
+        }
+    }
+
+    return hits;
+}
+
 } // namespace fallout

@@ -5,6 +5,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "game/art.h"
 #include "game/bmpdlog.h"
 #include "game/critter.h"
@@ -21,6 +23,7 @@
 #include "game/palette.h"
 #include "game/perk.h"
 #include "game/proto.h"
+#include "game/rt_rules.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -248,6 +251,13 @@ static int DrawCard2(int frmId, const char* name, const char* rank, char* descri
 static void push_perks();
 static void pop_perks();
 static int PerkCount();
+static void editor_rt_award_perks(int level);
+static void editor_rt_convert_old_save(unsigned char storedPending);
+
+// RT: `free_perk` counts pending perk selections. Saves mark the new format
+// with the high bit (old saves store 0 or 1).
+#define RT_FREE_PERK_MAX 0x7F
+#define RT_FREE_PERK_FORMAT 0x80
 static int is_supper_bonus();
 
 // 0x431C40
@@ -5171,7 +5181,8 @@ int editor_save(DB_FILE* stream)
 {
     if (db_fwriteInt(stream, last_level) == -1)
         return -1;
-    if (db_fwriteByte(stream, free_perk) == -1)
+    // RT: pending perk selections, marked as the new format.
+    if (db_fwriteByte(stream, (unsigned char)(RT_FREE_PERK_FORMAT | std::min((int)free_perk, RT_FREE_PERK_MAX))) == -1)
         return -1;
 
     return 0;
@@ -5180,10 +5191,24 @@ int editor_save(DB_FILE* stream)
 // 0x435E94
 int editor_load(DB_FILE* stream)
 {
+    unsigned char stored;
     if (db_freadInt(stream, &last_level) == -1)
         return -1;
-    if (db_freadByte(stream, &free_perk) == -1)
+    if (db_freadByte(stream, &stored) == -1)
         return -1;
+
+    // RT: count of pending perk selections; older saves are converted to the
+    // perk every 2 levels cadence.
+    if ((stored & RT_FREE_PERK_FORMAT) != 0) {
+        free_perk = stored & RT_FREE_PERK_MAX;
+    } else {
+        editor_rt_convert_old_save(stored);
+    }
+
+    // RT: derived statistics follow the current formulas (Armor Class from
+    // Endurance) even in saves made before they changed. Perks, traits and
+    // the player's stats are loaded at this point.
+    stat_recalc_derived(obj_dude);
 
     return 0;
 }
@@ -5193,6 +5218,7 @@ void editor_reset()
 {
     character_points = 5;
     last_level = 1;
+    free_perk = 0;
 }
 
 // 0x435EDC
@@ -5217,19 +5243,8 @@ static int UpdateLevel()
 
             stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp);
 
-            // NOTE: Uninline.
-            int selectedPerksCount = PerkCount();
-
-            if (selectedPerksCount < 7) {
-                int progression = 3;
-                if (trait_level(TRAIT_SKILLED)) {
-                    progression += 1;
-                }
-
-                if (nextLevel % progression == 0) {
-                    free_perk = 1;
-                }
-            }
+            // RT: one perk every 2 levels (see `editor_rt_award_perks`).
+            editor_rt_award_perks(nextLevel);
         }
     }
 
@@ -5246,7 +5261,7 @@ static int UpdateLevel()
             DrawFolder();
         } else if (rc == 1) {
             DrawFolder();
-            free_perk = 0;
+            free_perk -= 1;
         }
     }
 
@@ -6238,27 +6253,78 @@ void editor_rt_update_level()
 
             stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp);
 
-            // NOTE: Uninline.
-            int selectedPerksCount = PerkCount();
-            if (selectedPerksCount < 7) {
-                int progression = 3;
-                if (trait_level(TRAIT_SKILLED)) {
-                    progression += 1;
-                }
-
-                if (nextLevel % progression == 0) {
-                    free_perk = 1;
-                }
-            }
+            editor_rt_award_perks(nextLevel);
         }
     }
 
     last_level = level;
 }
 
+// One perk selection every 2 levels (2, 4, 6, ...), whatever the traits
+// (Skilled no longer delays perks) and with no limit on the number of
+// perks. `free_perk` counts the selections not spent yet. Levels are only
+// processed once (`last_level`), so reopening screens or loading never
+// awards a selection twice.
+static void editor_rt_award_perks(int level)
+{
+    int awarded = rt_perk_selections_earned(level) - rt_perk_selections_earned(level - 1);
+    free_perk = (unsigned char)std::min(free_perk + awarded, RT_FREE_PERK_MAX);
+}
+
 bool editor_rt_has_free_perk()
 {
     return free_perk != 0;
+}
+
+int editor_rt_free_perks()
+{
+    return free_perk;
+}
+
+// Test hooks (rt_autotest.cc).
+void editor_rt_debug_get(int* lastLevel, int* freePerks)
+{
+    *lastLevel = last_level;
+    *freePerks = free_perk;
+}
+
+void editor_rt_debug_set(int lastLevel, int freePerks)
+{
+    last_level = lastLevel;
+    free_perk = (unsigned char)std::clamp(freePerks, 0, RT_FREE_PERK_MAX);
+}
+
+// The pending selections `editor_load` would give a save made before the
+// change with this `last_level` and stored byte (state is restored).
+int editor_rt_debug_convert(int lastLevel, int storedPending)
+{
+    int savedLevel = last_level;
+    unsigned char savedPerks = free_perk;
+    last_level = lastLevel;
+    editor_rt_convert_old_save((unsigned char)storedPending);
+    int pending = free_perk;
+    last_level = savedLevel;
+    free_perk = savedPerks;
+    return pending;
+}
+
+// Saves written before the change store one pending selection at most and
+// none of the selections the new cadence adds for levels already reached.
+// Selections spent so far = those the original rules awarded minus the one
+// still pending; the new cadence's selections for the same levels minus the
+// spent ones are pending now. Perks already taken are never removed.
+static void editor_rt_convert_old_save(unsigned char storedPending)
+{
+    int spent = rt_perk_selections_original(last_level, trait_level(TRAIT_SKILLED) != 0) - (storedPending != 0 ? 1 : 0);
+    if (spent < 0) {
+        spent = 0;
+    }
+
+    int pending = rt_perk_selections_earned(last_level) - spent;
+    free_perk = (unsigned char)std::clamp(pending, 0, RT_FREE_PERK_MAX);
+
+    debug_printf("\nRT: perk selections converted: level %d, %d spent, %d pending (was %d)\n",
+        last_level, spent, free_perk, storedPending);
 }
 
 // Takes `perk` as the perk dialog does, with the same follow-ups: Tag! tags
@@ -6330,7 +6396,7 @@ int editor_rt_take_perk(int perk, int choiceA, int choiceB)
         stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, sp + 2);
     }
 
-    free_perk = 0;
+    free_perk -= 1;
     return 0;
 }
 

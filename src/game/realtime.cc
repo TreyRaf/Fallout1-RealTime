@@ -36,6 +36,7 @@
 #include "game/rt_context.h"
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
+#include "game/rt_rules.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -686,6 +687,18 @@ bool rt_is_engaged(Object* critter)
     return it != rt_states.end() && it->second.engaged;
 }
 
+bool rt_player_in_combat()
+{
+    for (Object* critter : rt_critters) {
+        if (critter->elevation == obj_dude->elevation
+            && rt_is_hostile_to_player(critter)
+            && obj_dist(obj_dude, critter) <= RT_DISENGAGE_DISTANCE) {
+            return true;
+        }
+    }
+    return false;
+}
+
 // -----------------------------------------------------------------------------
 // Main tick
 // -----------------------------------------------------------------------------
@@ -1188,8 +1201,10 @@ static int rt_check_shot(Object* attacker, Object* defender, int hitMode)
         }
     }
 
-    if (item_w_range(attacker, hitMode) < obj_dist(attacker, defender)) {
-        return COMBAT_BAD_SHOT_OUT_OF_RANGE;
+    // Reach includes Bonus HtH Attacks (fractional, blocked by walls).
+    int reach = combat_rt_check_reach(attacker, defender, hitMode);
+    if (reach != COMBAT_BAD_SHOT_OK) {
+        return reach;
     }
 
     if (item_w_max_ammo(weapon) > 0 && item_w_curr_ammo(weapon) == 0) {
@@ -1922,7 +1937,8 @@ static void rt_update_dude(float dtMs)
         if (rt_run_toggled) {
             rt_run_toggled = false;
             rt_log("run: off");
-        } else if (rt_dude_ap >= 1.0f) {
+        } else if (rt_dude_ap >= 1.0f || !rt_player_in_combat()) {
+            // Outside combat running is free, even at 0 AP.
             rt_run_toggled = true;
             rt_log("run: on (ap=%.2f)", rt_dude_ap);
         } else {
@@ -2026,22 +2042,37 @@ static void rt_update_ap(float dtMs)
         && anim_busy(obj_dude)
         && FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING;
 
-    if (running) {
-        rt_dude_ap -= dtMs / rt_run_drain_ms;
+    // Sprinting costs AP only in combat (a hostile engaged with the player's
+    // team, see `rt_player_in_combat`); Bonus Move lowers that drain.
+    // Outside combat a sprint is free and AP regenerates as when walking.
+    bool inCombat = running && rt_player_in_combat();
+    if (running && !inCombat) {
+        rt_stats.sprintCalmMs += dtMs;
+    }
+
+    if (inCombat) {
+        float drain = dtMs / rt_run_drain_ms * rt_sprint_drain_pct(true) / 100.0f;
+        rt_dude_ap -= drain;
+        rt_stats.sprintCombatMs += dtMs;
+        rt_stats.sprintCombatAp += drain;
         if (rt_dude_ap <= 0.0f) {
             rt_dude_ap = 0.0f;
             if (rt_run_toggled) {
                 // A new click is needed to run again.
                 rt_run_toggled = false;
                 rt_print("You are out of breath.");
-                rt_log("run: AP exhausted, back to walking");
+                rt_log("run: AP exhausted in combat, back to walking");
             }
         }
     } else {
         // Frozen while aimed attacks are carried out, so regeneration can't
         // pay for more of them than were reserved.
         if (!rt_aimed_is_executing()) {
-            rt_dude_ap += dtMs / rt_ap_regen_ms;
+            float regen = dtMs / rt_ap_regen_ms;
+            rt_dude_ap += regen;
+            if (running) {
+                rt_stats.sprintCalmRegen += regen;
+            }
         }
     }
 
@@ -2222,8 +2253,10 @@ static void rt_update_movement(bool canAct)
         }
     }
 
-    // Starting a run needs a full AP; once running, it lasts until AP is out.
-    bool wantRun = rt_run_toggled && (rt_move_active && rt_move_run ? rt_dude_ap > 0.0f : rt_dude_ap >= 1.0f);
+    // In combat, starting a run needs a full AP and it lasts until AP is out;
+    // outside combat running costs nothing.
+    bool wantRun = rt_run_toggled
+        && (!rt_player_in_combat() || (rt_move_active && rt_move_run ? rt_dude_ap > 0.0f : rt_dude_ap >= 1.0f));
     bool busy = anim_busy(obj_dude);
 
     // Only re-path when something changed or the current path ended: one
@@ -2284,9 +2317,15 @@ static void rt_update_movement(bool canAct)
     }
 
     if (busy && register_clear(obj_dude) == -2) {
+        static unsigned int lastLockedLog = 0;
+        if (rt_now - lastLockedLog >= 500) {
+            lastLockedLog = rt_now;
+            rt_log("move: can't replace the current %s (locked sequence)", FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING ? "run" : "movement");
+        }
         return;
     }
 
+    rt_log("move: issue %s to %d (toggle %d, combat %d, ap %.2f)", wantRun ? "run" : "walk", dest, rt_run_toggled, rt_player_in_combat(), rt_dude_ap);
     register_begin(ANIMATION_REQUEST_RESERVED);
     if (wantRun) {
         register_object_run_to_tile(obj_dude, dest, obj_dude->elevation, -1, 0);

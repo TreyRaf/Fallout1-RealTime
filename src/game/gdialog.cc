@@ -28,6 +28,7 @@
 #include "game/textobj.h"
 #include "game/tile.h"
 #include "int/dialog.h"
+#include "int/support/intextra.h"
 #include "int/window.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
@@ -1488,6 +1489,7 @@ static int gDialogProcessChoice(int a1)
 
     if (gdReenterLevel < 2) {
         if (dialogOptionEntry->proc != 0) {
+            intextra_rt_begin_procedure(dialogBlock.program);
             executeProcedure(dialogBlock.program, dialogOptionEntry->proc);
         }
     }

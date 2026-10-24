@@ -39,6 +39,16 @@ void combat(STRUCT_664980* attack);
 void combat_ctd_init(Attack* attack, Object* attacker, Object* defender, int hitMode, int hitLocation);
 int combat_attack(Object* a1, Object* a2, int hitMode, int location);
 int combat_rt_compute_attack(Attack* attack);
+
+// RT: whether `defender` is within the attack's reach: the weapon range in
+// hexes, plus the fractional Bonus HtH Attacks reach for the player's melee
+// and unarmed attacks (Euclidean, through no wall). Returns
+// COMBAT_BAD_SHOT_OK, COMBAT_BAD_SHOT_OUT_OF_RANGE or
+// COMBAT_BAD_SHOT_AIM_BLOCKED.
+int combat_rt_check_reach(Object* attacker, Object* defender, int hitMode);
+
+// RT: Friendly Foe statistics (companion shots that passed the player).
+int combat_rt_friendly_foe_blocks();
 char* combat_rt_loc_name(Object* critter, int hitLocation);
 void combat_rt_print_tohit(unsigned char* dest, int destPitch, int accuracy);
 int combat_rt_called_shot_location(int index);

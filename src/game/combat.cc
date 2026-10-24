@@ -24,7 +24,9 @@
 #include "game/pipboy.h"
 #include "game/proto.h"
 #include "game/queue.h"
+#include "game/party.h"
 #include "game/realtime.h"
+#include "game/rt_rules.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/skill.h"
@@ -1780,11 +1782,8 @@ static void combat_begin_extra(Object* a1)
 
     for (index = 0; index < list_total; index++) {
         outline_type = OUTLINE_TYPE_HOSTILE;
-        if (perk_level(PERK_FRIENDLY_FOE)) {
-            if (combat_list[index]->data.critter.combat.team == obj_dude->data.critter.combat.team) {
-                outline_type = OUTLINE_TYPE_FRIENDLY;
-            }
-        }
+        // RT: Friendly Foe protects from companion fire instead of
+        // coloring the team green.
 
         obj_outline_object(combat_list[index], outline_type, NULL);
         obj_turn_off_outline(combat_list[index], NULL);
@@ -2235,7 +2234,9 @@ static int combat_turn(Object* a1, bool a2)
         if (a1 == obj_dude) {
             kb_clear();
             intface_update_ac(true);
-            combat_free_move = 2 * perk_level(PERK_BONUS_MOVE);
+            // RT: Bonus Move lowers combat sprint drain instead (see
+            // `rt_sprint_drain_pct`).
+            combat_free_move = 0;
             intface_update_move_points(obj_dude->data.critter.combat.ap, combat_free_move);
         } else {
             soundUpdate();
@@ -2563,6 +2564,72 @@ int combat_rt_compute_attack(Attack* attack)
     return compute_attack(attack);
 }
 
+int combat_rt_check_reach(Object* attacker, Object* defender, int hitMode)
+{
+    int range = item_w_range(attacker, hitMode);
+    if (obj_dist(attacker, defender) <= range) {
+        return COMBAT_BAD_SHOT_OK;
+    }
+
+    Object* weapon = item_hit_with(attacker, hitMode);
+    double bonus = rt_reach_bonus(attacker, item_w_subtype(weapon, hitMode));
+    if (bonus <= 0.0 || attacker->elevation != defender->elevation) {
+        return COMBAT_BAD_SHOT_OUT_OF_RANGE;
+    }
+
+    // Hexes 2 steps away are 1.73 or 2.0 apart, 3 steps 2.65 to 3.0: with a
+    // 1 hex weapon and the 1.5 bonus every hex 2 steps away is in reach and
+    // none 3 steps away; with a 2 hex weapon part of the 4th ring is.
+    if (rt_obj_distance_exact(attacker, defender) > range + bonus + 0.0001) {
+        return COMBAT_BAD_SHOT_OUT_OF_RANGE;
+    }
+
+    // The longer reach doesn't go through walls or other scenery.
+    if (combat_is_shot_blocked(attacker, attacker->tile, defender->tile, defender, NULL)) {
+        return COMBAT_BAD_SHOT_AIM_BLOCKED;
+    }
+
+    return COMBAT_BAD_SHOT_OK;
+}
+
+// RT: Friendly Foe. Shots from the player's companions (guns and energy
+// weapons, bursts included) pass the player harmlessly. Explosions, thrown
+// weapons and melee are not covered, nor attacks from party members that
+// turned hostile.
+static int combat_friendly_foe_count = 0;
+
+static bool combat_friendly_foe_protects(Attack* attack, Object* victim)
+{
+    if (victim != obj_dude || attack->attacker == obj_dude || attack->attacker == NULL) {
+        return false;
+    }
+
+    if (perk_level(PERK_FRIENDLY_FOE) == 0) {
+        return false;
+    }
+
+    if (!isPartyMember(attack->attacker)
+        || attack->attacker->data.critter.combat.team != obj_dude->data.critter.combat.team) {
+        return false;
+    }
+
+    if (item_w_subtype(attack->weapon, attack->hitMode) != ATTACK_TYPE_RANGED) {
+        return false;
+    }
+
+    if (item_w_damage_type(attack->weapon) == DAMAGE_TYPE_EXPLOSION) {
+        return false;
+    }
+
+    combat_friendly_foe_count++;
+    return true;
+}
+
+int combat_rt_friendly_foe_blocks()
+{
+    return combat_friendly_foe_count;
+}
+
 // RT: The pieces of the original called shot window, for the controller's
 // aimed shot screen: the body part name for this critter's art (combat.msg),
 // the big to-hit digits, and the window's two columns of body parts.
@@ -2612,6 +2679,12 @@ static bool check_ranged_miss(Attack* attack)
                     if (FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
                         roll = ROLL_SUCCESS;
                         break;
+                    }
+
+                    // RT: Friendly Foe: the stray shot passes the player.
+                    if (combat_friendly_foe_protects(attack, critter)) {
+                        curr = critter->tile;
+                        continue;
                     }
 
                     if (critter != attack->defender) {
@@ -2671,6 +2744,12 @@ static int shoot_along_path(Attack* attack, int endTile, int rounds, int anim)
         if (critter != NULL) {
             if (FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER) {
                 break;
+            }
+
+            // RT: Friendly Foe: burst rounds pass the player.
+            if (combat_friendly_foe_protects(attack, critter)) {
+                currentTile = critter->tile;
+                continue;
             }
 
             int accuracy = determine_to_hit_func(attack->attacker, critter, HIT_LOCATION_TORSO, attack->hitMode, 1);
@@ -2833,7 +2912,8 @@ static int compute_attack(Attack* attack)
     weapon_range = item_w_range(attack->attacker, attack->hitMode);
     distance = obj_dist(attack->attacker, attack->defender);
 
-    if (weapon_range < distance) {
+    // RT: reach includes Bonus HtH Attacks.
+    if (combat_rt_check_reach(attack->attacker, attack->defender, attack->hitMode) != COMBAT_BAD_SHOT_OK) {
         return -1;
     }
 
@@ -2961,6 +3041,12 @@ static int compute_attack(Attack* attack)
                 attack->tile = defender->tile;
             } else {
                 defender = obj_blocking_at(NULL, attack->tile, attack->defender->elevation);
+            }
+
+            // RT: Friendly Foe: a missed companion shot never lands on the
+            // player.
+            if (defender != NULL && combat_friendly_foe_protects(attack, defender)) {
+                defender = NULL;
             }
 
             if (defender != NULL && (defender->flags & OBJECT_SHOOT_THRU) == 0) {
@@ -3305,6 +3391,13 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
                     modifier = -12 * range;
                 } else {
                     modifier = -4 * range;
+                }
+
+                // RT: Bonus Rate of Fire (guns, energy weapons) and Heave
+                // Ho! (throwing) shrink the penalty for targets beyond the
+                // Perception range; the bonus for closer ones is unchanged.
+                if (modifier < 0) {
+                    modifier = -rt_distance_penalty(attacker, attack_type, -modifier);
                 }
 
                 accuracy += modifier;
@@ -4472,8 +4565,10 @@ int combat_check_bad_shot(Object* attacker, Object* defender, int hitMode, bool 
         return COMBAT_BAD_SHOT_NOT_ENOUGH_AP;
     }
 
-    if (item_w_range(attacker, hitMode) < obj_dist(attacker, defender)) {
-        return COMBAT_BAD_SHOT_OUT_OF_RANGE;
+    // RT: reach includes Bonus HtH Attacks.
+    int reach = combat_rt_check_reach(attacker, defender, hitMode);
+    if (reach != COMBAT_BAD_SHOT_OK) {
+        return reach;
     }
 
     attack_type = item_w_subtype(weapon, hitMode);
@@ -4640,11 +4735,7 @@ void combat_outline_on()
         for (index = 0; index < critters_length; index++) {
             if (critters[index] != obj_dude && (critters[index]->data.critter.combat.results & DAM_DEAD) == 0) {
                 outline_type = OUTLINE_TYPE_HOSTILE;
-                if (perk_level(PERK_FRIENDLY_FOE)) {
-                    if (critters[index]->data.critter.combat.team == obj_dude->data.critter.combat.team) {
-                        outline_type = OUTLINE_TYPE_FRIENDLY;
-                    }
-                }
+                // RT: no green team outline (Friendly Foe changed).
 
                 obj_outline_object(critters[index], outline_type, NULL);
                 obj_turn_on_outline(critters[index], NULL);

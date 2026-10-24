@@ -4,6 +4,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <vector>
+
 #include "game/actions.h"
 #include "game/anim.h"
 #include "game/combat.h"
@@ -24,7 +26,9 @@
 #include "game/object.h"
 #include "game/palette.h"
 #include "game/perk.h"
+#include "game/party.h"
 #include "game/protinst.h"
+#include "game/rt_rules.h"
 #include "game/proto.h"
 #include "game/queue.h"
 #include "game/reaction.h"
@@ -216,10 +220,135 @@ static int correctFidForRemovedItem(Object* critter, Object* item, int flags)
     return 0;
 }
 
+// RT: Charisma companion limit. Recruitment scripts set their "joined"
+// variables (and sometimes give experience) right before `party_add`, which
+// returns nothing to the script. When the party refuses a companion, the
+// changes the same procedure made are undone so the companion stays where it
+// was (not following, can be asked again later).
+typedef enum RtUndoKind {
+    RT_UNDO_GLOBAL_VAR,
+    RT_UNDO_LOCAL_VAR,
+    RT_UNDO_EXPERIENCE,
+} RtUndoKind;
+
+typedef struct RtUndoEntry {
+    Program* program;
+    int kind;
+    int sid;
+    int variable;
+    ProgramValue value;
+    int level;
+} RtUndoEntry;
+
+static std::vector<RtUndoEntry> rt_undo_log;
+
+void intextra_rt_begin_procedure(Program* program)
+{
+    for (size_t index = 0; index < rt_undo_log.size();) {
+        if (rt_undo_log[index].program == program) {
+            rt_undo_log.erase(rt_undo_log.begin() + index);
+        } else {
+            index++;
+        }
+    }
+}
+
+static void rt_undo_record(Program* program, int kind, int sid, int variable, const ProgramValue& value)
+{
+    // Old entries of programs that never ran through the engine's entry
+    // points are dropped instead of growing forever.
+    if (rt_undo_log.size() >= 256) {
+        rt_undo_log.erase(rt_undo_log.begin());
+    }
+
+    RtUndoEntry entry;
+    entry.program = program;
+    entry.kind = kind;
+    entry.sid = sid;
+    entry.variable = variable;
+    entry.value = value;
+    entry.level = stat_pc_get(PC_STAT_LEVEL);
+    rt_undo_log.push_back(entry);
+}
+
+static int rt_undo_revert(Program* program)
+{
+    int reverted = 0;
+    for (size_t index = rt_undo_log.size(); index > 0; index--) {
+        RtUndoEntry& entry = rt_undo_log[index - 1];
+        if (entry.program != program) {
+            continue;
+        }
+
+        switch (entry.kind) {
+        case RT_UNDO_GLOBAL_VAR:
+            game_set_global_var(entry.variable, entry.value.integerValue);
+            break;
+        case RT_UNDO_LOCAL_VAR:
+            scr_set_local_var(entry.sid, entry.variable, entry.value);
+            break;
+        case RT_UNDO_EXPERIENCE:
+            // Only while the experience didn't bring a new level.
+            if (stat_pc_get(PC_STAT_LEVEL) == entry.level) {
+                stat_pc_set(PC_STAT_EXPERIENCE, entry.value.integerValue);
+            }
+            break;
+        }
+        reverted++;
+    }
+
+    intextra_rt_begin_procedure(program);
+    return reverted;
+}
+
+// `party_add` from a script: a refused companion is told why and the
+// script's changes since the procedure began are undone. Returns the number
+// of undone changes, or -1 when the critter joined (or was already in).
+static int rt_script_party_add(Program* program, Object* object)
+{
+    if (partyMemberAdd(object) != PARTY_MEMBER_ADD_COMPANION_LIMIT) {
+        return -1;
+    }
+
+    int reverted = rt_undo_revert(program);
+    int limit = rt_companion_limit();
+    char message[160];
+    snprintf(message, sizeof(message), "%s can't join you. Your Charisma lets you lead %d companion%s.",
+        critter_name(object), limit, limit == 1 ? "" : "s");
+    display_print(message);
+    debug_printf("\nRT: party_add refused for %s (%d script changes undone)\n", critter_name(object), reverted);
+    return reverted;
+}
+
+// Test hook: what a recruitment procedure does (set global `variable` to
+// `value`, then `party_add`), run for a dummy program. Returns the
+// `rt_script_party_add` result.
+int intextra_rt_debug_party_add(Object* object, int variable, int value)
+{
+    static int dummy;
+    Program* program = reinterpret_cast<Program*>(&dummy);
+    intextra_rt_begin_procedure(program);
+
+    ProgramValue before;
+    before.opcode = VALUE_TYPE_INT;
+    before.integerValue = game_get_global_var(variable);
+    rt_undo_record(program, RT_UNDO_GLOBAL_VAR, -1, variable, before);
+    game_set_global_var(variable, value);
+
+    int result = rt_script_party_add(program, object);
+    intextra_rt_begin_procedure(program);
+    return result;
+}
+
 // 0x44B78C
 static void op_give_exp_points(Program* program)
 {
     int xp = programStackPopInteger(program);
+
+    ProgramValue before;
+    before.opcode = VALUE_TYPE_INT;
+    before.integerValue = stat_pc_get(PC_STAT_EXPERIENCE);
+    rt_undo_record(program, RT_UNDO_EXPERIENCE, -1, 0, before);
 
     if (stat_pc_add_experience(xp) != 0) {
         int_debug("\nScript Error: %s: op_give_exp_points: stat_pc_set failed");
@@ -877,6 +1006,11 @@ static void op_set_local_var(Program* program)
     int variable = programStackPopInteger(program);
 
     int sid = scr_find_sid_from_program(program);
+    ProgramValue before;
+    if (scr_get_local_var(sid, variable, before) != -1) {
+        rt_undo_record(program, RT_UNDO_LOCAL_VAR, sid, variable, before);
+    }
+
     scr_set_local_var(sid, variable, value);
 }
 
@@ -925,6 +1059,10 @@ static void op_set_global_var(Program* program)
     int variable = programStackPopInteger(program);
 
     if (num_game_global_vars != 0) {
+        ProgramValue before;
+        before.opcode = VALUE_TYPE_INT;
+        before.integerValue = game_get_global_var(variable);
+        rt_undo_record(program, RT_UNDO_GLOBAL_VAR, -1, variable, before);
         game_set_global_var(variable, value);
     } else {
         int_debug("\nScript Error: %s: op_set_global_var: no global vars found!", program->name);
@@ -3280,7 +3418,7 @@ static void op_party_add(Program* program)
         return;
     }
 
-    partyMemberAdd(object);
+    rt_script_party_add(program, object);
 }
 
 // 0x450C78
@@ -4310,6 +4448,7 @@ void updateIntExtra()
 // 0x4531E0
 void intExtraRemoveProgramReferences(Program* program)
 {
+    intextra_rt_begin_procedure(program);
 }
 
 } // namespace fallout

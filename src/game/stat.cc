@@ -134,6 +134,18 @@ int stat_init()
         level_description[index] = getmsg(&stat_message_file, &messageListItem, 301 + index);
     }
 
+    // RT: what the attributes modify under the Fallout1-RealTime formulas.
+    static char strength[] = "Raw physical strength. A high Strength is good for physical characters. Modifies: Hit Points, Melee Damage, Carry Weight, and the Melee Weapons, Unarmed and Throwing skills.";
+    static char endurance[] = "Stamina and physical toughness. A character with a high Endurance will survive where others may not. Modifies: Hit Points, Armor Class, Poison & Radiation Resistance, Healing Rate, and the additional hit points per level.";
+    static char charisma[] = "A combination of appearance and charm. A high Charisma is important for characters that want to influence people with words. Modifies: NPC reactions, barter prices, and how many companions follow you (one per 2 points, at most 5).";
+    static char intelligence[] = "Knowledge, wisdom and the ability to think quickly. A high Intelligence is important for any character. Modifies: the number of new skill points per level, dialogue options, and many skills, Energy Weapons included.";
+    static char agility[] = "Coordination and the ability to move well. A high Agility is important for any active character. Modifies: Action Points, and the Small Guns, Big Guns, Lockpick, Steal and Traps skills.";
+    stat_data[STAT_STRENGTH].description = strength;
+    stat_data[STAT_ENDURANCE].description = endurance;
+    stat_data[STAT_CHARISMA].description = charisma;
+    stat_data[STAT_INTELLIGENCE].description = intelligence;
+    stat_data[STAT_AGILITY].description = agility;
+
     return 0;
 }
 
@@ -410,7 +422,8 @@ void stat_recalc_derived(Object* critter)
 
     data->baseStats[STAT_MAXIMUM_HIT_POINTS] = stat_get_base(critter, STAT_STRENGTH) + stat_get_base(critter, STAT_ENDURANCE) * 2 + 15;
     data->baseStats[STAT_MAXIMUM_ACTION_POINTS] = agility / 2 + 5;
-    data->baseStats[STAT_ARMOR_CLASS] = agility;
+    // RT: Endurance replaces Agility.
+    data->baseStats[STAT_ARMOR_CLASS] = endurance;
     data->baseStats[STAT_MELEE_DAMAGE] = std::max(strength - 5, 1);
     data->baseStats[STAT_CARRY_WEIGHT] = 25 * strength + 25;
     data->baseStats[STAT_SEQUENCE] = 2 * perception;

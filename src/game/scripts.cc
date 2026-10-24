@@ -22,6 +22,7 @@
 #include "game/tile.h"
 #include "game/worldmap.h"
 #include "int/dialog.h"
+#include "int/support/intextra.h"
 #include "int/export.h"
 #include "int/window.h"
 #include "platform_compat.h"
@@ -1147,6 +1148,7 @@ int exec_script_proc(int sid, int action)
         updatePrograms();
         interpretSetCPUBurstSize(10);
     } else {
+        intextra_rt_begin_procedure(program);
         executeProcedure(program, proc);
     }
 

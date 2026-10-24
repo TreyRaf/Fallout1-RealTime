@@ -84,6 +84,11 @@ int trait_init()
         }
     }
 
+    // RT: perks come every 2 levels for everyone, so Skilled no longer costs
+    // perks.
+    static char skilled[] = "Since you spent more time improving your skills than a normal person, you start with better skill levels.";
+    trait_data[TRAIT_SKILLED].description = skilled;
+
     // NOTE: Uninline.
     trait_reset();
 

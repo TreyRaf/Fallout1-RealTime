@@ -55,16 +55,21 @@ typedef struct SkillDescription {
 } SkillDescription;
 
 // 0x507AA4
+// RT: Agility only drives Small Guns, Big Guns, Lockpick, Steal and Traps.
+// Strength takes Agility's place in Unarmed, Melee Weapons and Throwing (in
+// Unarmed and Melee Weapons it joins the existing Strength term, so Strength
+// counts in full), Intelligence in Energy Weapons. Sneak loses Agility and
+// gets no other attribute.
 static SkillDescription skill_data[SKILL_COUNT] = {
     { NULL, NULL, NULL, 28, 35, 1, STAT_AGILITY, STAT_INVALID, 1, 0, 0 },
     { NULL, NULL, NULL, 29, 10, 1, STAT_AGILITY, STAT_INVALID, 1, 0, 0 },
-    { NULL, NULL, NULL, 30, 10, 1, STAT_AGILITY, STAT_INVALID, 1, 0, 0 },
-    { NULL, NULL, NULL, 31, 65, 1, STAT_AGILITY, STAT_STRENGTH, 1, 0, 0 },
-    { NULL, NULL, NULL, 32, 55, 1, STAT_AGILITY, STAT_STRENGTH, 1, 0, 0 },
-    { NULL, NULL, NULL, 33, 40, 1, STAT_AGILITY, STAT_INVALID, 1, 0, 0 },
+    { NULL, NULL, NULL, 30, 10, 1, STAT_INTELLIGENCE, STAT_INVALID, 1, 0, 0 },
+    { NULL, NULL, NULL, 31, 65, 1, STAT_STRENGTH, STAT_STRENGTH, 1, 0, 0 },
+    { NULL, NULL, NULL, 32, 55, 1, STAT_STRENGTH, STAT_STRENGTH, 1, 0, 0 },
+    { NULL, NULL, NULL, 33, 40, 1, STAT_STRENGTH, STAT_INVALID, 1, 0, 0 },
     { NULL, NULL, NULL, 34, 30, 1, STAT_PERCEPTION, STAT_INTELLIGENCE, 1, 25, 0 },
     { NULL, NULL, NULL, 35, 15, 1, STAT_PERCEPTION, STAT_INTELLIGENCE, 1, 50, 0 },
-    { NULL, NULL, NULL, 36, 25, 1, STAT_AGILITY, STAT_INVALID, 1, 0, 0 },
+    { NULL, NULL, NULL, 36, 25, 0, STAT_INVALID, STAT_INVALID, 1, 0, 0 },
     { NULL, NULL, NULL, 37, 20, 1, STAT_PERCEPTION, STAT_AGILITY, 1, 25, 1 },
     { NULL, NULL, NULL, 38, 20, 1, STAT_AGILITY, STAT_INVALID, 1, 25, 1 },
     { NULL, NULL, NULL, 39, 20, 1, STAT_PERCEPTION, STAT_AGILITY, 1, 25, 1 },
@@ -129,6 +134,16 @@ int skill_init()
             skill_data[index].attributes = mesg.text;
         }
     }
+
+    // RT: the attribute part of the changed skill formulas.
+    static char energyWeapons[] = "+ IN";
+    static char strengthFull[] = "+ ST";
+    static char sneak[] = "";
+    skill_data[SKILL_ENERGY_WEAPONS].attributes = energyWeapons;
+    skill_data[SKILL_UNARMED].attributes = strengthFull;
+    skill_data[SKILL_MELEE_WEAPONS].attributes = strengthFull;
+    skill_data[SKILL_THROWING].attributes = strengthFull;
+    skill_data[SKILL_SNEAK].attributes = sneak;
 
     for (index = 0; index < NUM_TAGGED_SKILLS; index++) {
         tag_skill[index] = -1;
@@ -220,7 +235,9 @@ int skill_level(Object* critter, int skill)
 
     skill_description = &(skill_data[skill]);
 
-    if (skill_description->stat2 != -1) {
+    if (skill_description->stat1 == -1) {
+        bonus = 0;
+    } else if (skill_description->stat2 != -1) {
         bonus = (stat_level(critter, skill_description->stat1) + stat_level(critter, skill_description->stat2)) * skill_description->stat_modifier / 2;
     } else {
         bonus = stat_level(critter, skill_description->stat1) * skill_description->stat_modifier;

@@ -16,6 +16,12 @@ int perk_add(int perk);
 int perk_sub(int perk);
 int perk_make_list(int* perks);
 int perk_level(int perk);
+
+// RT: minimum level and rank limit of a perk; test hook that sets a rank
+// directly (no effects applied).
+int perk_min_level(int perk);
+int perk_max_rank(int perk);
+void perk_rt_debug_set_rank(int perk, int rank);
 char* perk_name(int perk);
 char* perk_description(int perk);
 void perk_add_effect(Object* critter, int perk);

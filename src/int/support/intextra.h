@@ -21,6 +21,10 @@ void initIntExtra();
 void updateIntExtra();
 void intExtraRemoveProgramReferences(Program* program);
 
+// RT: called before the engine runs a script procedure (see `op_party_add`).
+void intextra_rt_begin_procedure(Program* program);
+int intextra_rt_debug_party_add(Object* object, int variable, int value);
+
 } // namespace fallout
 
 #endif /* FALLOUT_INT_SUPPORT_INTEXTRA_H_ */

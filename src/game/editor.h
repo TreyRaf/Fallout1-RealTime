@@ -21,6 +21,10 @@ int editor_load(DB_FILE* stream);
 // RT: character progression without the character screen (unified Pip-Boy).
 void editor_rt_update_level();
 bool editor_rt_has_free_perk();
+int editor_rt_free_perks();
+void editor_rt_debug_get(int* lastLevel, int* freePerks);
+void editor_rt_debug_set(int lastLevel, int freePerks);
+int editor_rt_debug_convert(int lastLevel, int storedPending);
 int editor_rt_take_perk(int perk, int choiceA, int choiceB);
 void editor_reset();
 void RedrwDMPrk();

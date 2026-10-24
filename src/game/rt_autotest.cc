@@ -36,7 +36,10 @@
 #include "game/rt_context.h"
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
+#include "game/rt_rules.h"
 #include "game/worldmap.h"
+#include "game/map_defs.h"
+#include "int/support/intextra.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -66,6 +69,10 @@ typedef enum AutotestCheck {
     C_REGEN,
     C_EXHAUST,
     C_RUN_RECLICK,
+    C_RUN_ZERO,
+    C_RUN_NEUTRAL,
+    C_RUN_COMBAT_START,
+    C_RUN_COMBAT_END,
     C_INVENTORY_B,
     C_SCREENS,
     C_Y_LB,
@@ -192,6 +199,23 @@ typedef enum AutotestCheck {
     C_HOLSTER_REDRAW,
     C_HOLSTER_CONTEXT,
     C_LEVEL_ICON,
+    C_RULE_SPECIAL_AG,
+    C_RULE_SPECIAL_ST,
+    C_RULE_SPECIAL_IN,
+    C_RULE_SPECIAL_EN,
+    C_RULE_CHA_LIMIT,
+    C_RULE_PERK_CADENCE,
+    C_RULE_PERK_TABLE,
+    C_RULE_PERK_CONVERT,
+    C_RULE_PERK_PERSIST,
+    C_RULE_CHA_RECRUIT,
+    C_RULE_REACH,
+    C_RULE_REACH_BLOCKED,
+    C_RULE_REACH_ATTACK,
+    C_RULE_LONG_RANGE,
+    C_RULE_LONG_RANGE_SHOWN,
+    C_RULE_FRIENDLY_FOE,
+    C_RULE_SPRINT,
     C_COUNT,
 } AutotestCheck;
 
@@ -200,10 +224,14 @@ static const char* at_check_names[C_COUNT] = {
     "Left stick walks with the walk animation",
     "Releasing the stick stops movement",
     "Straight walking issues few movement requests (no queue/restarts)",
-    "L3 toggles running with the run animation; AP drains",
+    "L3 toggles running with the run animation; outside combat running costs no AP",
     "AP regenerates while not running",
-    "AP exhaustion returns to walking and clears the toggle",
+    "AP exhaustion in combat returns to walking and clears the toggle",
     "Running again requires a new L3 click",
+    "Outside combat a run starts and continues at 0 AP while AP regenerates",
+    "Locking onto a non-hostile critter is not combat: running stays free",
+    "Combat starting during a run drains AP until it is out",
+    "Combat ending during a run stops the AP drain at once",
     "B opens the Pip-Boy, it stays open, B closes it",
     "D-pad with no favorites assigned opens nothing; R3 opens the Skilldex",
     "Y does nothing in gameplay; LB never changes the lock",
@@ -330,6 +358,23 @@ static const char* at_check_names[C_COUNT] = {
     "Readying the weapon again from favorites plays the draw animation",
     "X keeps its menu meanings (loot Take All, AIMED SHOT undo); an interrupted hold does nothing",
     "Level-up icon: on after a level up, stays while a perk is pending, clears when done; persists across save/load",
+    "Agility changes only AP, Small Guns, Big Guns, Lockpick, Steal and Traps",
+    "Strength changes Melee Weapons, Unarmed and Throwing (Strength in full), Carry Weight, Melee Damage",
+    "Intelligence changes Energy Weapons (and its original skills)",
+    "Endurance gives Armor Class (armor and perk bonuses added on top)",
+    "Charisma: companion limit floor(CH / 2), at most 5; Speech and Barter unchanged",
+    "Perks: one selection at levels 2, 4, 6, 8 (none at odd levels), levels at once add up, no duplicates when processed again or after spending",
+    "Perks: new minimum levels and ranks, no level-3 perks left, eligibility follows level, changed descriptions",
+    "Perks: saves from the old cadence convert without lost or duplicate selections",
+    "Perks: pending selections and processed levels survive save/load",
+    "Charisma: party refuses companions over the limit, keeps existing ones when CH drops, ignores temporary followers, undoes the script join",
+    "Bonus HtH Attacks: +1.5 hexes reach (hex-center distance) for player melee/unarmed, 2-hex weapons reach part of ring 4, not for others",
+    "Bonus HtH Attacks: the longer reach is blocked by walls",
+    "Bonus HtH Attacks: indicator, AIMED SHOT eligibility and the attack itself at 2 hexes",
+    "Bonus Rate of Fire / Heave Ho!: smaller long-range penalty for guns, energy weapons, throwing; close range and throw range unchanged",
+    "Long-range hit chance shown = the hit chance the attack rolls",
+    "Friendly Foe: companion bursts and strays never hit the player; hostile fire still does",
+    "Bonus Move: sprint drains 50% less in combat; no drain outside combat either way",
 };
 
 static int at_results[C_COUNT];
@@ -360,11 +405,17 @@ static void at_expect_menu(const char* screenshot, AtMenuScript* script);
 static void at_finish();
 static void at_clear_hostiles();
 static void at_record_save_state();
+static bool at_aim_released();
+static int at_clear_rats_near(int radius);
 static void at_record_level_state();
 
 static bool at_enabled = false;
 // Optional: only run steps whose name contains this text (development aid).
 static char at_only[64] = "";
+
+// Perk state at save time (character rules).
+static int at_rule_saved_perks = -1;
+static int at_rule_saved_last_level = -1;
 static bool at_finished = false;
 static FILE* at_stream = NULL;
 static bool at_screendump_registered = false;
@@ -1233,14 +1284,19 @@ static bool step_stop(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
+// Sprinting outside combat costs no AP.
 static bool step_run(unsigned int elapsed, bool first, bool timedOut)
 {
     if (first) {
+        at_clear_rats_near(20);
         at_ap_a = rt_get_dude_ap();
         at_ap_b = at_ap_a;
         at_flag_a = false;
         at_flag_b = false;
-        at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        at_count_a = 0;
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
         at_stick_open_direction();
         return false;
     }
@@ -1252,16 +1308,246 @@ static bool step_run(unsigned int elapsed, bool first, bool timedOut)
     if (rt_get_dude_ap() < at_ap_b) {
         at_ap_b = rt_get_dude_ap();
     }
+    if (rt_player_in_combat()) {
+        at_count_a++;
+    }
+    at_clear_rats_near(0);
 
     if (elapsed > 1000 && !at_flag_b) {
         at_flag_b = true;
         at_screenshot("02_run");
     }
 
-    if (rt_get_dude_ap() <= 0.0f || timedOut) {
-        at_check(C_RUN, at_flag_a && at_ap_b < at_ap_a, "run animation=%d, AP %.2f -> %.2f", at_flag_a, at_ap_a, at_ap_b);
-        at_flag_b = false;
+    if (elapsed >= 2500 || timedOut) {
+        at_check(C_RUN, at_flag_a && at_ap_b >= at_ap_a - 0.01f && at_count_a == 0,
+            "run animation=%d, AP %.2f, lowest while running %.2f, in combat %d ticks", at_flag_a, at_ap_a, at_ap_b, at_count_a);
         return true;
+    }
+    return false;
+}
+
+// Outside combat a run starts and continues at 0 AP, and AP regenerates.
+static bool step_run_zero(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_rats_near(20);
+        at_stick_release();
+        at_phase = 0;
+        return false;
+    }
+
+    at_clear_rats_near(0);
+    const RtStats* stats = rt_get_stats();
+    switch (at_phase) {
+    case 0:
+        if (rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        at_phase = 1;
+        break;
+    case 1:
+        if (elapsed < 400 || rt_is_run_toggled() || !at_aim_released()) {
+            break;
+        }
+        rt_debug_set_ap(0.0f);
+        at_flag_a = false;
+        at_time_a = elapsed;
+        at_ap_b = stats->sprintCalmRegen;
+        at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        at_stick_open_direction();
+        at_phase = 2;
+        break;
+    case 2:
+        at_stick_open_direction();
+        if (FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING) {
+            at_flag_a = true;
+        }
+        if (elapsed - at_time_a >= 2000) {
+            float regen = stats->sprintCalmRegen - at_ap_b;
+            at_check(C_RUN_ZERO, at_flag_a && rt_is_run_toggled() && rt_get_dude_ap() > 1.0f && regen > 1.0f,
+                "L3 at 0 AP: toggle on=%d, ran=%d, AP 0 -> %.2f while running (regenerated %.2f during the run)",
+                rt_is_run_toggled(), at_flag_a, rt_get_dude_ap(), regen);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// Locking onto a non-hostile critter is not combat: the run stays free.
+static bool step_run_neutral(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_rats_near(20);
+        at_target = at_spawn_rat(3, 6, false);
+        if (at_target != NULL) {
+            rt_debug_set_lock(at_target);
+        }
+        at_ap_a = rt_get_dude_ap();
+        at_ap_b = at_ap_a;
+        at_count_a = 0;
+        at_flag_a = false;
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        return false;
+    }
+
+    at_stick_open_direction();
+    if (FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING) {
+        at_flag_a = true;
+    }
+    if (rt_get_dude_ap() < at_ap_b) {
+        at_ap_b = rt_get_dude_ap();
+    }
+    if (rt_player_in_combat()) {
+        at_count_a++;
+    }
+    at_clear_rats_near(0);
+
+    if (elapsed >= 2000 || timedOut) {
+        bool locked = at_target != NULL && rt_get_lock() == at_target;
+        at_check(C_RUN_NEUTRAL, at_target != NULL && locked && at_flag_a && at_count_a == 0 && at_ap_b >= at_ap_a - 0.01f,
+            "locked a calm rat=%d, ran=%d, in combat %d ticks, AP %.2f, lowest %.2f",
+            locked, at_flag_a, at_count_a, at_ap_a, at_ap_b);
+        rt_debug_set_lock(NULL);
+        at_stick_release();
+        if (at_target != NULL && !critter_is_dead(at_target)) {
+            Rect rect;
+            anim_rt_end_all(at_target);
+            obj_erase_object(at_target, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+        }
+        at_target = NULL;
+        return true;
+    }
+    return false;
+}
+
+// A hostile engages during a run: AP drains until it is out, then the
+// player walks and the toggle clears (checked by the next step).
+static bool step_run_combat_start(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_phase = 0;
+        at_flag_a = false;
+        at_flag_b = false;
+        at_target = NULL;
+        rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        return false;
+    }
+
+    at_heal();
+    at_stick_open_direction();
+    switch (at_phase) {
+    case 0:
+        // Running, out of combat, for a moment.
+        if (elapsed < 800) {
+            break;
+        }
+        at_ap_a = rt_get_dude_ap();
+        at_flag_b = FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING && !rt_player_in_combat();
+        at_target = at_spawn_rat(5, 8, true);
+        at_time_a = elapsed;
+        at_phase = 1;
+        break;
+    case 1:
+        if (!rt_player_in_combat()) {
+            if (elapsed - at_time_a > 5000) {
+                at_check(C_RUN_COMBAT_START, false, "the hostile rat never engaged");
+                at_stick_release();
+                return true;
+            }
+            break;
+        }
+        at_ap_b = rt_get_dude_ap();
+        at_time_a = elapsed;
+        at_phase = 2;
+        break;
+    case 2:
+        if (FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING) {
+            at_flag_a = true;
+        }
+        if (rt_get_dude_ap() <= 0.0f || timedOut) {
+            at_check(C_RUN_COMBAT_START, at_flag_b && at_flag_a && rt_get_dude_ap() <= 0.0f && at_ap_a >= at_ap_b - 0.01f,
+                "running out of combat=%d (AP %.2f), combat began at AP %.2f, ran in combat=%d, AP now %.2f after %d ms",
+                at_flag_b, at_ap_a, at_ap_b, at_flag_a, rt_get_dude_ap(), (int)(elapsed - at_time_a));
+            // The next step reads `at_flag_b` as "ran after exhaustion".
+            at_flag_b = false;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// Combat ends during a run: the drain stops at once.
+static bool step_run_combat_end(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_phase = 0;
+        at_time_a = elapsed;
+        return false;
+    }
+
+    at_heal();
+    at_stick_open_direction();
+    switch (at_phase) {
+    case 0:
+        if (!rt_player_in_combat()) {
+            at_spawn_rat(5, 8, true);
+        }
+        at_phase = 1;
+        break;
+    case 1:
+        // In combat with enough AP to run.
+        if (!rt_player_in_combat() || rt_get_dude_ap() < 3.0f) {
+            if (elapsed - at_time_a > 20000) {
+                at_check(C_RUN_COMBAT_END, false, "setup: in combat=%d, AP %.2f", rt_player_in_combat(), rt_get_dude_ap());
+                at_stick_release();
+                at_clear_rats_near(0);
+                return true;
+            }
+            break;
+        }
+        at_flag_a = false;
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        at_time_a = elapsed;
+        at_phase = 2;
+        break;
+    case 2:
+        // Running in combat (any moment of the window).
+        if (FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING && rt_player_in_combat()) {
+            at_flag_a = true;
+        }
+        if (elapsed - at_time_a < 1000 || (!at_flag_a && elapsed - at_time_a < 4000)) {
+            break;
+        }
+        at_ap_a = rt_get_dude_ap();
+        at_clear_rats_near(0);
+        at_flag_b = !rt_player_in_combat();
+        at_ap_b = rt_get_dude_ap();
+        at_time_a = elapsed;
+        at_phase = 3;
+        break;
+    case 3:
+        if (rt_get_dude_ap() < at_ap_b) {
+            at_ap_b = rt_get_dude_ap();
+        }
+        if (elapsed - at_time_a >= 1500) {
+            at_check(C_RUN_COMBAT_END, at_flag_a && at_flag_b && at_ap_b >= at_ap_a - 0.01f && rt_get_dude_ap() > at_ap_a && rt_is_run_toggled(),
+                "running in combat=%d at AP %.2f; combat over at once=%d; lowest AP after %.2f, AP now %.2f, still running=%d",
+                at_flag_a, at_ap_a, at_flag_b, at_ap_b, rt_get_dude_ap(), rt_is_run_toggled());
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+            at_stick_release();
+            return true;
+        }
+        break;
     }
     return false;
 }
@@ -1270,6 +1556,8 @@ static bool step_exhausted(unsigned int elapsed, bool first, bool timedOut)
 {
     // Keep pushing the stick: the player must walk, and keep walking even
     // after AP is back above 1 (a new click is required to run).
+    // Still in combat (the hostile rat from the previous step).
+    at_heal();
     at_stick_open_direction();
 
     int anim = FID_ANIM_TYPE(obj_dude->fid);
@@ -1556,6 +1844,15 @@ static bool step_find_hostile(unsigned int elapsed, bool first, bool timedOut)
         at_log("hostile available: %s at %d", critter_name(hostile), obj_dist(obj_dude, hostile));
         register_clear(obj_dude);
         return true;
+    }
+
+    // Cave rats don't always notice the player (earlier steps remove rats
+    // that engaged): after a while a hostile one is spawned.
+    if (elapsed > 15000) {
+        if (at_spawn_rat(4, 8, true) != NULL) {
+            at_log("harness: no rat engaged on its own, spawned a hostile one");
+        }
+        return false;
     }
 
     // Walk towards the nearest rat until it notices the player.
@@ -2207,6 +2504,21 @@ static bool at_prepare_target()
         return false;
     }
     approaching = NULL;
+
+    // Shots and throws need a clear line: a target behind rocks is replaced
+    // by a rat on a clear tile.
+    if ((at_kind == AT_SINGLE || at_kind == AT_BURST || at_kind == AT_THROW)
+        && combat_is_shot_blocked(obj_dude, obj_dude->tile, at_target->tile, at_target, NULL)) {
+        for (int attempt = 0; attempt < 40; attempt++) {
+            int tile = at_free_tile(2, 4);
+            if (tile != -1 && !combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                at_log("harness: %s is behind cover, using a new rat in the open", critter_name(at_target));
+                at_target = at_spawn_rat_at(tile, true);
+                break;
+            }
+        }
+        return false;
+    }
 
     if (anim_busy(obj_dude) && FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK) {
         register_clear(obj_dude);
@@ -3012,6 +3324,37 @@ static bool step_combat_summary(unsigned int elapsed, bool first, bool timedOut)
 }
 
 // Removes every living rat (fixture cleanup before the quiet tests).
+// Removes living rats within `radius` of the player, and any rat engaged
+// with the player wherever it is (out-of-combat fixtures). Farther calm
+// rats stay for the steps that need one.
+static int at_clear_rats_near(int radius)
+{
+    Object** list;
+    int count = obj_create_list(-1, obj_dude->elevation, OBJ_TYPE_CRITTER, &list);
+    int removed = 0;
+    for (int index = 0; index < count; index++) {
+        Object* critter = list[index];
+        if (critter != obj_dude && !critter_is_dead(critter) && at_filter_enemy_team(critter)
+            && (obj_dist(obj_dude, critter) <= radius || rt_is_hostile(critter))) {
+            if (rt_get_lock() == critter) {
+                rt_debug_set_lock(NULL);
+            }
+            Rect rect;
+            anim_rt_end_all(critter);
+            obj_erase_object(critter, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            removed++;
+        }
+    }
+    if (count > 0) {
+        obj_delete_list(list);
+    }
+    if (removed != 0) {
+        at_log("harness: removed %d rats near the player or engaged", removed);
+    }
+    return removed;
+}
+
 static void at_clear_hostiles()
 {
     Object** list;
@@ -4643,6 +4986,41 @@ static bool step_chem(unsigned int elapsed, bool first, bool timedOut)
         return true;
     }
     return false;
+}
+
+// Diagnostics (only with --rt-autotest-only=dump): logs the game's perk, stat
+// and skill texts and every script call that touches party membership.
+static bool step_dump(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (SDL_strcasestr(at_only, "dump") == NULL) {
+        return true;
+    }
+
+    for (int perk = 0; perk < PERK_COUNT; perk++) {
+        at_log("dump perk %d %s | %s", perk, perk_name(perk), perk_description(perk));
+    }
+    for (int stat = 0; stat < STAT_COUNT; stat++) {
+        at_log("dump stat %d %s | %s", stat, stat_name(stat), stat_description(stat));
+    }
+    for (int skill = 0; skill < SKILL_COUNT; skill++) {
+        at_log("dump skill %d %s | %s | %s", skill, skill_name(skill), skill_attribute(skill), skill_description(skill));
+    }
+    for (int trait = 0; trait < TRAIT_COUNT; trait++) {
+        at_log("dump trait %d %s | %s", trait, trait_name(trait), trait_description(trait));
+    }
+
+    static const int opcodes[] = { 0x8124, 0x8125, 0x814B };
+    for (int index = 0; index < 2000; index++) {
+        char name[16];
+        if (scr_list_str(index, name, sizeof(name)) == -1) {
+            break;
+        }
+        int hits = rt_context_dump_opcodes(index, opcodes, 3);
+        if (hits != 0) {
+            at_log("dump party script %d %s: %d calls", index, name, hits);
+        }
+    }
+    return true;
 }
 
 // Scans every script in scripts.lst for skill handling (report only).
@@ -7778,6 +8156,9 @@ static void at_record_save_state()
     memcpy(at_fav_saved, rt_favorites_get_state()->slots, sizeof(at_fav_saved));
     at_fav_saved_valid = true;
     at_record_level_state();
+    at_rule_saved_perks = editor_rt_free_perks();
+    int freePerks;
+    editor_rt_debug_get(&at_rule_saved_last_level, &freePerks);
 }
 
 static bool step_fav_persist(unsigned int elapsed, bool first, bool timedOut)
@@ -9930,16 +10311,33 @@ static bool step_level_icon(unsigned int elapsed, bool first, bool timedOut)
     }
 
     bool flag = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
-    int progression = 3 + (trait_level(TRAIT_SKILLED) ? 1 : 0);
+    // Perks come every 2 levels (see `rt_perk_selections_earned`).
+    int progression = 2;
     switch (at_lvl_phase) {
     case 0: {
         if (!at_aim_released()) {
             break;
         }
-        // The next level, one without a perk.
-        int level = stat_pc_get(PC_STAT_LEVEL) + 1;
-        at_lvl_gain(level % progression == 0 ? 2 : 1);
-        at_log("level icon: now level %d, icon on=%d", stat_pc_get(PC_STAT_LEVEL), is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE));
+        // Start without selections left over from earlier steps.
+        {
+            editor_rt_update_level();
+            int lastLevel;
+            int freePerks;
+            editor_rt_debug_get(&lastLevel, &freePerks);
+            editor_rt_debug_set(lastLevel, 0);
+        }
+        // The next level, one without a perk: an even level on the way is
+        // processed and its selection cleared first.
+        if ((stat_pc_get(PC_STAT_LEVEL) + 1) % progression == 0) {
+            at_lvl_gain(1);
+            editor_rt_update_level();
+            int lastLevel;
+            int freePerks;
+            editor_rt_debug_get(&lastLevel, &freePerks);
+            editor_rt_debug_set(lastLevel, 0);
+        }
+        at_lvl_gain(1);
+        at_log("level icon: now level %d, icon on=%d, pending perks %d", stat_pc_get(PC_STAT_LEVEL), is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE), editor_rt_free_perks());
         at_lvl_ok[0] = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
         at_lvl_open(0);
         at_lvl_phase = 1;
@@ -9964,7 +10362,7 @@ static bool step_level_icon(unsigned int elapsed, bool first, bool timedOut)
         at_menu_expected = false;
         // Stats seen, no perk due: off, the points stay (banked).
         at_lvl_ok[2] = !flag && stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS) == at_lvl_unspent;
-        at_log("level icon: after the Stats tab: on=%d, unspent %d (was %d)", flag, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS), at_lvl_unspent);
+        at_log("level icon: after the Stats tab: on=%d, unspent %d (was %d), pending perks %d", flag, stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS), at_lvl_unspent, editor_rt_free_perks());
         // Up to the next perk level.
         {
             int level = stat_pc_get(PC_STAT_LEVEL);
@@ -10036,15 +10434,1247 @@ static bool step_level_after_load(unsigned int elapsed, bool first, bool timedOu
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Steps: character rules (SPECIAL formulas, perks, companions, replaced perks)
+// -----------------------------------------------------------------------------
+
+
+// Prototype of the first item with this name, or -1.
+static int at_item_pid_by_name(const char* name)
+{
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_ITEM << 24) | index;
+        Proto* proto;
+        if (proto_ptr(pid, &proto) != -1 && SDL_strcasecmp(proto_name(pid), name) == 0) {
+            return pid;
+        }
+    }
+    return -1;
+}
+
+// Index of a script in scripts.lst, or -1.
+static int at_script_index(const char* script)
+{
+    for (int index = 0; index < 2000; index++) {
+        char name[16];
+        if (scr_list_str(index, name, sizeof(name)) == -1) {
+            break;
+        }
+        if (SDL_strcasecmp(name, script) == 0) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+static bool at_tile_free(int tile)
+{
+    return tile >= 0 && tile < HEX_GRID_SIZE && obj_blocking_at(NULL, tile, obj_dude->elevation) == NULL;
+}
+
+// A calm critter (script removed) whose prototype differs from the player's
+// and from the `count` critters in `others` (the party keeps one member per
+// prototype).
+static Object* at_spawn_distinct_critter(Object** others, int count)
+{
+    int tile = at_free_tile(2, 7);
+    if (tile == -1) {
+        return NULL;
+    }
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        if (pid == obj_dude->pid || proto_ptr(pid, &proto) == -1) {
+            continue;
+        }
+        bool used = false;
+        for (int other = 0; other < count; other++) {
+            if (others[other] != NULL && others[other]->pid == pid) {
+                used = true;
+            }
+        }
+        if (used) {
+            continue;
+        }
+        Object* critter;
+        if (obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+        if (critter->sid != -1) {
+            scr_remove(critter->sid);
+            critter->sid = -1;
+        }
+        Rect rect;
+        obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        return critter;
+    }
+    return NULL;
+}
+
+// Every hex within `radius` of `center` is free and in the line of fire
+// from it.
+static bool at_open_around(int center, int radius)
+{
+    for (int distance = 1; distance <= radius; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int corner = tile_num_in_direction(center, rotation, distance);
+            for (int step = 0; step < distance; step++) {
+                int tile = corner != -1 ? tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step) : -1;
+                if (tile == -1 || obj_blocking_at(obj_dude, tile, obj_dude->elevation) != NULL
+                    || combat_is_shot_blocked(obj_dude, center, tile, NULL, NULL)) {
+                    return false;
+                }
+            }
+        }
+    }
+    return true;
+}
+
+// Moves the player to the nearest spot with open ground `radius` hexes
+// around (character rules fixtures need room).
+static bool at_move_to_open_spot(int radius)
+{
+    for (int distance = 0; distance <= 40; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int corner = distance == 0 ? obj_dude->tile : tile_num_in_direction(obj_dude->tile, rotation, distance);
+            int steps = distance == 0 ? 1 : distance;
+            for (int step = 0; step < steps && corner != -1; step++) {
+                int tile = distance == 0 ? corner : tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step);
+                if (tile == -1 || obj_blocking_at(obj_dude, tile, obj_dude->elevation) != NULL || !at_open_around(tile, radius)) {
+                    continue;
+                }
+                if (tile != obj_dude->tile) {
+                    Rect rect;
+                    register_clear(obj_dude);
+                    obj_move_to_tile(obj_dude, tile, obj_dude->elevation, &rect);
+                    tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW);
+                    at_log("harness: player moved %d tiles to open ground (radius %d)", distance, radius);
+                }
+                return true;
+            }
+        }
+    }
+    at_log("harness: no open ground of radius %d found", radius);
+    return false;
+}
+
+static void at_erase(Object* obj)
+{
+    if (obj == NULL) {
+        return;
+    }
+    if (FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER && isPartyMember(obj)) {
+        partyMemberRemove(obj);
+    }
+    Rect rect;
+    if (FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER) {
+        anim_rt_end_all(obj);
+    }
+    obj_erase_object(obj, &rect);
+    tile_refresh_rect(&rect, obj_dude->elevation);
+}
+
+// Makes the effective value of a SPECIAL attribute `value`; returns the
+// previous bonus (restore with `stat_set_bonus`).
+static int at_set_special(int stat, int value)
+{
+    int bonus = stat_get_bonus(obj_dude, stat);
+    int effective = stat_level(obj_dude, stat);
+    stat_set_bonus(obj_dude, stat, bonus + value - effective);
+    return bonus;
+}
+
+#define AT_RULE_AC SKILL_COUNT
+#define AT_RULE_AP (SKILL_COUNT + 1)
+#define AT_RULE_CARRY (SKILL_COUNT + 2)
+#define AT_RULE_MELEE (SKILL_COUNT + 3)
+#define AT_RULE_VALUES (SKILL_COUNT + 4)
+
+static void at_rule_values(int* values)
+{
+    for (int skill = 0; skill < SKILL_COUNT; skill++) {
+        values[skill] = skill_level(obj_dude, skill);
+    }
+    values[AT_RULE_AC] = stat_level(obj_dude, STAT_ARMOR_CLASS);
+    values[AT_RULE_AP] = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+    values[AT_RULE_CARRY] = stat_level(obj_dude, STAT_CARRY_WEIGHT);
+    values[AT_RULE_MELEE] = stat_level(obj_dude, STAT_MELEE_DAMAGE);
+}
+
+static const char* at_rule_value_name(int index)
+{
+    switch (index) {
+    case AT_RULE_AC:
+        return "AC";
+    case AT_RULE_AP:
+        return "AP";
+    case AT_RULE_CARRY:
+        return "Carry";
+    case AT_RULE_MELEE:
+        return "MeleeDmg";
+    }
+    return skill_name(index);
+}
+
+// Changes `stat` by 2 (down when it's 9 or 10) and compares every skill and
+// derived value against `expected` (per 2 points). Returns true when all
+// match; `note` lists the changes.
+static bool at_rule_special(int stat, const int* expectedPer2, char* note, size_t size)
+{
+    int before[AT_RULE_VALUES];
+    int after[AT_RULE_VALUES];
+    at_rule_values(before);
+
+    int level = stat_level(obj_dude, stat);
+    int delta = level <= 8 ? 2 : -2;
+    int bonus = stat_get_bonus(obj_dude, stat);
+    stat_set_bonus(obj_dude, stat, bonus + delta);
+    at_rule_values(after);
+    stat_set_bonus(obj_dude, stat, bonus);
+
+    bool ok = true;
+    snprintf(note, size, "%s %d->%d:", stat_name(stat), level, level + delta);
+    for (int index = 0; index < AT_RULE_VALUES; index++) {
+        int change = after[index] - before[index];
+        int expected = expectedPer2[index] * delta / 2;
+        if (index == AT_RULE_AP && stat == STAT_AGILITY) {
+            expected = (level + delta) / 2 - level / 2;
+        } else if (index == AT_RULE_MELEE && stat == STAT_STRENGTH) {
+            expected = std::max(level + delta - 5, 1) - std::max(level - 5, 1);
+        }
+        if (change != 0 || expected != 0) {
+            char part[48];
+            snprintf(part, sizeof(part), " %s %+d%s", at_rule_value_name(index), change, change == expected ? "" : "(!)");
+            SDL_strlcat(note, part, size);
+        }
+        if (change != expected) {
+            ok = false;
+        }
+    }
+    at_log("rules: %s", note);
+    return ok;
+}
+
+static bool step_rules_special(unsigned int elapsed, bool first, bool timedOut)
+{
+    char note[400];
+
+    // Per +2 points of the attribute.
+    int agility[AT_RULE_VALUES] = { 0 };
+    agility[SKILL_SMALL_GUNS] = 2;
+    agility[SKILL_BIG_GUNS] = 2;
+    agility[SKILL_LOCKPICK] = 1;
+    agility[SKILL_STEAL] = 2;
+    agility[SKILL_TRAPS] = 1;
+    at_check(C_RULE_SPECIAL_AG, at_rule_special(STAT_AGILITY, agility, note, sizeof(note)), "%s", note);
+
+    int strength[AT_RULE_VALUES] = { 0 };
+    strength[SKILL_UNARMED] = 2;
+    strength[SKILL_MELEE_WEAPONS] = 2;
+    strength[SKILL_THROWING] = 2;
+    strength[AT_RULE_CARRY] = 50;
+    at_check(C_RULE_SPECIAL_ST, at_rule_special(STAT_STRENGTH, strength, note, sizeof(note)), "%s", note);
+
+    int intelligence[AT_RULE_VALUES] = { 0 };
+    intelligence[SKILL_ENERGY_WEAPONS] = 2;
+    intelligence[SKILL_FIRST_AID] = 1;
+    intelligence[SKILL_DOCTOR] = 1;
+    intelligence[SKILL_SCIENCE] = 4;
+    intelligence[SKILL_REPAIR] = 2;
+    intelligence[SKILL_OUTDOORSMAN] = 1;
+    at_check(C_RULE_SPECIAL_IN, at_rule_special(STAT_INTELLIGENCE, intelligence, note, sizeof(note)), "%s", note);
+
+    int endurance[AT_RULE_VALUES] = { 0 };
+    endurance[AT_RULE_AC] = 2;
+    endurance[SKILL_OUTDOORSMAN] = 1;
+    bool enOk = at_rule_special(STAT_ENDURANCE, endurance, note, sizeof(note));
+    // Armor still adds on top of Endurance.
+    int ac = stat_level(obj_dude, STAT_ARMOR_CLASS);
+    int expectedAc = stat_level(obj_dude, STAT_ENDURANCE) + stat_get_bonus(obj_dude, STAT_ARMOR_CLASS);
+    char acNote[96];
+    snprintf(acNote, sizeof(acNote), "; AC %d = EN %d + bonus (armor, perks) %d", ac, stat_level(obj_dude, STAT_ENDURANCE), stat_get_bonus(obj_dude, STAT_ARMOR_CLASS));
+    SDL_strlcat(note, acNote, sizeof(note));
+    at_check(C_RULE_SPECIAL_EN, enOk && ac == std::clamp(expectedAc, 0, 90), "%s", note);
+
+    // Charisma: Speech and Barter as before, companions floor(CH / 2), max 5.
+    int charisma[AT_RULE_VALUES] = { 0 };
+    charisma[SKILL_SPEECH] = 4;
+    charisma[SKILL_BARTER] = 4;
+    bool chaSkills = at_rule_special(STAT_CHARISMA, charisma, note, sizeof(note));
+    char limits[160] = "limits:";
+    bool limitsOk = true;
+    for (int value = 1; value <= 10; value++) {
+        int bonus = at_set_special(STAT_CHARISMA, value);
+        int limit = rt_companion_limit();
+        stat_set_bonus(obj_dude, STAT_CHARISMA, bonus);
+        char part[16];
+        snprintf(part, sizeof(part), " %d:%d", value, limit);
+        SDL_strlcat(limits, part, sizeof(limits));
+        if (limit != std::min(value / 2, 5)) {
+            limitsOk = false;
+        }
+    }
+    at_check(C_RULE_CHA_LIMIT, chaSkills && limitsOk, "%s (CH:companions); %s", limits, note);
+    return true;
+}
+
+static bool step_rules_perks(unsigned int elapsed, bool first, bool timedOut)
+{
+    int savedLevel = stat_pc_get(PC_STAT_LEVEL);
+    int savedSp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+    int savedLastLevel;
+    int savedFree;
+    editor_rt_debug_get(&savedLastLevel, &savedFree);
+
+    // Level by level from 1 to 9, each level processed twice (a reopened
+    // screen): selections at 2, 4, 6, 8 only.
+    char line[200] = "selections after level:";
+    bool cadenceOk = true;
+    editor_rt_debug_set(1, 0);
+    for (int level = 1; level <= 9; level++) {
+        stat_pc_set(PC_STAT_LEVEL, level);
+        editor_rt_update_level();
+        int once = editor_rt_free_perks();
+        editor_rt_update_level();
+        int twice = editor_rt_free_perks();
+        char part[16];
+        snprintf(part, sizeof(part), " %d:%d", level, twice);
+        SDL_strlcat(line, part, sizeof(line));
+        if (once != twice || twice != level / 2) {
+            cadenceOk = false;
+        }
+    }
+
+    // Several levels at once (1 -> 7) add up.
+    editor_rt_debug_set(1, 0);
+    stat_pc_set(PC_STAT_LEVEL, 7);
+    editor_rt_update_level();
+    int jump = editor_rt_free_perks();
+
+    // Spending one leaves the others; processing again adds nothing.
+    int perks[PERK_COUNT];
+    int count = perk_make_list(perks);
+    int spent = -1;
+    for (int index = 0; index < count && spent == -1; index++) {
+        int perk = perks[index];
+        if (perk != PERK_TAG && perk != PERK_MUTATE && perk != PERK_LIFEGIVER && perk != PERK_EDUCATED) {
+            spent = perk;
+        }
+    }
+    int rankBefore = spent != -1 ? perk_level(spent) : 0;
+    bool took = spent != -1 && editor_rt_take_perk(spent, -1, -1) == 0;
+    int afterSpend = editor_rt_free_perks();
+    editor_rt_update_level();
+    int afterReopen = editor_rt_free_perks();
+    bool rankUp = spent != -1 && perk_level(spent) == rankBefore + 1;
+    if (took) {
+        perk_sub(spent);
+    }
+
+    at_check(C_RULE_PERK_CADENCE,
+        cadenceOk && jump == 3 && took && rankUp && afterSpend == 2 && afterReopen == 2,
+        "%s; level 1->7 at once: %d; took %s: %d left, %d after processing again",
+        line, jump, spent != -1 ? perk_name(spent) : "(none)", afterSpend, afterReopen);
+
+    // Eligibility follows the new minimum levels.
+    bool eligibleOk = true;
+    char eligible[200] = "";
+    for (int level = 2; level <= 4; level++) {
+        stat_pc_set(PC_STAT_LEVEL, level);
+        count = perk_make_list(perks);
+        for (int index = 0; index < count; index++) {
+            if (perk_min_level(perks[index]) > level) {
+                eligibleOk = false;
+            }
+        }
+        char part[48];
+        snprintf(part, sizeof(part), "%s%d eligible at level %d", level > 2 ? ", " : "", count, level);
+        SDL_strlcat(eligible, part, sizeof(eligible));
+    }
+
+    stat_pc_set(PC_STAT_LEVEL, savedLevel);
+    stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, savedSp);
+
+    static const int table[][3] = {
+        { PERK_ANIMAL_FRIEND, 4, 1 },
+        { PERK_ACTION_BOY, 4, 3 },
+        { PERK_AWARENESS, 2, 1 },
+        { PERK_BETTER_CRITICALS, 6, 1 },
+        { PERK_BONUS_HTH_DAMAGE, 2, 3 },
+        { PERK_BONUS_RATE_OF_FIRE, 8, 1 },
+        { PERK_DODGER, 10, 2 },
+        { PERK_FRIENDLY_FOE, 4, 1 },
+        { PERK_TOUGHNESS, 2, 3 },
+        { PERK_SCROUNGER, 8, 1 },
+        { PERK_EDUCATED, 4, 3 },
+        { PERK_PRESENCE, 4, 3 },
+        { PERK_SMOOTH_TALKER, 4, 3 },
+        { PERK_EARLIER_SEQUENCE, 2, 3 },
+        { PERK_FASTER_HEALING, 2, 3 },
+        { PERK_NIGHT_VISION, 2, 3 },
+        { PERK_STRONG_BACK, 4, 3 },
+        { PERK_SURVIVALIST, 2, 3 },
+        { PERK_HEALER, 2, 3 },
+        { PERK_SCOUT, 2, 1 },
+        { PERK_QUICK_POCKETS, 2, 3 },
+        { PERK_SWIFT_LEARNER, 4, 3 },
+        { PERK_BONUS_HTH_ATTACKS, 6, 1 },
+        { PERK_BONUS_MOVE, 6, 1 },
+        { PERK_HEAVE_HO, 6, 3 },
+    };
+    bool tableOk = true;
+    char wrong[200] = "";
+    for (const auto& row : table) {
+        if (perk_min_level(row[0]) != row[1] || perk_max_rank(row[0]) != row[2]) {
+            tableOk = false;
+            char part[64];
+            snprintf(part, sizeof(part), " %s %d/%d", perk_name(row[0]), perk_min_level(row[0]), perk_max_rank(row[0]));
+            SDL_strlcat(wrong, part, sizeof(wrong));
+        }
+    }
+    int level3 = 0;
+    for (int perk = 0; perk < PERK_COUNT; perk++) {
+        if (perk_max_rank(perk) != -1 && perk_min_level(perk) == 3) {
+            level3++;
+        }
+    }
+
+    bool textOk = strstr(perk_description(PERK_BONUS_HTH_ATTACKS), "1.5 hexes") != NULL
+        && strstr(perk_description(PERK_BONUS_MOVE), "50%") != NULL
+        && strstr(perk_description(PERK_BONUS_RATE_OF_FIRE), "25%") != NULL
+        && strstr(perk_description(PERK_HEAVE_HO), "20%") != NULL
+        && strstr(perk_description(PERK_FRIENDLY_FOE), "never hurt you") != NULL
+        && strstr(trait_description(TRAIT_SKILLED), "four levels") == NULL
+        && strstr(stat_description(STAT_AGILITY), "Armor Class") == NULL
+        && strstr(stat_description(STAT_ENDURANCE), "Armor Class") != NULL
+        && strstr(stat_description(STAT_CHARISMA), "companions") != NULL
+        && strcmp(skill_attribute(SKILL_ENERGY_WEAPONS), "+ IN") == 0
+        && strcmp(skill_attribute(SKILL_MELEE_WEAPONS), "+ ST") == 0;
+    at_log("rules: Bonus HtH Attacks: %s", perk_description(PERK_BONUS_HTH_ATTACKS));
+    at_log("rules: Bonus Move: %s", perk_description(PERK_BONUS_MOVE));
+    at_log("rules: Bonus Rate of Fire: %s", perk_description(PERK_BONUS_RATE_OF_FIRE));
+    at_log("rules: Heave Ho!: %s", perk_description(PERK_HEAVE_HO));
+    at_log("rules: Friendly Foe: %s", perk_description(PERK_FRIENDLY_FOE));
+
+    at_check(C_RULE_PERK_TABLE, eligibleOk && tableOk && level3 == 0 && textOk,
+        "%s; table %s%s; perks still at level 3: %d; descriptions updated=%d",
+        eligible, tableOk ? "ok" : "wrong:", wrong, level3, textOk);
+
+    // Old saves: (last level, stored byte, Skilled) -> pending now.
+    static const int cases[][5] = {
+        // level, stored, skilled, expected
+        { 1, 0, 0, 0 },
+        { 3, 0, 0, 0 },
+        { 3, 1, 0, 1 },
+        { 4, 0, 0, 1 },
+        { 6, 1, 0, 2 },
+        { 6, 0, 0, 1 },
+        { 7, 0, 1, 2 },
+        { 12, 0, 0, 2 },
+        { 12, 1, 1, 4 },
+    };
+    bool convertOk = true;
+    char conversions[300] = "";
+    int trait1;
+    int trait2;
+    trait_get(&trait1, &trait2);
+    for (const auto& row : cases) {
+        bool skilled = row[2] != 0;
+        if (skilled && trait1 != TRAIT_SKILLED && trait2 != TRAIT_SKILLED) {
+            trait_set(TRAIT_SKILLED, trait1 != TRAIT_SKILLED ? trait1 : trait2);
+        }
+        int pending = editor_rt_debug_convert(row[0], row[1]);
+        trait_set(trait1, trait2);
+        char part[48];
+        snprintf(part, sizeof(part), " L%d/%d%s->%d", row[0], row[1], skilled ? "S" : "", pending);
+        SDL_strlcat(conversions, part, sizeof(conversions));
+        if (pending != row[3]) {
+            convertOk = false;
+        }
+    }
+    at_check(C_RULE_PERK_CONVERT, convertOk, "old save (level/pending[S=Skilled]) -> pending now:%s", conversions);
+
+    // Leave two pending selections for the save/load check.
+    editor_rt_debug_set(savedLastLevel, std::max(savedFree, 2));
+    at_log("rules: pending perk selections left for the save test: %d (were %d)", editor_rt_free_perks(), savedFree);
+    return true;
+}
+
+static bool step_rules_companions(unsigned int elapsed, bool first, bool timedOut)
+{
+    static const char* scripts[] = { "Ian.int", "Tycho.int", "Katja.int", "Junkdog.int", "Tandi.int" };
+    // Calm test critters given the followers' own scripts (their prototypes
+    // carry none; maps attach them). Everything happens in this tick, before
+    // the scripts get to run.
+    Object* critters[5] = { NULL };
+    for (int index = 0; index < 5; index++) {
+        int scriptIndex = at_script_index(scripts[index]);
+        Object* critter = scriptIndex != -1 ? at_spawn_distinct_critter(critters, index) : NULL;
+        if (critter != NULL && obj_new_sid_inst(critter, SCRIPT_TYPE_CRITTER, scriptIndex) == -1) {
+            at_erase(critter);
+            critter = NULL;
+        }
+        critters[index] = critter;
+    }
+    Object* ian = critters[0];
+    Object* tycho = critters[1];
+    Object* katja = critters[2];
+    Object* dogmeat = critters[3];
+    Object* tandi = critters[4];
+    if (ian == NULL || tycho == NULL || katja == NULL || dogmeat == NULL || tandi == NULL) {
+        at_check(C_RULE_CHA_RECRUIT, false, "fixtures missing (Ian %d, Tycho %d, Katja %d, Dogmeat %d, Tandi %d)",
+            ian != NULL, tycho != NULL, katja != NULL, dogmeat != NULL, tandi != NULL);
+        for (Object* critter : critters) {
+            at_erase(critter);
+        }
+        return true;
+    }
+
+    bool kinds = rt_is_companion(ian) && rt_is_companion(tycho) && rt_is_companion(katja) && rt_is_companion(dogmeat) && !rt_is_companion(tandi);
+    int baseCount = partyMemberCompanionCount();
+    int bonus = stat_get_bonus(obj_dude, STAT_CHARISMA);
+
+    at_set_special(STAT_CHARISMA, 1);
+    int ianAt1 = partyMemberAdd(ian);
+    at_set_special(STAT_CHARISMA, 2);
+    int ianAt2 = partyMemberAdd(ian);
+    int tychoAt2 = partyMemberAdd(tycho);
+    at_set_special(STAT_CHARISMA, 4);
+    int tychoAt4 = partyMemberAdd(tycho);
+    int countAt4 = partyMemberCompanionCount();
+
+    // Charisma drops (a temporary penalty): nobody leaves, nobody new joins.
+    at_set_special(STAT_CHARISMA, 1);
+    bool stayed = isPartyMember(ian) && isPartyMember(tycho);
+    int dogAt1 = partyMemberAdd(dogmeat);
+    int tandiAt1 = partyMemberAdd(tandi);
+    int countAt1 = partyMemberCompanionCount();
+
+    // The script's join is undone: Katja's status variable keeps its value.
+    int katjaVar = 244;
+    int before = game_get_global_var(katjaVar);
+    int refused = intextra_rt_debug_party_add(katja, katjaVar, before + 7);
+    int afterRefusal = game_get_global_var(katjaVar);
+    bool katjaOut = !isPartyMember(katja);
+    at_set_special(STAT_CHARISMA, 6);
+    int joined = intextra_rt_debug_party_add(katja, katjaVar, before);
+    bool katjaIn = isPartyMember(katja);
+    game_set_global_var(katjaVar, before);
+
+    stat_set_bonus(obj_dude, STAT_CHARISMA, bonus);
+    for (Object* critter : critters) {
+        at_erase(critter);
+    }
+
+    bool ok = kinds
+        && ianAt1 == PARTY_MEMBER_ADD_COMPANION_LIMIT && ianAt2 == 0
+        && tychoAt2 == PARTY_MEMBER_ADD_COMPANION_LIMIT && tychoAt4 == 0 && countAt4 == baseCount + 2
+        && stayed && dogAt1 == PARTY_MEMBER_ADD_COMPANION_LIMIT && tandiAt1 == 0 && countAt1 == baseCount + 2
+        && refused >= 1 && afterRefusal == before && katjaOut
+        && joined == -1 && katjaIn
+        && partyMemberCompanionCount() == baseCount;
+    at_check(C_RULE_CHA_RECRUIT, ok,
+        "CH1 Ian %d; CH2 Ian %d, Tycho %d; CH4 Tycho %d (companions %d); CH1 again: kept=%d, Dogmeat %d, Tandi (temporary) %d, companions %d; "
+        "script join refused: %d change(s) undone, Katja var %d->%d, out=%d; CH6 join %d in=%d",
+        ianAt1, ianAt2, tychoAt2, tychoAt4, countAt4 - baseCount, stayed, dogAt1, tandiAt1, countAt1 - baseCount,
+        refused, before, afterRefusal, katjaOut, joined, katjaIn);
+    return true;
+}
+
+// Bonus HtH Attacks reach.
+static Object* at_reach_rats[6];
+static Object* at_reach_wall;
+static int at_reach_count_a;
+
+static int at_hex_walk(int tile, int rotation1, int steps1, int rotation2, int steps2)
+{
+    if (tile == -1) {
+        return -1;
+    }
+    if (steps1 > 0) {
+        tile = tile_num_in_direction(tile, rotation1, steps1);
+    }
+    if (tile != -1 && steps2 > 0) {
+        tile = tile_num_in_direction(tile, rotation2, steps2);
+    }
+    return tile;
+}
+
+static bool step_rules_reach(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_phase = 0;
+        memset(at_reach_rats, 0, sizeof(at_reach_rats));
+        at_reach_wall = NULL;
+        at_clear_hostiles();
+        if (!at_move_to_open_spot(4)) {
+            at_move_to_open_spot(3);
+        }
+        return false;
+    }
+
+    at_heal();
+    switch (at_phase) {
+    case 0: {
+        if (!at_unarmed() || anim_busy(obj_dude)) {
+            break;
+        }
+
+        // Two steps straight (2.0 apart), two steps with a turn (1.73),
+        // three steps with a turn (2.65) and straight (3.0).
+        int rotation = -1;
+        int tiles[4];
+        for (int r = 0; r < ROTATION_COUNT && rotation == -1; r++) {
+            tiles[0] = at_hex_walk(obj_dude->tile, r, 2, 0, 0);
+            tiles[1] = at_hex_walk(obj_dude->tile, r, 1, (r + 1) % ROTATION_COUNT, 1);
+            tiles[2] = at_hex_walk(obj_dude->tile, r, 2, (r + 1) % ROTATION_COUNT, 1);
+            tiles[3] = at_hex_walk(obj_dude->tile, r, 3, 0, 0);
+            bool usable = true;
+            for (int tile : tiles) {
+                if (!at_tile_free(tile) || combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                    usable = false;
+                }
+            }
+            if (usable) {
+                rotation = r;
+            }
+        }
+        if (rotation == -1) {
+            at_check(C_RULE_REACH, false, "no free hexes around the player");
+            return true;
+        }
+        for (int index = 0; index < 4; index++) {
+            at_reach_rats[index] = at_spawn_rat_at(tiles[index], false);
+        }
+
+        int hitMode = HIT_MODE_PUNCH;
+        int without[4];
+        int with[4];
+        double distance[4];
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        for (int index = 0; index < 4; index++) {
+            without[index] = combat_rt_check_reach(obj_dude, at_reach_rats[index], hitMode);
+            distance[index] = rt_obj_distance_exact(obj_dude, at_reach_rats[index]);
+        }
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 1);
+        for (int index = 0; index < 4; index++) {
+            with[index] = combat_rt_check_reach(obj_dude, at_reach_rats[index], hitMode);
+        }
+        // Critters other than the player don't get the reach.
+        int ratReach = combat_rt_check_reach(at_reach_rats[0], obj_dude, HIT_MODE_PUNCH);
+
+        // A 2-hex weapon (spear) with the perk: 3.46 in reach, 3.61 not.
+        char spearNote[160] = "spear: not available";
+        bool spearOk = true;
+        int spearPid = at_item_pid_by_name("Spear");
+        Object* spear = NULL;
+        if (spearPid != -1 && obj_pid_new(&spear, spearPid) != -1) {
+            Rect rect;
+            if (item_add_force(obj_dude, spear, 1) == 0) {
+                obj_disconnect(spear, &rect);
+            }
+            int near4 = -1;
+            int far4 = -1;
+            for (int r = 0; r < ROTATION_COUNT && near4 == -1; r++) {
+                int a = at_hex_walk(obj_dude->tile, r, 2, (r + 1) % ROTATION_COUNT, 2);
+                int b = at_hex_walk(obj_dude->tile, r, 3, (r + 1) % ROTATION_COUNT, 1);
+                if (at_tile_free(a) && at_tile_free(b)
+                    && !combat_is_shot_blocked(obj_dude, obj_dude->tile, a, NULL, NULL)
+                    && !combat_is_shot_blocked(obj_dude, obj_dude->tile, b, NULL, NULL)) {
+                    near4 = a;
+                    far4 = b;
+                }
+            }
+            if (at_wield(spear) && near4 != -1) {
+                at_reach_rats[4] = at_spawn_rat_at(near4, false);
+                at_reach_rats[5] = at_spawn_rat_at(far4, false);
+                int mode = at_current_hit_mode();
+                int nearReach = combat_rt_check_reach(obj_dude, at_reach_rats[4], mode);
+                int farReach = combat_rt_check_reach(obj_dude, at_reach_rats[5], mode);
+                spearOk = item_w_range(obj_dude, mode) == 2 && nearReach == COMBAT_BAD_SHOT_OK && farReach == COMBAT_BAD_SHOT_OUT_OF_RANGE;
+                snprintf(spearNote, sizeof(spearNote), "spear (range %d) + perk: %d steps/%.2f -> %d, %d steps/%.2f -> %d",
+                    item_w_range(obj_dude, mode),
+                    tile_dist(obj_dude->tile, near4), rt_obj_distance_exact(obj_dude, at_reach_rats[4]), nearReach,
+                    tile_dist(obj_dude->tile, far4), rt_obj_distance_exact(obj_dude, at_reach_rats[5]), farReach);
+            } else {
+                SDL_strlcpy(spearNote, "spear: could not set up", sizeof(spearNote));
+            }
+            at_unarmed();
+        }
+
+        bool ok = without[0] == COMBAT_BAD_SHOT_OUT_OF_RANGE && without[1] == COMBAT_BAD_SHOT_OUT_OF_RANGE
+            && with[0] == COMBAT_BAD_SHOT_OK && with[1] == COMBAT_BAD_SHOT_OK
+            && with[2] == COMBAT_BAD_SHOT_OUT_OF_RANGE && with[3] == COMBAT_BAD_SHOT_OUT_OF_RANGE
+            && ratReach == COMBAT_BAD_SHOT_OUT_OF_RANGE && spearOk;
+        at_check(C_RULE_REACH, ok,
+            "unarmed, distances %.2f/%.2f/%.2f/%.2f hexes: without perk %d/%d/%d/%d, with perk %d/%d/%d/%d (0 = in reach, 2 = out); rat at 2.0: %d; %s",
+            distance[0], distance[1], distance[2], distance[3],
+            without[0], without[1], without[2], without[3],
+            with[0], with[1], with[2], with[3], ratReach, spearNote);
+
+        // Blocked: a wall between the player and a hex two steps away.
+        char blockNote[160] = "";
+        int blocked = -1;
+        for (int r = 0; r < ROTATION_COUNT && blocked == -1; r++) {
+            int middle = at_hex_walk(obj_dude->tile, r, 1, 0, 0);
+            int end = at_hex_walk(obj_dude->tile, r, 2, 0, 0);
+            if (!at_tile_free(end)) {
+                continue;
+            }
+            if (!combat_is_shot_blocked(obj_dude, obj_dude->tile, end, NULL, NULL)) {
+                if (!at_tile_free(middle)) {
+                    continue;
+                }
+                // No wall here: put one in (the game's first wall prototype).
+                for (int index = 1; index < 300 && at_reach_wall == NULL; index++) {
+                    Object* wall;
+                    if (obj_pid_new(&wall, (OBJ_TYPE_WALL << 24) | index) != -1) {
+                        Rect rect;
+                        obj_move_to_tile(wall, middle, obj_dude->elevation, &rect);
+                        if (combat_is_shot_blocked(obj_dude, obj_dude->tile, end, NULL, NULL)) {
+                            at_reach_wall = wall;
+                        } else {
+                            obj_erase_object(wall, &rect);
+                        }
+                    }
+                }
+                if (at_reach_wall == NULL) {
+                    continue;
+                }
+            }
+            blocked = end;
+        }
+        if (blocked != -1) {
+            Object* rat = at_spawn_rat_at(blocked, false);
+            int reach = combat_rt_check_reach(obj_dude, rat, HIT_MODE_PUNCH);
+            snprintf(blockNote, sizeof(blockNote), "%s wall, target %.2f hexes away: %d (5 = blocked)",
+                at_reach_wall != NULL ? "test" : "map", rt_obj_distance_exact(obj_dude, rat), reach);
+            at_check(C_RULE_REACH_BLOCKED, reach == COMBAT_BAD_SHOT_AIM_BLOCKED, "%s", blockNote);
+            at_erase(rat);
+        } else {
+            at_check(C_RULE_REACH_BLOCKED, false, "no hex to block");
+        }
+        if (at_reach_wall != NULL) {
+            at_erase(at_reach_wall);
+            at_reach_wall = NULL;
+        }
+
+        rt_debug_set_lock(at_reach_rats[0]);
+        at_time_a = now;
+        at_phase = 1;
+        break;
+    }
+    case 1: {
+        if (now - at_time_a < 400) {
+            break;
+        }
+        char note[240];
+        bool shown = at_indicator_matches(at_reach_rats[0], note, sizeof(note));
+        int aim = rt_aim_check_shot(at_reach_rats[0], HIT_MODE_PUNCH);
+        at_log("rules: reach lock: %s; aimed shot check %d", note, aim);
+        at_flag_a = shown && aim == COMBAT_BAD_SHOT_OK;
+        at_reach_count_a = rt_get_stats()->playerAttacks;
+        at_screenshot("40_reach_lock");
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_time_a = now;
+        at_phase = 2;
+        break;
+    }
+    case 2: {
+        if (now - at_time_a < 2000) {
+            break;
+        }
+        int attacks = rt_get_stats()->playerAttacks - at_reach_count_a;
+        at_check(C_RULE_REACH_ATTACK, at_flag_a && attacks >= 1,
+            "target 2 hexes away: indicator and aimed shot ok=%d, attacks started=%d, last reject %d",
+            at_flag_a, attacks, rt_get_stats()->lastRejectReason);
+        rt_debug_set_lock(NULL);
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        for (Object*& rat : at_reach_rats) {
+            if (rat != NULL && !critter_is_dead(rat)) {
+                at_erase(rat);
+            }
+            rat = NULL;
+        }
+        at_clear_hostiles();
+        return true;
+    }
+    }
+    return false;
+}
+
+// Long-range accuracy (Bonus Rate of Fire, Heave Ho!).
+static Object* at_lr_far;
+static Object* at_lr_near;
+static int at_lr_bonus_pe;
+static char at_lr_note[400];
+static bool at_lr_ok;
+static Object* at_lr_throw;
+
+// The hit chance for the current weapon with the perk at `rank`.
+static int at_lr_chance(int perk, int rank, Object* target)
+{
+    int saved = perk_level(perk);
+    perk_rt_debug_set_rank(perk, rank);
+    int chance = determine_to_hit(obj_dude, target, HIT_LOCATION_UNCALLED, at_current_hit_mode());
+    perk_rt_debug_set_rank(perk, saved);
+    return chance;
+}
+
+// Checks the perk's effect on the current weapon: the far target's penalty
+// shrinks by `pct` per rank, the near one is unchanged.
+static bool at_lr_measure(const char* label, int perk, int maxRank, int pct)
+{
+    int perception = stat_level(obj_dude, STAT_PERCEPTION);
+    int range = obj_dist(obj_dude, at_lr_far) - 2 * perception - 2 * perk_level(PERK_SHARPSHOOTER);
+    int penalty = range > 0 ? 4 * range : 0;
+    int base = at_lr_chance(perk, 0, at_lr_far);
+    int nearBase = at_lr_chance(perk, 0, at_lr_near);
+    bool ok = penalty > 0;
+    char part[160];
+    snprintf(part, sizeof(part), " %s (penalty %d at %d hexes, PE %d): %d%%", label, penalty, obj_dist(obj_dude, at_lr_far), perception, base);
+    SDL_strlcat(at_lr_note, part, sizeof(at_lr_note));
+    for (int rank = 1; rank <= maxRank; rank++) {
+        int chance = at_lr_chance(perk, rank, at_lr_far);
+        int reduction = std::min(penalty * std::min(pct * rank, 100) / 100, penalty);
+        int expected = std::min(base + reduction, 95);
+        snprintf(part, sizeof(part), " r%d %d%% (exp %d)", rank, chance, expected);
+        SDL_strlcat(at_lr_note, part, sizeof(at_lr_note));
+        if (chance != expected) {
+            ok = false;
+        }
+    }
+    int nearChance = at_lr_chance(perk, maxRank, at_lr_near);
+    snprintf(part, sizeof(part), ", near %d->%d;", nearBase, nearChance);
+    SDL_strlcat(at_lr_note, part, sizeof(at_lr_note));
+    return ok && nearChance == nearBase;
+}
+
+static bool step_rules_long_range(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    Object* pistol = at_find_inventory("10mm Pistol");
+    if (first) {
+        at_phase = 0;
+        at_lr_far = NULL;
+        at_lr_near = NULL;
+        at_lr_note[0] = 0;
+        at_lr_ok = true;
+        at_clear_hostiles();
+        if (!at_move_to_open_spot(6)) {
+            at_move_to_open_spot(5);
+        }
+        // Perception 1: targets beyond 2 hexes get the distance penalty.
+        at_lr_bonus_pe = at_set_special(STAT_PERCEPTION, 1);
+        return false;
+    }
+
+    at_heal();
+    switch (at_phase) {
+    case 0: {
+        if (!at_wield(pistol) || anim_busy(obj_dude)) {
+            if (timedOut) {
+                at_check(C_RULE_LONG_RANGE, false, "no pistol");
+                stat_set_bonus(obj_dude, STAT_PERCEPTION, at_lr_bonus_pe);
+                return true;
+            }
+            break;
+        }
+        for (int attempt = 0; attempt < 40 && at_lr_far == NULL; attempt++) {
+            int tile = at_free_tile(5, 9);
+            if (tile != -1 && !combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                at_lr_far = at_spawn_rat_at(tile, false);
+            }
+        }
+        for (int attempt = 0; attempt < 40 && at_lr_near == NULL; attempt++) {
+            int tile = at_free_tile(1, 2);
+            if (tile != -1 && !combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                at_lr_near = at_spawn_rat_at(tile, false);
+            }
+        }
+        if (at_lr_far == NULL || at_lr_near == NULL) {
+            at_check(C_RULE_LONG_RANGE, false, "no clear targets (far %d, near %d)", at_lr_far != NULL, at_lr_near != NULL);
+            stat_set_bonus(obj_dude, STAT_PERCEPTION, at_lr_bonus_pe);
+            at_clear_hostiles();
+            return true;
+        }
+
+        at_lr_ok = at_lr_measure("10mm pistol, Bonus Rate of Fire", PERK_BONUS_RATE_OF_FIRE, 1, 25) && at_lr_ok;
+        // Heave Ho! doesn't touch guns.
+        int heave = at_lr_chance(PERK_HEAVE_HO, 3, at_lr_far);
+        int none = at_lr_chance(PERK_HEAVE_HO, 0, at_lr_far);
+        if (heave != none) {
+            at_lr_ok = false;
+            SDL_strlcat(at_lr_note, " Heave Ho! changed a gun!", sizeof(at_lr_note));
+        }
+        perk_rt_debug_set_rank(PERK_BONUS_RATE_OF_FIRE, 1);
+        rt_debug_set_lock(at_lr_far);
+        at_time_a = now;
+        at_phase = 1;
+        break;
+    }
+    case 1: {
+        if (now - at_time_a < 400) {
+            break;
+        }
+        // Displayed = rolled: the indicator shows `determine_to_hit`, the
+        // same call the attack rolls against (`rt_attack`).
+        char note[240];
+        bool shown = at_indicator_matches(at_lr_far, note, sizeof(note));
+        at_log("rules: long range lock with Bonus Rate of Fire: %s", note);
+        at_flag_a = shown;
+        at_screenshot("41_long_range_lock");
+        rt_debug_set_lock(NULL);
+        perk_rt_debug_set_rank(PERK_BONUS_RATE_OF_FIRE, 0);
+
+        // Energy weapon.
+        int laserPid = at_item_pid_by_name("Laser Pistol");
+        Object* laser = NULL;
+        if (laserPid != -1 && obj_pid_new(&laser, laserPid) != -1) {
+            Rect rect;
+            if (item_add_force(obj_dude, laser, 1) == 0) {
+                obj_disconnect(laser, &rect);
+            }
+            item_w_set_curr_ammo(laser, item_w_max_ammo(laser));
+        }
+        at_obj_a = laser;
+        at_phase = 2;
+        at_time_a = now;
+        break;
+    }
+    case 2: {
+        if (at_obj_a != NULL && !at_wield(at_obj_a)) {
+            if (now - at_time_a < 3000) {
+                break;
+            }
+            SDL_strlcat(at_lr_note, " laser pistol: could not equip;", sizeof(at_lr_note));
+            at_lr_ok = false;
+        } else if (at_obj_a != NULL) {
+            at_lr_ok = at_lr_measure("Laser Pistol, Bonus Rate of Fire", PERK_BONUS_RATE_OF_FIRE, 1, 25) && at_lr_ok;
+        } else {
+            SDL_strlcat(at_lr_note, " no laser pistol prototype;", sizeof(at_lr_note));
+            at_lr_ok = false;
+        }
+        at_lr_throw = at_create_throw_weapon();
+        at_phase = 3;
+        at_time_a = now;
+        break;
+    }
+    case 3: {
+        if (at_lr_throw == NULL || !at_wield(at_lr_throw)) {
+            if (now - at_time_a < 3000) {
+                break;
+            }
+            SDL_strlcat(at_lr_note, " throwing weapon: could not equip;", sizeof(at_lr_note));
+            at_lr_ok = false;
+        } else {
+            int mode = at_current_hit_mode();
+            int rangeWithout = item_w_range(obj_dude, mode);
+            perk_rt_debug_set_rank(PERK_HEAVE_HO, 3);
+            int rangeWith = item_w_range(obj_dude, mode);
+            perk_rt_debug_set_rank(PERK_HEAVE_HO, 0);
+            char part[96];
+            snprintf(part, sizeof(part), " throw range %d / %d with Heave Ho! 3 (3 x ST = %d);",
+                rangeWithout, rangeWith, 3 * stat_level(obj_dude, STAT_STRENGTH));
+            SDL_strlcat(at_lr_note, part, sizeof(at_lr_note));
+            if (rangeWith != rangeWithout || obj_dist(obj_dude, at_lr_far) > rangeWithout) {
+                at_lr_ok = false;
+            }
+            at_lr_ok = at_lr_measure(object_name(at_lr_throw), PERK_HEAVE_HO, 3, 20) && at_lr_ok;
+            // Bonus Rate of Fire doesn't touch throwing.
+            if (at_lr_chance(PERK_BONUS_RATE_OF_FIRE, 1, at_lr_far) != at_lr_chance(PERK_BONUS_RATE_OF_FIRE, 0, at_lr_far)) {
+                at_lr_ok = false;
+                SDL_strlcat(at_lr_note, " Bonus Rate of Fire changed a throw!", sizeof(at_lr_note));
+            }
+        }
+
+        at_check(C_RULE_LONG_RANGE, at_lr_ok, "%s", at_lr_note);
+        at_check(C_RULE_LONG_RANGE_SHOWN, at_flag_a, "indicator for the far target with Bonus Rate of Fire matches determine_to_hit (rolled by the attack)");
+        stat_set_bonus(obj_dude, STAT_PERCEPTION, at_lr_bonus_pe);
+        at_wield(pistol);
+        at_clear_hostiles();
+        return true;
+    }
+    }
+    return false;
+}
+
+// Friendly Foe: bursts through the player.
+static int at_ff_trials(Object* shooter, Object* target, int hitMode, int trials, int* targetHits)
+{
+    int dudeHits = 0;
+    *targetHits = 0;
+    Object* weapon = item_hit_with(shooter, hitMode);
+    for (int trial = 0; trial < trials; trial++) {
+        item_w_set_curr_ammo(weapon, item_w_max_ammo(weapon));
+        Attack attack;
+        combat_ctd_init(&attack, shooter, target, hitMode, HIT_LOCATION_UNCALLED);
+        if (combat_rt_compute_attack(&attack) == -1) {
+            continue;
+        }
+        bool hit = attack.defender == obj_dude && (attack.attackerFlags & DAM_HIT) != 0;
+        for (int index = 0; index < attack.extrasLength; index++) {
+            if (attack.extras[index] == obj_dude) {
+                hit = true;
+            }
+        }
+        if (hit) {
+            dudeHits++;
+        }
+        if (attack.defender == target && (attack.attackerFlags & DAM_HIT) != 0) {
+            (*targetHits)++;
+        }
+    }
+    return dudeHits;
+}
+
+static bool step_rules_friendly_foe(unsigned int elapsed, bool first, bool timedOut)
+{
+    at_clear_hostiles();
+    at_move_to_open_spot(3);
+
+    int shooterTile = -1;
+    int targetTile = -1;
+    for (int attempt = 0; attempt < ROTATION_COUNT * 9 && shooterTile == -1; attempt++) {
+        int r = attempt % ROTATION_COUNT;
+        int a = at_hex_walk(obj_dude->tile, r, 1 + (attempt / ROTATION_COUNT) % 3, 0, 0);
+        int b = at_hex_walk(obj_dude->tile, (r + 3) % ROTATION_COUNT, 2 + attempt / (ROTATION_COUNT * 3), 0, 0);
+        if (at_tile_free(a) && at_tile_free(b)
+            && !combat_is_shot_blocked(obj_dude, obj_dude->tile, a, NULL, NULL)
+            && !combat_is_shot_blocked(obj_dude, obj_dude->tile, b, NULL, NULL)) {
+            shooterTile = a;
+            targetTile = b;
+        }
+    }
+
+    Object* shooter = shooterTile != -1 ? at_spawn_rat_at(shooterTile, false) : NULL;
+    Object* target = targetTile != -1 ? at_spawn_rat_at(targetTile, false) : NULL;
+    Object* weapon = NULL;
+    for (int index = 1; index < 600 && weapon == NULL && shooter != NULL; index++) {
+        int pid = (OBJ_TYPE_ITEM << 24) | index;
+        Proto* proto;
+        if (proto_ptr(pid, &proto) == -1 || proto->item.type != ITEM_TYPE_WEAPON
+            || (proto->item.extendedFlags & 0xF) != 6 || ((proto->item.extendedFlags & 0xF0) >> 4) != 7
+            || proto->item.data.weapon.damageType != DAMAGE_TYPE_NORMAL) {
+            continue;
+        }
+        if (obj_pid_new(&weapon, pid) == -1) {
+            weapon = NULL;
+            continue;
+        }
+        Rect rect;
+        item_add_force(shooter, weapon, 1);
+        obj_disconnect(weapon, &rect);
+        weapon->flags |= OBJECT_IN_RIGHT_HAND;
+    }
+    if (shooter == NULL || target == NULL || weapon == NULL) {
+        at_check(C_RULE_FRIENDLY_FOE, false, "fixtures missing (shooter %d, target %d, burst weapon %d)", shooter != NULL, target != NULL, weapon != NULL);
+        at_erase(shooter);
+        at_erase(target);
+        return true;
+    }
+
+    // Rats are too weak for the gun's Strength requirement: a temporary
+    // bonus (on the rat prototype, restored below).
+    int strengthBonus = stat_get_bonus(shooter, STAT_STRENGTH);
+    stat_set_bonus(shooter, STAT_STRENGTH, strengthBonus + 9);
+
+    partyMemberAdd(shooter);
+    bool inParty = isPartyMember(shooter) && shooter->data.critter.combat.team == obj_dude->data.critter.combat.team;
+    at_log("rules: friendly foe shooter hit chance on the target %d%%, on the player %d%%",
+        determine_to_hit(shooter, target, HIT_LOCATION_UNCALLED, HIT_MODE_RIGHT_WEAPON_SECONDARY),
+        determine_to_hit(shooter, obj_dude, HIT_LOCATION_UNCALLED, HIT_MODE_RIGHT_WEAPON_SECONDARY));
+    int trials = 200;
+    int targetHits[4];
+
+    perk_rt_debug_set_rank(PERK_FRIENDLY_FOE, 0);
+    int without = at_ff_trials(shooter, target, HIT_MODE_RIGHT_WEAPON_SECONDARY, trials, &targetHits[0]);
+    perk_rt_debug_set_rank(PERK_FRIENDLY_FOE, 1);
+    int blocksBefore = combat_rt_friendly_foe_blocks();
+    int with = at_ff_trials(shooter, target, HIT_MODE_RIGHT_WEAPON_SECONDARY, trials, &targetHits[1]);
+    int singles = at_ff_trials(shooter, target, HIT_MODE_RIGHT_WEAPON_PRIMARY, trials, &targetHits[2]);
+    int blocks = combat_rt_friendly_foe_blocks() - blocksBefore;
+
+    // A party member that turns on the player isn't covered.
+    partyMemberRemove(shooter);
+    shooter->data.critter.combat.team = at_rat_team;
+    int hostile = at_ff_trials(shooter, target, HIT_MODE_RIGHT_WEAPON_SECONDARY, trials, &targetHits[3]);
+    perk_rt_debug_set_rank(PERK_FRIENDLY_FOE, 0);
+    stat_set_bonus(shooter, STAT_STRENGTH, strengthBonus);
+
+    at_erase(shooter);
+    at_erase(target);
+
+    at_check(C_RULE_FRIENDLY_FOE,
+        inParty && without > 0 && with == 0 && singles == 0 && targetHits[1] > 0 && hostile > 0,
+        "%s bursts through the player (%d each): without perk %d hit the player, with perk %d (target hit %d), single shots %d, "
+        "shots passed %d; same shooter hostile: %d",
+        object_name(weapon), trials, without, with, targetHits[1], singles, blocks, hostile);
+    return true;
+}
+
+// Bonus Move: sprint drain in combat.
+static float at_sprint_ms;
+static float at_sprint_ap;
+static float at_sprint_rate[2];
+static Object* at_sprint_rat;
+static float at_sprint_calm;
+
+static bool step_rules_sprint(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_phase = 0;
+        at_sprint_rat = NULL;
+        at_sprint_rate[0] = -1.0f;
+        at_sprint_rate[1] = -1.0f;
+        at_sprint_calm = -1.0f;
+        at_clear_hostiles();
+        at_release_all();
+        return false;
+    }
+
+    at_heal();
+    float maxAp = (float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+    const RtStats* stats = rt_get_stats();
+    switch (at_phase) {
+    case 0:
+        // A hostile rat engages the player.
+        at_sprint_rat = at_spawn_rat(5, 8, true);
+        at_time_a = now;
+        at_phase = 1;
+        break;
+    case 1:
+    case 4:
+        // In combat, AP full: sprint for 1.5 s (rank 0, then rank 1).
+        if (!rt_player_in_combat() || rt_get_dude_ap() < maxAp - 0.05f || anim_busy(obj_dude)) {
+            if (now - at_time_a > 15000) {
+                at_check(C_RULE_SPRINT, false, "phase %d: in combat=%d, AP %.2f of %.0f", at_phase, rt_player_in_combat(), rt_get_dude_ap(), maxAp);
+                at_release_all();
+                at_clear_hostiles();
+                return true;
+            }
+            break;
+        }
+        perk_rt_debug_set_rank(PERK_BONUS_MOVE, at_phase == 1 ? 0 : 1);
+        at_sprint_ms = stats->sprintCombatMs;
+        at_sprint_ap = stats->sprintCombatAp;
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        at_stick_open_direction();
+        at_time_a = now;
+        at_phase += 1;
+        break;
+    case 2:
+    case 5:
+        at_stick_open_direction();
+        if (now - at_time_a < 1500 && rt_get_dude_ap() > 0.5f) {
+            break;
+        }
+        at_stick_release();
+        {
+            float ms = stats->sprintCombatMs - at_sprint_ms;
+            float ap = stats->sprintCombatAp - at_sprint_ap;
+            at_sprint_rate[at_phase == 2 ? 0 : 1] = ms > 100.0f ? ap / ms : -1.0f;
+            at_log("rules: combat sprint, Bonus Move %d: %.0f ms running, %.3f AP (%.5f AP/ms)", at_phase == 2 ? 0 : 1, ms, ap, ms > 0 ? ap / ms : 0.0f);
+        }
+        at_time_a = now;
+        at_phase += 1;
+        break;
+    case 3:
+        // Back to standing still and full AP.
+        at_phase = 4;
+        at_time_a = now;
+        break;
+    case 6:
+        // Out of combat, with the perk: normal drain.
+        at_clear_hostiles();
+        at_time_a = now;
+        at_phase = 7;
+        break;
+    case 7:
+        if (rt_player_in_combat() || rt_get_dude_ap() < maxAp - 0.05f || anim_busy(obj_dude)) {
+            if (now - at_time_a > 15000) {
+                at_phase = 9;
+            }
+            break;
+        }
+        perk_rt_debug_set_rank(PERK_BONUS_MOVE, 1);
+        at_sprint_ms = stats->sprintCalmMs;
+        at_sprint_ap = stats->sprintCalmAp;
+        if (!rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        at_stick_open_direction();
+        at_time_a = now;
+        at_phase = 8;
+        break;
+    case 8:
+        at_stick_open_direction();
+        if (now - at_time_a < 1500 && rt_get_dude_ap() > 0.5f) {
+            break;
+        }
+        at_stick_release();
+        perk_rt_debug_set_rank(PERK_BONUS_MOVE, 0);
+        at_sprint_calm = stats->sprintCalmMs - at_sprint_ms > 100.0f
+            ? (stats->sprintCalmAp - at_sprint_ap) / (stats->sprintCalmMs - at_sprint_ms)
+            : -1.0f;
+        at_log("rules: calm sprint with Bonus Move: %.0f ms, %.5f AP/ms", stats->sprintCalmMs - at_sprint_ms, at_sprint_calm);
+        at_phase = 9;
+        break;
+    case 9: {
+        perk_rt_debug_set_rank(PERK_BONUS_MOVE, 1);
+        int calmPct = rt_sprint_drain_pct(false);
+        int combatPct = rt_sprint_drain_pct(true);
+        perk_rt_debug_set_rank(PERK_BONUS_MOVE, 0);
+        float calmRate = at_sprint_calm;
+        float normal = 1.0f / 400.0f;
+        float ratio = at_sprint_rate[0] > 0.0f ? at_sprint_rate[1] / at_sprint_rate[0] : -1.0f;
+        bool ok = at_sprint_rate[0] > 0.0f && at_sprint_rate[1] > 0.0f
+            && fabsf(at_sprint_rate[0] - normal) < normal * 0.05f
+            && fabsf(ratio - 0.5f) < 0.03f
+            && calmPct == 100 && combatPct == 50
+            && calmRate >= 0.0f && calmRate < 0.000001f;
+        at_check(C_RULE_SPRINT, ok,
+            "combat drain %.5f AP/ms without perk, %.5f with (ratio %.2f); outside combat with perk %.5f (no drain; normal combat drain %.5f); drain %% with perk: calm %d, combat %d",
+            at_sprint_rate[0], at_sprint_rate[1], ratio, calmRate, normal, calmPct, combatPct);
+        at_release_all();
+        at_clear_hostiles();
+        return true;
+    }
+    }
+    return false;
+}
+
+static bool step_rules_perks_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    int lastLevel;
+    int freePerks;
+    editor_rt_debug_get(&lastLevel, &freePerks);
+    at_check(C_RULE_PERK_PERSIST,
+        at_rule_saved_perks >= 2 && freePerks == at_rule_saved_perks && lastLevel == at_rule_saved_last_level,
+        "pending perk selections %d (saved %d), last processed level %d (saved %d)",
+        freePerks, at_rule_saved_perks, lastLevel, at_rule_saved_last_level);
+    return true;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
+    { "dump", step_dump, 30000 },
     { "walk", step_walk, 5000 },
     { "stop", step_stop, 3000 },
-    { "run until exhausted", step_run, 15000 },
+    { "run outside combat (free)", step_run, 5000 },
+    { "run at 0 AP outside combat", step_run_zero, 6000 },
+    { "run with a neutral lock", step_run_neutral, 5000 },
+    { "combat starts during a run", step_run_combat_start, 20000 },
     { "walk after exhaustion", step_exhausted, 5000 },
     { "AP regeneration", step_regen, 5000 },
     { "run again after new click", step_run_again, 5000 },
+    { "combat ends during a run", step_run_combat_end, 30000 },
     { "Pip-Boy (B)", step_inventory, 10000 },
     { "D-pad screens", step_screens, 30000 },
     { "Y and LB", step_y_lb, 5000 },
@@ -10089,11 +11719,19 @@ static const AtStep at_steps[] = {
     { "favorites assignment (Pip-Boy Y)", step_fav_assign, 90000 },
     { "favorites (direct D-pad)", step_fav_use, 60000 },
     { "level-up indicator", step_level_icon, 90000 },
+    { "character rules: SPECIAL formulas", step_rules_special, 5000 },
+    { "character rules: perk progression", step_rules_perks, 5000 },
+    { "character rules: Charisma and companions", step_rules_companions, 5000 },
+    { "character rules: Bonus HtH Attacks reach", step_rules_reach, 30000 },
+    { "character rules: long-range accuracy", step_rules_long_range, 30000 },
+    { "character rules: Friendly Foe", step_rules_friendly_foe, 10000 },
+    { "character rules: Bonus Move sprint", step_rules_sprint, 60000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
     { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
     { "favorites after load", step_fav_persist, 3000 },
     { "level-up indicator after load", step_level_after_load, 3000 },
+    { "perk selections after load", step_rules_perks_after_load, 3000 },
     { "map transition", step_map_change, 30000 },
     { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },
@@ -10101,6 +11739,19 @@ static const AtStep at_steps[] = {
 };
 
 #define AT_STEP_COUNT ((int)(sizeof(at_steps) / sizeof(at_steps[0])))
+
+// `--rt-autotest-only=a|b` runs the steps whose names contain a or b.
+static bool at_only_matches(const char* name)
+{
+    char filter[64];
+    SDL_strlcpy(filter, at_only, sizeof(filter));
+    for (char* part = strtok(filter, "|"); part != NULL; part = strtok(NULL, "|")) {
+        if (SDL_strcasestr(name, part) != NULL) {
+            return true;
+        }
+    }
+    return false;
+}
 
 void rt_autotest_tick()
 {
@@ -10142,7 +11793,7 @@ void rt_autotest_tick()
 
     // Development filter: skip steps not asked for (the first one loads the map).
     while (at_only[0] != 0 && at_step_index > 0 && at_step_index < AT_STEP_COUNT
-        && SDL_strcasestr(at_steps[at_step_index].name, at_only) == NULL) {
+        && !at_only_matches(at_steps[at_step_index].name)) {
         at_step_index++;
     }
     if (at_step_index >= AT_STEP_COUNT) {

@@ -20,6 +20,12 @@ int partyMemberRestingHeal(int a1);
 Object* partyMemberFindObjFromPid(int pid);
 bool isPartyMember(Object* object);
 int getPartyMemberCount();
+
+// RT: recruitable companions in the party (see `rt_is_companion`).
+int partyMemberCompanionCount();
+
+// RT: `partyMemberAdd` result when Charisma allows no more companions.
+#define PARTY_MEMBER_ADD_COMPANION_LIMIT -2
 int partyMemberPrepItemSaveAll();
 
 } // namespace fallout

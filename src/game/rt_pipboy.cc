@@ -28,6 +28,8 @@
 #include "game/proto.h"
 #include "game/realtime.h"
 #include "game/rt_favorites.h"
+#include "game/party.h"
+#include "game/rt_rules.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/trait.h"
@@ -451,8 +453,16 @@ static void pb_stats_status(int top, int bottom)
         add("Skill points to spend", text);
     }
     if (editor_rt_has_free_perk()) {
-        add("A new perk is available", "(Perks page)");
+        snprintf(text, sizeof(text), "%d (Perks page)", editor_rt_free_perks());
+        add("Perks to choose", text);
     }
+    level = stat_pc_get(PC_STAT_LEVEL);
+    if (level < PC_LEVEL_MAX) {
+        snprintf(text, sizeof(text), "%d", level + 2 - level % 2);
+        add("Next perk at level", text);
+    }
+    snprintf(text, sizeof(text), "%d / %d", partyMemberCompanionCount(), rt_companion_limit());
+    add("Companions (Charisma)", text);
 
     add("", NULL);
     static const int derived[] = {
@@ -724,7 +734,9 @@ static void pb_render_stats(int top, int bottom)
         std::vector<std::string> labels;
         for (const PbRow& row : pb_rows) {
             if (row.kind == 0) {
-                labels.push_back("> Choose a new perk");
+                labels.push_back(editor_rt_free_perks() > 1
+                        ? "> Choose a new perk (" + std::to_string(editor_rt_free_perks()) + ")"
+                        : std::string("> Choose a new perk"));
             } else if (row.kind == 1) {
                 std::string label = perk_name(row.id);
                 if (perk_level(row.id) > 1) {

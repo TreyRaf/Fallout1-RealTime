@@ -7,6 +7,7 @@
 #include "game/message.h"
 #include "game/object.h"
 #include "game/party.h"
+#include "game/rt_rules.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "platform_compat.h"
@@ -29,60 +30,64 @@ typedef struct PerkDescription {
 
 static bool perk_can_add(int perk);
 static void perk_defaults();
+static void perk_rt_descriptions();
 
 // 0x506324
+// RT: minimum levels changed for the perk every 2 levels cadence (see the
+// table in docs/character-rules.md): every level 3 perk now needs level 2 or
+// 4, and some others moved. Bonus Move has a single rank.
 static PerkDescription perk_data[PERK_COUNT] = {
-    { NULL, NULL, 1, 3, -1, 0, -1, 0, { 0, 5, 0, 0, 0, 0, 0 } },
+    { NULL, NULL, 1, 2, -1, 0, -1, 0, { 0, 5, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 6, 0 } },
-    { NULL, NULL, 3, 3, 11, 2, -1, 0, { 6, 0, 0, 0, 0, 6, 0 } },
-    { NULL, NULL, 3, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
+    { NULL, NULL, 3, 2, 11, 2, -1, 0, { 6, 0, 0, 0, 0, 6, 0 } },
+    { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
     { NULL, NULL, 2, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 6, 6 } },
-    { NULL, NULL, 1, 9, -1, 0, -1, 0, { 0, 6, 0, 0, 6, 7, 0 } },
-    { NULL, NULL, 3, 3, 13, 2, -1, 0, { 0, 6, 0, 0, 0, 0, 0 } },
-    { NULL, NULL, 3, 3, 14, 1, -1, 0, { 0, 0, 6, 0, 0, 0, 0 } },
+    { NULL, NULL, 1, 8, -1, 0, -1, 0, { 0, 6, 0, 0, 6, 7, 0 } },
+    { NULL, NULL, 3, 2, 13, 2, -1, 0, { 0, 6, 0, 0, 0, 0, 0 } },
+    { NULL, NULL, 3, 2, 14, 1, -1, 0, { 0, 0, 6, 0, 0, 0, 0 } },
     { NULL, NULL, 3, 6, 15, 5, -1, 0, { 0, 0, 0, 0, 0, 0, 6 } },
-    { NULL, NULL, 3, 3, -1, 0, -1, 0, { 0, 6, 0, 0, 0, 0, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, -1, 0, { 0, 0, 0, 6, 0, 0, 0 } },
+    { NULL, NULL, 3, 2, -1, 0, -1, 0, { 0, 6, 0, 0, 0, 0, 0 } },
+    { NULL, NULL, 3, 4, -1, 0, -1, 0, { 0, 0, 0, 6, 0, 0, 0 } },
     { NULL, NULL, 3, 6, 31, 15, -1, 0, { 0, 0, 6, 0, 4, 0, 0 } },
-    { NULL, NULL, 3, 3, 24, 10, -1, 0, { 0, 0, 6, 0, 0, 0, 6 } },
-    { NULL, NULL, 3, 3, 12, 50, -1, 0, { 6, 0, 6, 0, 0, 0, 0 } },
+    { NULL, NULL, 3, 2, 24, 10, -1, 0, { 0, 0, 6, 0, 0, 0, 6 } },
+    { NULL, NULL, 3, 4, 12, 50, -1, 0, { 6, 0, 6, 0, 0, 0, 0 } },
     { NULL, NULL, 2, 6, -1, 0, -1, 0, { 0, 7, 0, 0, 6, 0, 0 } },
     { NULL, NULL, 1, 6, -1, 0, 8, 50, { 0, 0, 0, 0, 0, 6, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, 17, 40, { 0, 0, 6, 0, 6, 0, 0 } },
+    { NULL, NULL, 3, 2, -1, 0, 17, 40, { 0, 0, 6, 0, 6, 0, 0 } },
     { NULL, NULL, 1, 9, -1, 0, 15, 60, { 0, 0, 0, 7, 0, 0, 0 } },
-    { NULL, NULL, 3, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 6, 0, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, 6, 40, { 0, 7, 0, 0, 5, 6, 0 } },
+    { NULL, NULL, 3, 4, -1, 0, -1, 0, { 0, 0, 0, 0, 6, 0, 0 } },
+    { NULL, NULL, 3, 2, -1, 0, 6, 40, { 0, 7, 0, 0, 5, 6, 0 } },
     { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 8 } },
-    { NULL, NULL, 1, 9, 16, 20, -1, 0, { 0, 6, 0, 0, 0, 4, 6 } },
+    { NULL, NULL, 1, 6, 16, 20, -1, 0, { 0, 6, 0, 0, 0, 4, 6 } },
     { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 7, 0, 0, 5, 0, 0 } },
     { NULL, NULL, 1, 18, -1, 0, 3, 80, { 8, 0, 0, 0, 0, 8, 0 } },
     { NULL, NULL, 1, 18, -1, 0, 0, 80, { 0, 8, 0, 0, 0, 8, 0 } },
     { NULL, NULL, 1, 18, -1, 0, 8, 80, { 0, 0, 0, 0, 0, 10, 0 } },
-    { NULL, NULL, 3, 12, 8, 1, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
+    { NULL, NULL, 3, 4, 8, 1, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
     { NULL, NULL, 1, 15, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 3, 12, -1, 0, -1, 0, { 0, 0, 4, 0, 0, 0, 0 } },
-    { NULL, NULL, 2, 9, 9, 5, -1, 0, { 0, 0, 0, 0, 0, 4, 0 } },
+    { NULL, NULL, 2, 10, 9, 5, -1, 0, { 0, 0, 0, 0, 0, 4, 0 } },
     { NULL, NULL, 1, 6, 32, 25, -1, 0, { 0, 0, 3, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 3, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
-    { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 4, 0, 0, 0, 0, 0 } },
+    { NULL, NULL, 1, 4, -1, 0, -1, 0, { 0, 4, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 9, -1, 0, 8, 80, { 0, 0, 0, 0, 0, 8, 0 } },
     { NULL, NULL, 1, 6, -1, 0, 8, 60, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 10, 0, 0, 0 } },
-    { NULL, NULL, 1, 9, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 8 } },
+    { NULL, NULL, 1, 8, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 8 } },
     { NULL, NULL, 1, 9, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 9, -1, 0, -1, 0, { 0, 0, 5, 0, 0, 0, 0 } },
     { NULL, NULL, 2, 6, -1, 0, 17, 40, { 0, 0, 6, 0, 0, 0, 0 } },
-    { NULL, NULL, 1, 9, -1, 0, 17, 25, { 0, 0, 0, 0, 5, 0, 0 } },
-    { NULL, NULL, 1, 3, -1, 0, -1, 0, { 0, 8, 0, 0, 0, 0, 0 } },
+    { NULL, NULL, 1, 4, -1, 0, 17, 25, { 0, 0, 0, 0, 5, 0, 0 } },
+    { NULL, NULL, 1, 2, -1, 0, -1, 0, { 0, 8, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 6, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 7 } },
     { NULL, NULL, 3, 6, -1, 0, -1, 0, { 0, 6, 0, 0, 0, 0, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, -1, 0, { 0, 0, 0, 0, 4, 0, 0 } },
-    { NULL, NULL, 3, 3, -1, 0, -1, 0, { 0, 0, 0, 0, 4, 0, 0 } },
+    { NULL, NULL, 3, 2, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 5, 0 } },
+    { NULL, NULL, 3, 4, -1, 0, -1, 0, { 0, 0, 0, 0, 4, 0, 0 } },
+    { NULL, NULL, 3, 4, -1, 0, -1, 0, { 0, 0, 0, 0, 4, 0, 0 } },
     { NULL, NULL, 1, 12, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, 1, 9, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
     { NULL, NULL, -1, 1, -1, 0, -1, 0, { 0, 0, 0, 0, 0, 0, 0 } },
@@ -138,7 +143,46 @@ int perk_init()
         }
     }
 
+    perk_rt_descriptions();
+
     return 0;
+}
+
+// RT: descriptions of the perks whose effects changed, with the current
+// balance values (fallout.cfg [realtime], see `rt_rules`).
+static void perk_rt_descriptions()
+{
+    static char hthAttacks[320];
+    static char bonusMove[320];
+    static char rateOfFire[320];
+    static char heaveHo[320];
+    static char friendlyFoe[320];
+
+    const RtRules* rules = rt_rules();
+
+    snprintf(hthAttacks, sizeof(hthAttacks),
+        "You have learned the secret arts of the East, or you just have long arms. Your melee and unarmed attacks reach %.1f hexes farther than the weapon normally allows, aimed attacks included. The longer reach does not pass through walls.",
+        rules->hthReachBonus);
+    perk_data[PERK_BONUS_HTH_ATTACKS].description = hthAttacks;
+
+    snprintf(bonusMove, sizeof(bonusMove),
+        "You keep your breath when the bullets fly. While you are in combat, sprinting drains %d%% fewer Action Points. (Sprinting outside combat costs no Action Points anyway.) Attacks and aimed shots cost the same.",
+        rules->moveDrainPct);
+    perk_data[PERK_BONUS_MOVE].description = bonusMove;
+
+    snprintf(rateOfFire, sizeof(rateOfFire),
+        "You have learned to hold steady on far targets. With guns and energy weapons, the accuracy penalty for targets beyond your Perception range is %d%% smaller. Range, line of fire and the rate of fire are unchanged.",
+        rules->rateOfFireRangePct);
+    perk_data[PERK_BONUS_RATE_OF_FIRE].description = rateOfFire;
+
+    snprintf(heaveHo, sizeof(heaveHo),
+        "Each level of the Heave Ho! Perk makes the accuracy penalty for thrown weapons against targets beyond your Perception range %d%% smaller. The throwing range is still set by Strength.",
+        rules->heaveHoRangePct);
+    perk_data[PERK_HEAVE_HO].description = heaveHo;
+
+    snprintf(friendlyFoe, sizeof(friendlyFoe),
+        "Your companions know where you stand. Their bullets and energy weapon shots, bursts included, never hurt you. Their melee attacks, thrown weapons and explosions still can, and so can anyone who turns on you.");
+    perk_data[PERK_FRIENDLY_FOE].description = friendlyFoe;
 }
 
 // 0x48663C
@@ -291,6 +335,23 @@ int perk_make_list(int* perks)
 int perk_level(int perk)
 {
     return perk >= 0 && perk < PERK_COUNT ? perk_lev[perk] : 0;
+}
+
+int perk_min_level(int perk)
+{
+    return perk >= 0 && perk < PERK_COUNT ? perk_data[perk].min_level : 0;
+}
+
+int perk_max_rank(int perk)
+{
+    return perk >= 0 && perk < PERK_COUNT ? perk_data[perk].max_rank : 0;
+}
+
+void perk_rt_debug_set_rank(int perk, int rank)
+{
+    if (perk >= 0 && perk < PERK_COUNT) {
+        perk_lev[perk] = rank;
+    }
 }
 
 // 0x486868
