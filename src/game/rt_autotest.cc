@@ -7,6 +7,7 @@
 #include <sys/stat.h>
 #include <time.h>
 
+#include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
 
@@ -31,7 +32,9 @@
 #include "game/game_vars.h"
 #include "game/perk.h"
 #include "game/pipboy.h"
+#include "game/rt_aimed.h"
 #include "game/rt_context.h"
+#include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/worldmap.h"
 #include "game/scripts.h"
@@ -141,6 +144,41 @@ typedef enum AutotestCheck {
     C_PB_SHORTCUTS,
     C_PB_PERSIST,
     C_PB_MAP_SAVED,
+    C_AIM_NO_TARGET,
+    C_AIM_ENTRY_LOCK,
+    C_AIM_ENTRY_NEAREST,
+    C_AIM_ANATOMY,
+    C_AIM_QUEUE,
+    C_AIM_EXECUTE,
+    C_AIM_AP,
+    C_AIM_ODDS,
+    C_AIM_CANCEL,
+    C_AIM_LIMITS,
+    C_AIM_BLOCKED,
+    C_AIM_UNSUPPORTED,
+    C_AIM_SKIP_DEAD,
+    C_AIM_INTERRUPT,
+    C_MODAL_INTERRUPT,
+    C_FAV_ASSIGN,
+    C_FAV_USE,
+    C_FAV_DEPLETED,
+    C_FAV_NO_LEAK,
+    C_FAV_PERSIST,
+    C_INT_CYCLE,
+    C_INT_NO_COMBAT,
+    C_INT_CONTEXT,
+    C_INT_ACTIVATE,
+    C_INT_BARRIER,
+    C_INT_LABEL,
+    C_FAV_MIGRATE,
+    C_LOOT_FOCUS,
+    C_LOOT_NAV,
+    C_LOOT_TRANSFER,
+    C_LOOT_QUANTITY,
+    C_LOOT_TAKE_ALL,
+    C_LOOT_EMPTY,
+    C_LOOT_SAFETY,
+    C_LOOT_BIG_STACK,
     C_COUNT,
 } AutotestCheck;
 
@@ -154,8 +192,8 @@ static const char* at_check_names[C_COUNT] = {
     "AP exhaustion returns to walking and clears the toggle",
     "Running again requires a new L3 click",
     "B opens the Pip-Boy, it stays open, B closes it",
-    "D-pad opens Pip-Boy Data, Map, Stats and the Skilldex",
-    "Y does nothing; LB reports the pending targeting system",
+    "D-pad with no favorites assigned opens nothing; R3 opens the Skilldex",
+    "Y does nothing in gameplay; LB never changes the lock",
     "Menu: D-pad moves the cursor between buttons",
     "Menu: LT/RT do nothing (no lock, no attack)",
     "Menu: A activates the selected button",
@@ -224,7 +262,7 @@ static const char* at_check_names[C_COUNT] = {
     "Pip-Boy: B reopens it on the last tab",
     "Pip-Boy: hold, put away and hold again a weapon (hand state changes)",
     "Pip-Boy: using a Stimpak heals and consumes it",
-    "Pip-Boy: quantity picker drops part of a stack; Y inspects",
+    "Pip-Boy: quantity picker drops part of a stack; Inspect (A menu) shows the text",
     "Pip-Boy: skill point spent, undone (X) and spent again",
     "Pip-Boy: perk chosen when one is due",
     "Pip-Boy: live automap with player marker; world map matches the revealed cells",
@@ -232,6 +270,41 @@ static const char* at_check_names[C_COUNT] = {
     "Pip-Boy: i, c, Tab, p, z (keys and HUD buttons) open the Pip-Boy on their tab",
     "Pip-Boy: equipment, skills and perks survive save/load",
     "Pip-Boy: after a map change, its saved automap opens; the world map shows revealed land",
+    "AIMED SHOT: LB with no enemy gives feedback and stays in gameplay",
+    "AIMED SHOT: LB opens on the LT-locked target; the game is paused; B closes",
+    "AIMED SHOT: without a lock, LB picks the nearest enemy, never a neutral NPC",
+    "AIMED SHOT: body parts come from each creature's own anatomy (rat vs human)",
+    "AIMED SHOT: D-pad parts, A queues (same part twice), X undoes, flick switches target; reserved AP shown",
+    "AIMED SHOT: RT executes the queue in order on the planned targets and parts; controls blocked, then restored",
+    "AIMED SHOT: AP reserved while planning, spent once per committed attack, no regeneration during execution",
+    "AIMED SHOT: shown hit chance = resolution; body-part criticals from the original tables; no guaranteed hits/crits",
+    "AIMED SHOT: B and LB cancel planning without spending AP",
+    "AIMED SHOT: not enough AP or ammunition refuses another attack",
+    "AIMED SHOT: blocked or out-of-range targets can't be queued",
+    "AIMED SHOT: burst mode is refused with an explanation (no invented support)",
+    "AIMED SHOT: a planned target that died is skipped and its AP released",
+    "AIMED SHOT: B cancels the rest; knockdown and map reset end the queue; no AP stays reserved",
+    "Controller disconnect / focus loss inside AIMED SHOT and the loot screen leave no stuck or phantom input",
+    "Favorites: Y in the Pip-Boy assigns a direction (stick or D-pad, A), replaces, clears (X); B returns to the same item",
+    "Favorites: a D-pad press uses a Stimpak / readies a weapon at once (no menu); holding uses one; empty direction does nothing",
+    "Favorites: a depleted item fails safely with feedback (no menu, no other item) and works again when restocked",
+    "Favorites: direct D-pad use leaks no movement, interaction or attack",
+    "Favorites survive save/load",
+    "Interaction: left/right step only to objects within 2 hexes (map distance) of the highlighted one (1, 2, 3 hexes apart)",
+    "Interaction cycling doesn't change the lock or cause aggression",
+    "D-pad: left/right cycle only when another object is within 2 hexes, otherwise favorites; one action per press",
+    "A acts only within 1 hex: picks up the highlighted item; from 2+ hexes it refuses without moving",
+    "Objects behind a wall are not offered for interaction",
+    "Interaction label: name and action only within 1 hex; no D-pad helper text",
+    "Favorites: eight-slot saves migrate to four directions without overwriting (moves and drops reported)",
+    "Loot: opens focused on the loot side, first item highlighted",
+    "Loot: LT/RT switch sides; up/down move and scroll a long list; each side keeps its selection",
+    "Loot: A moves a single item at once, both ways (take and put in)",
+    "Loot: a stack asks how many (D-pad changes it, A confirms); B cancels and moves nothing",
+    "Loot: X takes all from the loot side (whichever side is focused), never deposits; what is too heavy stays",
+    "Loot: an empty container is safe (A, X, D-pad), B closes",
+    "Loot: no item duplicated or lost; equipped items not offered; no input leaks into gameplay",
+    "Loot: a 50,000-cap stack moves in one go (Y = all); RT/LT change the amount by 100, held they repeat",
 };
 
 static int at_results[C_COUNT];
@@ -261,6 +334,7 @@ static int at_screendump(int width, int height, unsigned char* data, unsigned ch
 static void at_expect_menu(const char* screenshot, AtMenuScript* script);
 static void at_finish();
 static void at_clear_hostiles();
+static void at_record_save_state();
 
 static bool at_enabled = false;
 // Optional: only run steps whose name contains this text (development aid).
@@ -275,6 +349,7 @@ static bool at_turn_based_seen = false;
 
 static GamepadState at_pad;
 static int at_press_frames[GAMEPAD_BUTTON_COUNT];
+static int at_press_gap[GAMEPAD_BUTTON_COUNT];
 
 static int at_step_index = 0;
 static unsigned int at_step_start = 0;
@@ -407,7 +482,14 @@ static void at_check(AutotestCheck check, bool passed, const char* format, ...)
 static void at_press(GamepadButton button)
 {
     // Held for a few polls so the press is seen regardless of frame timing.
-    at_press_frames[button] = 3;
+    // A button still held from the previous press is let go first, so this
+    // is a new press.
+    if (at_press_frames[button] > 0 && at_press_gap[button] == 0) {
+        at_press_frames[button] = 0;
+        at_press_gap[button] = 2;
+    } else if (at_press_gap[button] == 0) {
+        at_press_frames[button] = 3;
+    }
 }
 
 static void at_release_all()
@@ -416,6 +498,7 @@ static void at_release_all()
     memset(&at_pad, 0, sizeof(at_pad));
     at_pad.connected = connected;
     memset(at_press_frames, 0, sizeof(at_press_frames));
+    memset(at_press_gap, 0, sizeof(at_press_gap));
 }
 
 static void at_expect_menu(const char* screenshot, AtMenuScript* script)
@@ -494,7 +577,13 @@ static void at_hook()
 
     GamepadState state = at_pad;
     for (int button = 0; button < GAMEPAD_BUTTON_COUNT; button++) {
-        if (at_press_frames[button] > 0) {
+        if (at_press_gap[button] > 0) {
+            // Released for a moment before a repeated press.
+            at_press_gap[button]--;
+            if (at_press_gap[button] == 0) {
+                at_press_frames[button] = 3;
+            }
+        } else if (at_press_frames[button] > 0) {
             state.buttons[button] = true;
             at_press_frames[button]--;
         }
@@ -596,7 +685,8 @@ static int at_open_rotation(int* freeTiles)
         int count = 0;
         for (int step = 0; step < 8; step++) {
             int next = tile_num_in_direction(tile, rotation, 1);
-            if (next == -1 || obj_blocking_at(obj_dude, next, obj_dude->elevation) != NULL) {
+            // At the map edge the neighbor is the tile itself: no way there.
+            if (next == -1 || next == tile || obj_blocking_at(obj_dude, next, obj_dude->elevation) != NULL) {
                 break;
             }
             tile = next;
@@ -619,7 +709,7 @@ static void at_stick_open_direction()
 {
     static int rotation = -1;
     int next = rotation != -1 ? tile_num_in_direction(obj_dude->tile, rotation, 1) : -1;
-    if (rotation == -1 || next == -1 || obj_blocking_at(obj_dude, next, obj_dude->elevation) != NULL) {
+    if (rotation == -1 || next == -1 || next == obj_dude->tile || obj_blocking_at(obj_dude, next, obj_dude->elevation) != NULL) {
         int freeTiles;
         rotation = at_open_rotation(&freeTiles);
     }
@@ -1247,21 +1337,21 @@ static bool step_inventory(unsigned int elapsed, bool first, bool timedOut)
     }
     return false;
 }
-
 static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
 {
+    // With no favorites assigned yet, D-pad up and down open nothing (they
+    // activate a favorite directly); R3 opens the Skilldex.
     static const GamepadButton buttons[] = {
         GAMEPAD_BUTTON_DPAD_UP,
         GAMEPAD_BUTTON_DPAD_DOWN,
-        GAMEPAD_BUTTON_DPAD_LEFT,
-        GAMEPAD_BUTTON_DPAD_RIGHT,
+        GAMEPAD_BUTTON_RIGHT_STICK,
     };
     static const char* names[] = {
-        "04_pipboy_data",
-        "05_pipboy_map",
-        "06_pipboy_stats",
+        "D-pad up",
+        "D-pad down",
         "07_skilldex",
     };
+    static int activationsBefore;
 
     unsigned int now = SDL_GetTicks();
     if (first) {
@@ -1272,29 +1362,29 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
         return false;
     }
 
-    if (at_count_a >= 4) {
-        at_check(C_SCREENS, at_count_b == 4, "%d of 4 screens opened and closed with B", at_count_b);
+    if (at_count_a >= 3) {
+        at_check(C_SCREENS, at_count_b == 3, "%d of 3 presses did what they should (D-pad: no menu, nothing used; R3: Skilldex, closed with B)", at_count_b);
         at_menu_expected = false;
         return true;
     }
 
+    bool skilldex = at_count_a == 2;
     if (at_time_a == 0) {
         if (now - (unsigned int)at_tile_a < 700) {
             return false;
         }
-        at_expect_menu(names[at_count_a], NULL);
+        activationsBefore = rt_favorites_get_state()->activations + rt_favorites_get_state()->refusals;
+        at_expect_menu(skilldex ? names[at_count_a] : NULL, NULL);
         at_press(buttons[at_count_a]);
         at_time_a = now;
         return false;
     }
 
-    if ((at_menu_seen && now - at_time_a > 300) || now - at_time_a > 5000) {
-        // Up, down and left open the Pip-Boy on Data, Map and Stats (its state
-        // keeps the tab after closing); right opens the Skilldex.
-        static const int tabs[] = { RT_PIPBOY_TAB_DATA, RT_PIPBOY_TAB_MAP, RT_PIPBOY_TAB_STATS, -1 };
-        bool tabOk = tabs[at_count_a] == -1 || rt_pipboy_get_state()->tab == tabs[at_count_a];
-        at_log("screen %s: opened=%d closed=%d Pip-Boy tab %d", names[at_count_a], at_menu_seen, at_menu_done, rt_pipboy_get_state()->tab);
-        if (at_menu_seen && at_menu_done && tabOk) {
+    if ((skilldex && at_menu_seen && now - at_time_a > 300) || now - at_time_a > (skilldex ? 5000u : 1500u)) {
+        int activations = rt_favorites_get_state()->activations + rt_favorites_get_state()->refusals - activationsBefore;
+        bool right = skilldex ? at_menu_seen && at_menu_done : !at_menu_seen && activations == 0;
+        at_log("%s: menu opened=%d closed=%d, favorites activated %d time(s)", names[at_count_a], at_menu_seen, at_menu_done, activations);
+        if (right) {
             at_count_b++;
         }
         at_menu_expected = false;
@@ -1304,12 +1394,13 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
     }
     return false;
 }
-
 static bool step_y_lb(unsigned int elapsed, bool first, bool timedOut)
 {
     if (first) {
         at_count_a = rt_get_stats()->targetingRequests;
+        at_count_b = rt_aimed_get_state()->refusals;
         at_flag_a = false;
+        at_flag_b = false;
         at_expect_menu(NULL, NULL);
         at_press(GAMEPAD_BUTTON_Y);
         return false;
@@ -1317,15 +1408,22 @@ static bool step_y_lb(unsigned int elapsed, bool first, bool timedOut)
 
     if (elapsed > 800 && !at_flag_a) {
         at_flag_a = true;
+        at_flag_b = at_menu_seen;
+        at_menu_seen = false;
+        // LB: AIMED SHOT (opens only with a target; the default script closes it).
         at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
     }
 
     if (elapsed >= 1800) {
-        bool yOpenedMenu = at_menu_seen;
+        bool lbOpenedMenu = at_menu_seen;
         at_menu_expected = false;
         int lb = rt_get_stats()->targetingRequests - at_count_a;
-        at_check(C_Y_LB, !yOpenedMenu && lb == 1 && rt_get_lock() == NULL,
-            "Y opened a menu=%d, LB targeting requests=%d, LB locked something=%d", yOpenedMenu, lb, rt_get_lock() != NULL);
+        int refusals = rt_aimed_get_state()->refusals - at_count_b;
+        at_check(C_Y_LB, !at_flag_b && lb == 1 && rt_get_lock() == NULL,
+            "Y opened a menu=%d, LB presses=%d, LB locked something=%d", at_flag_b, lb, rt_get_lock() != NULL);
+        // The no-target case is checked in the aimed shot entry step, where
+        // no enemy is around for sure (here a rat may have noticed the player).
+        at_log("LB: aimed shot screen opened=%d, refused=%d (%s)", lbOpenedMenu, refusals, rt_aimed_get_state()->message);
         return true;
     }
     return false;
@@ -2063,10 +2161,26 @@ static bool at_prepare_target()
         }
     }
 
+    static Object* approaching = NULL;
+    static unsigned int approachSince = 0;
     if (obj_dist(obj_dude, at_target) > at_kind_reach()) {
+        unsigned int now = SDL_GetTicks();
+        if (approaching != at_target) {
+            approaching = at_target;
+            approachSince = now;
+        } else if (now - approachSince > 8000) {
+            // Harness: the two can't get to each other (cave rocks); another
+            // rat right next to the player instead.
+            at_log("harness: can't reach %s (%d tiles, player busy %d anim %d), using a new rat",
+                critter_name(at_target), obj_dist(obj_dude, at_target), anim_busy(obj_dude) != 0, FID_ANIM_TYPE(obj_dude->fid));
+            approaching = NULL;
+            at_target = at_spawn_rat(1, 1, true);
+            return false;
+        }
         at_approach(at_target, at_kind_reach());
         return false;
     }
+    approaching = NULL;
 
     if (anim_busy(obj_dude) && FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK) {
         register_clear(obj_dude);
@@ -3609,6 +3723,7 @@ static bool step_save(unsigned int elapsed, bool first, bool timedOut)
     if (at_count_a == 1) {
         if (elapsed > 500) {
             at_saved_tile = obj_dude->tile;
+            at_record_save_state();
             at_log("save: lock=%s pending attacks=%d player tile=%d",
                 rt_get_lock() != NULL ? critter_name(rt_get_lock()) : "(none)", rt_get_pending_count(), at_saved_tile);
             at_expect_menu(NULL, at_menu_save_script);
@@ -4413,6 +4528,7 @@ static bool step_chem(unsigned int elapsed, bool first, bool timedOut)
         // Injured with nothing nearby: A does nothing (no self-treatment).
         at_count_a = context->menus;
         at_count_b = context->skillUses;
+        at_tile_b = context->interactions;
         at_press(GAMEPAD_BUTTON_A);
         at_phase = 1;
         at_time_a = now;
@@ -4421,7 +4537,7 @@ static bool step_chem(unsigned int elapsed, bool first, bool timedOut)
         if (now - at_time_a < 800) {
             break;
         }
-        bool nothing = context->menus == at_count_a && context->skillUses == at_count_b && !anim_busy(obj_dude);
+        bool nothing = context->menus == at_count_a && context->skillUses == at_count_b && context->interactions == at_tile_b;
         // An injured, calm critter next to the player: no First Aid/Doctor.
         Object* rat = at_spawn_rat(1, 2, false);
         char actions[128] = "(no rat)";
@@ -4724,7 +4840,7 @@ static bool at_menu_pipboy_script(unsigned int elapsed)
         if (state->mode != RT_PIPBOY_MODE_NONE) {
             at_pb_tap(GAMEPAD_BUTTON_B);
         }
-        at_pb_next(at_pb_phase + 1);
+        at_pb_next(at_pb_phase == 90 ? 14 : at_pb_phase + 1);
         return false;
     }
 
@@ -4848,9 +4964,15 @@ static bool at_menu_pipboy_script(unsigned int elapsed)
         }
         break;
     case 13:
-        // Inspect with Y, back with B.
+        // Inspect from the action menu (A, Inspect, A), back with B.
         if (at_pb_ready(400) && at_pb_goto_item(at_pb_weapon) && at_pb_ready()) {
-            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(90);
+        }
+        break;
+    case 90:
+        if (state->mode == RT_PIPBOY_MODE_ACTIONS && at_pb_ready(250) && at_pb_goto_choice(RT_PIPBOY_ACTION_INSPECT) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
             at_pb_next(14);
         }
         break;
@@ -5472,6 +5594,3437 @@ static bool step_pipboy_maps(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Steps: AIMED SHOT
+// -----------------------------------------------------------------------------
+
+// Fixtures: two calm, toughened rats in the line of fire, the premade
+// character's 10mm pistol, and extra action points so that several aimed
+// attacks fit in one queue.
+static Object* at_aim_rats[2] = { NULL, NULL };
+static Object* at_aim_human = NULL;
+static Object* at_aim_pistol = NULL;
+static int at_aim_ap_bonus = 0;
+static bool at_aim_fixture = false;
+static int at_aim_hp_rat_pid = -1;
+static char at_aim_message[128];
+// Disconnect inside the aimed shot screen (checked with the radial's focus loss).
+static bool at_aim_disconnect_ok = false;
+static int at_aim_flick_tries = 0;
+
+static const RtAimedState* at_aim()
+{
+    return rt_aimed_get_state();
+}
+
+// A free tile at `minDistance`..`maxDistance`, on screen, that the player can
+// shoot at, and not next to `avoid`.
+static int at_aim_open_tile(int minDistance, int maxDistance, Object* avoid)
+{
+    int width = scr_size.lrx - scr_size.ulx + 1;
+    int height = scr_size.lry - scr_size.uly + 1 - INTERFACE_BAR_HEIGHT;
+    for (int distance = minDistance; distance <= maxDistance; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int corner = tile_num_in_direction(obj_dude->tile, rotation, distance);
+            for (int step = 0; step < distance && corner != -1; step++) {
+                int tile = tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step);
+                int x;
+                int y;
+                if (tile == -1 || obj_blocking_at(NULL, tile, obj_dude->elevation) != NULL
+                    || tile_coord(tile, &x, &y, obj_dude->elevation) != 0
+                    || x < 40 || x > width - 60 || y < 40 || y > height - 40) {
+                    continue;
+                }
+                if (avoid != NULL && tile_dist(tile, avoid->tile) < 2) {
+                    continue;
+                }
+                if (combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                    continue;
+                }
+                return tile;
+            }
+        }
+    }
+    return -1;
+}
+
+// Keeps two calm rats with plenty of hit points within pistol range.
+static bool at_aim_ensure_rats()
+{
+    for (int index = 0; index < 2; index++) {
+        Object* rat = at_aim_rats[index];
+        bool usable = rat != NULL && !critter_is_dead(rat) && rt_aim_target_valid(rat)
+            && obj_dist(obj_dude, rat) <= 8
+            && (at_current_hit_mode() == -1 || rt_aim_check_shot(rat, at_current_hit_mode()) != COMBAT_BAD_SHOT_AIM_BLOCKED);
+        if (usable) {
+            continue;
+        }
+
+        // The one replaced goes, so flicks only find the two fixtures.
+        if (rat != NULL && !critter_is_dead(rat)) {
+            Rect rect;
+            if (rt_get_lock() == rat) {
+                rt_debug_set_lock(NULL);
+            }
+            anim_rt_end_all(rat);
+            obj_erase_object(rat, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+        }
+        rat = at_spawn_rat_at(at_aim_open_tile(3, 6, at_aim_rats[1 - index]), false);
+        if (rat == NULL) {
+            return false;
+        }
+
+        // Critter stats live on the prototype shared by all rats (removed
+        // again when the aimed shot tests end).
+        stat_set_bonus(rat, STAT_MAXIMUM_HIT_POINTS, 300);
+        critter_adjust_hits(rat, 300);
+        at_aim_hp_rat_pid = rat->pid;
+        at_aim_rats[index] = rat;
+        at_log("harness: aimed shot fixture rat %d at %d tiles (%d HP)", index, obj_dist(obj_dude, rat), critter_get_hits(rat));
+    }
+    return true;
+}
+
+static void at_aim_begin_fixture()
+{
+    if (!at_aim_fixture) {
+        at_aim_fixture = true;
+        at_aim_ap_bonus = stat_get_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+    }
+    // The test companion would stand in the line of fire.
+    if (at_companion != NULL) {
+        if (!critter_is_dead(at_companion)) {
+            Rect rect;
+            anim_rt_end_all(at_companion);
+            obj_erase_object(at_companion, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_log("harness: test companion removed for the aimed shot tests");
+        }
+        at_companion = NULL;
+    }
+}
+
+static void at_aim_end_fixture()
+{
+    if (at_aim_fixture) {
+        stat_set_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS, at_aim_ap_bonus);
+        at_aim_fixture = false;
+    }
+    if (at_aim_hp_rat_pid != -1) {
+        for (Object* rat : at_aim_rats) {
+            if (rat != NULL && rat->pid == at_aim_hp_rat_pid) {
+                stat_set_bonus(rat, STAT_MAXIMUM_HIT_POINTS, 0);
+                break;
+            }
+        }
+    }
+    at_clear_hostiles();
+    at_aim_rats[0] = NULL;
+    at_aim_rats[1] = NULL;
+    if (at_aim_human != NULL) {
+        Rect rect;
+        obj_erase_object(at_aim_human, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        at_aim_human = NULL;
+    }
+    rt_debug_set_lock(NULL);
+    at_release_all();
+}
+
+// The pistol in hand, loaded, in single-shot mode.
+static bool at_aim_pistol_ready()
+{
+    if (at_aim_pistol == NULL || inven_rt_quantity(at_aim_pistol) == 0) {
+        at_aim_pistol = at_find_inventory("10mm Pistol");
+    }
+    if (!at_wield(at_aim_pistol)) {
+        return false;
+    }
+    if (item_w_curr_ammo(at_aim_pistol) < item_w_max_ammo(at_aim_pistol)) {
+        item_w_set_curr_ammo(at_aim_pistol, item_w_max_ammo(at_aim_pistol));
+        intface_update_ammo_lights();
+    }
+    return at_current_anim() == ANIM_FIRE_SINGLE && !anim_busy(obj_dude);
+}
+
+// The last scripted press (LB, B...) is over, so the next one is a new press.
+static bool at_aim_released()
+{
+    for (int button = 0; button < GAMEPAD_BUTTON_COUNT; button++) {
+        if (at_press_frames[button] > 0 || at_press_gap[button] > 0) {
+            return false;
+        }
+    }
+    return SDL_GetTicks() - at_pb_last_press >= 400;
+}
+
+// Fixture: maximum AP set so exactly three aimed attacks with the current
+// weapon fit (plus 2 AP), and AP filled up.
+static void at_aim_full_ap()
+{
+    int cost = item_w_mp_cost(obj_dude, at_current_hit_mode(), true);
+    int current = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+    int wanted = 3 * cost + 2;
+    if (current != wanted) {
+        stat_set_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS, stat_get_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS) + wanted - current);
+        at_log("harness: maximum AP set to %d (3 aimed attacks of %d AP + 2)", stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS), cost);
+    }
+    rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+}
+
+// The unit screen direction from `from` to `to`, for a right stick flick.
+static void at_aim_direction(Object* from, Object* to, float* fx, float* fy)
+{
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    at_screen_pos(from, &x1, &y1);
+    at_screen_pos(to, &x2, &y2);
+    float dx = (float)(x2 - x1);
+    float dy = (float)(y2 - y1);
+    float length = sqrtf(dx * dx + dy * dy);
+    *fx = length > 0.0f ? dx / length : 1.0f;
+    *fy = length > 0.0f ? dy / length : 0.0f;
+}
+
+// A human critter prototype (fixture), for the anatomy comparison: one with
+// all eight body parts whose names differ from the rat's somewhere.
+static Object* at_aim_spawn_human()
+{
+    Object* rat = at_aim_rats[0];
+    if (rat == NULL) {
+        return NULL;
+    }
+
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        if (proto_ptr(pid, &proto) == -1 || pid == rat->pid) {
+            continue;
+        }
+
+        int fid = art_id(OBJ_TYPE_CRITTER, proto->fid & 0xFFF, ANIM_CALLED_SHOT_PIC, 0, 0);
+        if (!art_exists(fid)) {
+            continue;
+        }
+
+        Object* critter;
+        if (obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+
+        int parts = 0;
+        bool differs = false;
+        for (int part = 0; part < RT_AIMED_PARTS; part++) {
+            int location = combat_rt_called_shot_location(part);
+            const char* name = rt_aimed_part_name(critter, location);
+            const char* ratName = rt_aimed_part_name(rat, location);
+            if (name != NULL) {
+                parts++;
+            }
+            if ((name == NULL) != (ratName == NULL) || (name != NULL && strcmp(name, ratName) != 0)) {
+                differs = true;
+            }
+        }
+
+        if (parts == RT_AIMED_PARTS && differs && critter_body_type(critter) == BODY_TYPE_BIPED) {
+            int tile = at_aim_open_tile(2, 3, NULL);
+            if (tile != -1) {
+                Rect rect;
+                obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+                tile_refresh_rect(&rect, obj_dude->elevation);
+                if (critter->sid != -1) {
+                    scr_remove(critter->sid);
+                    critter->sid = -1;
+                }
+                // A neutral bystander: not the player's team, not the rats'.
+                critter->data.critter.combat.team = 77;
+                at_log("harness: human fixture %s (pid 0x%08X) at %d tiles", critter_name(critter), pid, obj_dist(obj_dude, critter));
+                return critter;
+            }
+        }
+
+        Rect rect;
+        obj_erase_object(critter, &rect);
+    }
+    return NULL;
+}
+
+static void at_aim_log_anatomy(Object* critter, const char* label)
+{
+    char line[400] = "";
+    for (int part = 0; part < RT_AIMED_PARTS; part++) {
+        const char* name = rt_aimed_part_name(critter, combat_rt_called_shot_location(part));
+        SDL_strlcat(line, name != NULL ? name : "(none)", sizeof(line));
+        SDL_strlcat(line, part < RT_AIMED_PARTS - 1 ? ", " : "", sizeof(line));
+    }
+    at_log("anatomy %s (%s): %s", label, critter_name(critter), line);
+}
+
+// Menu script state shared by the aimed shot scripts.
+static Object* at_aim_seen_target = NULL;
+static int at_aim_seen_available = 0;
+static bool at_aim_seen_open = false;
+static float at_aim_flick_x = 0.0f;
+static float at_aim_flick_y = 0.0f;
+
+// Opens the screen, notes what it shows, closes it with B.
+static bool at_menu_aim_look_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (elapsed > 600 && !at_aim_seen_open) {
+        at_aim_seen_open = state->selecting;
+        at_aim_seen_target = state->target;
+        at_aim_seen_available = 0;
+        for (int part = 0; part < RT_AIMED_PARTS; part++) {
+            at_aim_seen_available += state->available[part] ? 1 : 0;
+        }
+    }
+    if (elapsed > 1300) {
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+    return false;
+}
+
+static int at_aim_entry_phase;
+static unsigned int at_aim_time;
+static float at_aim_ap_before;
+static Object* at_aim_rat_names = NULL;
+
+// Entry with and without a lock, and the anatomy of two creature types.
+static bool step_aim_entry(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_clear_hostiles();
+        at_release_all();
+        at_aim_begin_fixture();
+        at_aim_entry_phase = 20;
+        at_aim_time = now;
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_AIM_ENTRY_LOCK, at_results[C_AIM_ENTRY_LOCK] == 1, "timed out in phase %d", at_aim_entry_phase);
+        at_menu_expected = false;
+        return true;
+    }
+
+    at_heal();
+    switch (at_aim_entry_phase) {
+    case 20:
+        // No enemy around (the rats were removed): LB refuses and stays in
+        // gameplay.
+        if (!at_aim_released() || !at_aim_pistol_ready()) {
+            break;
+        }
+        rt_debug_set_lock(NULL);
+        at_count_a = at_aim()->refusals;
+        at_count_b = at_aim()->opens;
+        at_expect_menu(NULL, NULL);
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_entry_phase = 21;
+        at_aim_time = now;
+        break;
+    case 21:
+        if (now - at_aim_time < 800) {
+            break;
+        }
+        at_check(C_AIM_NO_TARGET, !at_menu_seen && at_aim()->opens == at_count_b && at_aim()->refusals == at_count_a + 1
+                && !rt_aimed_is_executing() && strstr(at_aim()->message, "No enemy") != NULL,
+            "LB with no enemy: screen opened=%d, refused=%d, message '%s'",
+            at_menu_seen, at_aim()->refusals - at_count_a, at_aim()->message);
+        at_menu_expected = false;
+        at_aim_entry_phase = 0;
+        break;
+    case 0:
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats()) {
+            break;
+        }
+        at_aim_full_ap();
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_aim_ap_before = rt_get_dude_ap();
+        at_aim_seen_open = false;
+        at_aim_entry_phase = 1;
+        at_aim_time = now;
+        break;
+    case 1:
+        // A tick later (the lock is set), LB.
+        at_expect_menu("aim_01_rat", at_menu_aim_look_script);
+        at_count_a = at_aim()->opens;
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_entry_phase = 2;
+        at_aim_time = now;
+        break;
+    case 2:
+        if (!at_menu_seen || !at_menu_done || now - at_aim_time < 400) {
+            break;
+        }
+        at_check(C_AIM_ENTRY_LOCK,
+            at_aim_seen_open && at_aim_seen_target == at_aim_rats[0] && at_aim()->opens == at_count_a + 1
+                && !at_aim()->selecting && !rt_aimed_is_executing() && rt_get_dude_ap() >= at_aim_ap_before - 0.01f,
+            "opened=%d on the locked rat=%d, closed with B=%d, AP %.2f -> %.2f",
+            at_aim_seen_open, at_aim_seen_target == at_aim_rats[0], !at_aim()->selecting, at_aim_ap_before, rt_get_dude_ap());
+        at_aim_rat_names = at_aim_rats[0];
+        at_aim_log_anatomy(at_aim_rats[0], "rat");
+        at_menu_expected = false;
+
+        // Without a lock: a neutral human stands closer than the rats; the
+        // rats are made hostile (as if they had noticed the player).
+        rt_debug_set_lock(NULL);
+        at_aim_human = at_aim_spawn_human();
+        for (Object* rat : at_aim_rats) {
+            STRUCT_664980 request;
+            memset(&request, 0, sizeof(request));
+            request.attacker = rat;
+            request.defender = obj_dude;
+            rt_combat_request(&request);
+        }
+        at_aim_entry_phase = 3;
+        at_aim_time = now;
+        break;
+    case 3:
+        if (now - at_aim_time < 300) {
+            break;
+        }
+        at_aim_seen_open = false;
+        at_expect_menu("aim_02_nearest", at_menu_aim_look_script);
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_entry_phase = 4;
+        at_aim_time = now;
+        break;
+    case 4: {
+        if (!at_menu_seen || !at_menu_done || now - at_aim_time < 400) {
+            break;
+        }
+        Object* nearest = at_nearest(at_filter_hostile, 25);
+        bool hostileTarget = at_aim_seen_target != NULL && rt_is_hostile(at_aim_seen_target);
+        at_check(C_AIM_ENTRY_NEAREST,
+            at_aim_seen_open && hostileTarget && at_aim_seen_target != at_aim_human
+                && (nearest == NULL || obj_dist(obj_dude, at_aim_seen_target) <= obj_dist(obj_dude, nearest) + 1),
+            "no lock: target %s (hostile=%d, %d tiles), nearest hostile at %d tiles, neutral human %s at %d tiles not picked=%d",
+            at_aim_seen_target != NULL ? critter_name(at_aim_seen_target) : "(none)", hostileTarget,
+            at_aim_seen_target != NULL ? obj_dist(obj_dude, at_aim_seen_target) : -1,
+            nearest != NULL ? obj_dist(obj_dude, nearest) : -1,
+            at_aim_human != NULL ? critter_name(at_aim_human) : "(none)",
+            at_aim_human != NULL ? obj_dist(obj_dude, at_aim_human) : -1,
+            at_aim_seen_target != at_aim_human);
+        at_menu_expected = false;
+
+        if (at_aim_human == NULL) {
+            at_check(C_AIM_ANATOMY, false, "no human critter prototype with a called shot picture found");
+            at_aim_entry_phase = 9;
+            break;
+        }
+        // A neutral NPC deliberately locked is a valid target.
+        rt_debug_set_lock(at_aim_human);
+        at_aim_entry_phase = 5;
+        at_aim_time = now;
+        break;
+    }
+    case 5:
+        if (now - at_aim_time < 300) {
+            break;
+        }
+        at_aim_seen_open = false;
+        at_expect_menu("aim_03_human", at_menu_aim_look_script);
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_entry_phase = 6;
+        at_aim_time = now;
+        break;
+    case 6: {
+        if (!at_menu_seen || !at_menu_done || now - at_aim_time < 400) {
+            break;
+        }
+        at_aim_log_anatomy(at_aim_human, "human");
+        int humanParts = at_aim_seen_available;
+        int differing = 0;
+        int ratParts = 0;
+        for (int part = 0; part < RT_AIMED_PARTS; part++) {
+            int location = combat_rt_called_shot_location(part);
+            const char* human = rt_aimed_part_name(at_aim_human, location);
+            const char* rat = rt_aimed_part_name(at_aim_rat_names, location);
+            ratParts += rat != NULL ? 1 : 0;
+            if ((human == NULL) != (rat == NULL) || (human != NULL && strcmp(human, rat) != 0)) {
+                differing++;
+            }
+        }
+        at_check(C_AIM_ANATOMY, at_aim_seen_open && at_aim_seen_target == at_aim_human && differing > 0 && humanParts > 0,
+            "human: %d body parts shown, rat: %d; %d of 8 names differ (from combat.msg per creature art)",
+            humanParts, ratParts, differing);
+        at_menu_expected = false;
+        // The human never became hostile by being aimed at.
+        if (rt_is_hostile(at_aim_human) || rt_is_engaged(at_aim_human)) {
+            at_check(C_AIM_ANATOMY, false, "the neutral human turned hostile");
+        }
+        at_aim_entry_phase = 9;
+        break;
+    }
+    case 9: {
+        Rect rect;
+        if (at_aim_human != NULL) {
+            rt_debug_set_lock(NULL);
+            obj_erase_object(at_aim_human, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_aim_human = NULL;
+        }
+        return true;
+    }
+    }
+    return false;
+}
+
+// The queue: D-pad, A, X, a flick to the second rat, the AP limit, RT.
+static int at_aim_q_selected_before;
+static int at_aim_q_selected_after;
+static bool at_aim_q_dpad_ok;
+static bool at_aim_q_odds_ok;
+static int at_aim_q_after_two;
+static int at_aim_q_after_undo;
+static int at_aim_q_reserved_one;
+static int at_aim_q_free_one;
+static bool at_aim_q_switched;
+static int at_aim_q_refusals_before;
+static bool at_aim_q_refused_ap;
+static int at_aim_q_final_length;
+static int at_aim_q_cost;
+static int at_aim_q_free_start;
+static RtAimedEntry at_aim_q_plan[RT_AIMED_QUEUE_MAX];
+static int at_aim_q_favorites_before;
+static int at_aim_q_cycles_before;
+
+static bool at_menu_aim_queue_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (!state->selecting) {
+        return false;
+    }
+
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 6000) {
+        at_log("aim queue script: phase %d timed out", at_pb_phase);
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 600) {
+            at_aim_q_cost = state->apCost;
+            at_aim_q_free_start = state->availableAp;
+            at_aim_q_selected_before = state->selected;
+            at_aim_q_favorites_before = rt_favorites_get_state()->opens;
+            at_aim_q_cycles_before = rt_get_stats()->interactCycles;
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(300)) {
+            at_aim_q_selected_after = state->selected;
+            at_aim_q_dpad_ok = at_aim_q_selected_after != at_aim_q_selected_before
+                && rt_favorites_get_state()->opens == at_aim_q_favorites_before
+                && rt_get_stats()->interactCycles == at_aim_q_cycles_before;
+            // The shown hit chance is the original calculation for this part.
+            int location = state->locations[state->selected];
+            int expected = determine_to_hit(obj_dude, state->target, location, state->hitMode);
+            at_aim_q_odds_ok = state->toHit[state->selected] == expected;
+            at_log("aim: part %d -> %d (%s), shown %d%%, determine_to_hit %d%%",
+                at_aim_q_selected_before, state->selected, rt_aimed_part_name(state->target, location), state->toHit[state->selected], expected);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready(300)) {
+            at_aim_q_reserved_one = state->reservedAp;
+            at_aim_q_free_one = state->availableAp;
+            // The same body part again.
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (at_pb_ready(300)) {
+            at_aim_q_after_two = state->queueLength;
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        if (at_pb_ready(300)) {
+            at_aim_q_after_undo = state->queueLength;
+            // Flick the right stick toward the second rat.
+            at_aim_direction(at_aim_rats[0], at_aim_rats[1], &at_aim_flick_x, &at_aim_flick_y);
+            at_pad.rightX = at_aim_flick_x;
+            at_pad.rightY = at_aim_flick_y;
+            at_pb_last_press = SDL_GetTicks();
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(150)) {
+            at_pad.rightX = 0.0f;
+            at_pad.rightY = 0.0f;
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        if (at_pb_ready(400)) {
+            at_aim_q_switched = state->target == at_aim_rats[1];
+            // Another body part of the second rat, twice (AP allows three).
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_RIGHT);
+            at_pb_next(7);
+        }
+        break;
+    case 7:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(8);
+        }
+        break;
+    case 8:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        if (at_pb_ready(300)) {
+            // One more than the AP allows.
+            at_aim_q_refusals_before = state->refusals;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(10);
+        }
+        break;
+    case 10:
+        if (at_pb_ready(400)) {
+            at_aim_q_refused_ap = state->refusals == at_aim_q_refusals_before + 1 && strstr(state->message, "AP") != NULL;
+            at_aim_q_final_length = state->queueLength;
+            memcpy(at_aim_q_plan, state->queue, sizeof(at_aim_q_plan));
+            at_log("aim: queue %d, reserved %d AP, free %d AP, message '%s'", state->queueLength, state->reservedAp, state->availableAp, state->message);
+            at_screenshot("aim_04_queue");
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(11);
+        }
+        break;
+    case 11:
+        return true;
+    }
+    return false;
+}
+
+static int at_aim_x_phase;
+static float at_aim_x_ap_start;
+static float at_aim_x_ap_max;
+static int at_aim_x_aimed_before;
+static int at_aim_x_committed_before;
+static int at_aim_x_seen;
+static bool at_aim_x_order_ok;
+static int at_aim_x_ammo_before;
+static int at_aim_x_moves_before;
+static int at_aim_x_tile_before;
+static int at_aim_x_attacks_before;
+static bool at_aim_x_blocked_ok;
+static int at_aim_x_last_aimed;
+
+static bool step_aim_queue(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_aim_begin_fixture();
+        at_aim_x_phase = 0;
+        at_aim_time = now;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_check(C_AIM_EXECUTE, false, "timed out in phase %d (executing %d, next %d of %d)",
+            at_aim_x_phase, rt_aimed_is_executing(), at_aim()->next, at_aim()->queueLength);
+        at_menu_expected = false;
+        return true;
+    }
+
+    at_heal();
+    const RtStats* stats = rt_get_stats();
+    switch (at_aim_x_phase) {
+    case 0:
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats() || rt_get_pending_count() > 0) {
+            break;
+        }
+        at_aim_full_ap();
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_aim_x_phase = 1;
+        break;
+    case 1:
+        at_pb_next(0);
+        at_pb_last_press = now;
+        at_expect_menu(NULL, at_menu_aim_queue_script);
+        at_aim_x_ammo_before = item_w_curr_ammo(at_aim_pistol);
+        at_aim_x_aimed_before = stats->aimedAttacks;
+        at_aim_x_committed_before = at_aim()->committed;
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_x_phase = 2;
+        break;
+    case 2:
+        // The first gameplay tick after RT closed the screen.
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_aim_x_ap_start = rt_get_dude_ap();
+        at_aim_x_ap_max = at_aim_x_ap_start;
+        at_aim_x_seen = 0;
+        at_aim_x_order_ok = true;
+        at_aim_x_last_aimed = stats->aimedAttacks;
+        at_aim_x_moves_before = stats->moveRequests;
+        at_aim_x_tile_before = obj_dude->tile;
+        at_aim_x_attacks_before = stats->playerAttacks;
+        at_check(C_AIM_QUEUE,
+            at_aim_q_dpad_ok && at_aim_q_reserved_one == at_aim_q_cost && at_aim_q_free_one == at_aim_q_free_start - at_aim_q_cost
+                && at_aim_q_after_two == 2 && at_aim_q_after_undo == 1 && at_aim_q_switched && at_aim_q_final_length == 3,
+            "D-pad moved the part=%d (no favorites/cycling), 1 queued: %d AP reserved, %d of %d free; same part twice -> %d, X -> %d, flick switched to rat 2=%d, final queue %d",
+            at_aim_q_dpad_ok, at_aim_q_reserved_one, at_aim_q_free_one, at_aim_q_free_start, at_aim_q_after_two, at_aim_q_after_undo, at_aim_q_switched, at_aim_q_final_length);
+        at_check(C_AIM_LIMITS, at_aim_q_refused_ap, "a 4th aimed attack (%d AP each) with %d AP free was refused=%d",
+            at_aim_q_cost, at_aim_q_free_start - 3 * at_aim_q_cost, at_aim_q_refused_ap);
+        if (!rt_aimed_is_executing()) {
+            at_check(C_AIM_EXECUTE, false, "RT did not start the queue");
+            return true;
+        }
+        // Try to walk and fire while the queue runs.
+        at_stick_open_direction();
+        at_aim_x_phase = 3;
+        at_aim_time = now;
+        break;
+    case 3:
+        if (now - at_aim_time < 700) {
+            at_stick_open_direction();
+            if ((now - at_aim_time) % 300 < 40) {
+                at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            }
+        } else {
+            at_stick_release();
+        }
+
+        // Each aimed attack as it starts: planned target and body part, in
+        // order.
+        if (stats->aimedAttacks != at_aim_x_last_aimed) {
+            at_aim_x_last_aimed = stats->aimedAttacks;
+            const RtAimedEntry* planned = &(at_aim_q_plan[at_aim_x_seen]);
+            bool same = stats->lastAimedDefender == planned->target && stats->lastAimedLocation == planned->hitLocation;
+            at_log("aim: attack %d on %s, location %d (planned %s, %d), to-hit %d%%, flags 0x%X",
+                at_aim_x_seen + 1, critter_name(stats->lastAimedDefender), stats->lastAimedLocation,
+                critter_name(planned->target), planned->hitLocation, stats->lastAimedToHit, stats->lastAimedFlags);
+            at_aim_x_order_ok = at_aim_x_order_ok && same;
+            at_aim_x_seen++;
+        }
+        if (rt_get_dude_ap() > at_aim_x_ap_max) {
+            at_aim_x_ap_max = rt_get_dude_ap();
+        }
+
+        if (rt_aimed_is_executing()) {
+            break;
+        }
+
+        {
+            int committed = at_aim()->committed - at_aim_x_committed_before;
+            float spent = at_aim_x_ap_start - rt_get_dude_ap();
+            float expected = (float)(committed * at_aim_q_cost);
+            // AP never went up during execution; it went down by exactly the
+            // committed attacks' cost.
+            bool apOk = at_aim_x_ap_max <= at_aim_x_ap_start + 0.001f && fabsf(spent - expected) < 0.01f;
+            at_aim_x_blocked_ok = stats->moveRequests == at_aim_x_moves_before
+                && obj_dude->tile == at_aim_x_tile_before
+                && stats->playerAttacks - at_aim_x_attacks_before == committed;
+            at_check(C_AIM_AP, apOk && committed == 3,
+                "AP %.2f at start, highest %.2f during execution, %.2f at the end: spent %.2f for %d committed attacks of %d AP",
+                at_aim_x_ap_start, at_aim_x_ap_max, rt_get_dude_ap(), spent, committed, at_aim_q_cost);
+            at_flag_a = at_aim_x_order_ok && at_aim_x_seen == 3 && committed == 3 && at_aim_x_blocked_ok;
+            at_count_a = committed;
+        }
+        at_aim_x_phase = 4;
+        at_aim_time = now;
+        break;
+    case 4:
+        // Ammunition is taken when each attack lands.
+        if (rt_get_pending_count() > 0 && now - at_aim_time < 5000) {
+            break;
+        }
+        at_count_b = at_aim_x_ammo_before - item_w_curr_ammo(at_aim_pistol);
+        // The rats (hostile now) would keep the player in hit reactions:
+        // they go, so the walk shows the controls are back (new ones are
+        // spawned for the next step).
+        at_clear_hostiles();
+        at_aim_rats[0] = NULL;
+        at_aim_rats[1] = NULL;
+        at_ap_a = rt_get_dude_ap();
+        at_tile_a = obj_dude->tile;
+        at_stick_open_direction();
+        at_aim_x_phase = 5;
+        at_aim_time = now;
+        break;
+    case 5:
+        // Controls are back: the stick walks; AP regenerates again.
+        at_stick_open_direction();
+        if (now - at_aim_time < 1500) {
+            break;
+        }
+        at_stick_release();
+        {
+            bool walks = obj_dude->tile != at_tile_a;
+            bool regen = rt_get_dude_ap() > at_ap_a;
+            at_check(C_AIM_EXECUTE, at_flag_a && at_count_b == at_count_a && walks && regen,
+                "%d of 3 attacks started in planned order on planned targets/parts=%d; walking/RT blocked during execution=%d; rounds used %d; afterwards walks=%d, AP regenerates=%d",
+                at_aim_x_seen, at_aim_x_order_ok, at_aim_x_blocked_ok, at_count_b, walks, regen);
+        }
+        at_screenshot("aim_05_after");
+        return true;
+    }
+    return false;
+}
+
+// Hit chances and criticals: the original attack calculation (the one each
+// queued attack uses) run many times per body part, without animations.
+static bool step_aim_odds(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!first) {
+        return true;
+    }
+
+    at_heal();
+    if (!at_aim_ensure_rats() || at_aim_pistol == NULL) {
+        at_check(C_AIM_ODDS, false, "no target or pistol for the calculation test");
+        return true;
+    }
+
+    int hitMode = at_current_hit_mode();
+    Object* target = at_aim_rats[0];
+
+    // Fixture: the rat right next to the player, so range and darkness
+    // don't push every body part to 0%.
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(obj_dude->tile, rotation, 1);
+        if (tile != -1 && obj_blocking_at(NULL, tile, obj_dude->elevation) == NULL) {
+            Rect rect;
+            anim_rt_end_all(target);
+            obj_move_to_tile(target, tile, obj_dude->elevation, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            break;
+        }
+    }
+
+    static const int locations[] = { HIT_LOCATION_TORSO, HIT_LOCATION_EYES, HIT_LOCATION_HEAD, HIT_LOCATION_LEFT_ARM, HIT_LOCATION_RIGHT_LEG };
+    const int trials = 2000;
+    int ammo = item_w_curr_ammo(at_aim_pistol);
+
+    bool rateOk = true;
+    bool effectsOk = true;
+    bool notGuaranteed = true;
+    int torsoCrits = 0;
+    int torsoHits = 0;
+    int torsoToHit = 0;
+    int aimedCrits = 0;
+    int aimedHits = 0;
+    int aimedLocation = -1;
+    bool penaltyOk = true;
+    char summary[700] = "";
+
+    // The original game rolls no criticals on the first day (see
+    // `roll_check_critical`); this run is on day 1, so first that rule, then
+    // the same calculations with the clock on day 2 (put back afterwards; no
+    // game event runs in between).
+    int savedTime = game_time();
+    int dayOneCrits = 0;
+    for (int trial = 0; trial < 500; trial++) {
+        Attack attack;
+        combat_ctd_init(&attack, obj_dude, target, hitMode, HIT_LOCATION_TORSO);
+        if (combat_rt_compute_attack(&attack) != -1 && (attack.attackerFlags & DAM_CRITICAL) != 0) {
+            dayOneCrits++;
+        }
+    }
+    if (savedTime / GAME_TIME_TICKS_PER_DAY >= 1) {
+        dayOneCrits = 0;
+    }
+    set_game_time(savedTime + GAME_TIME_TICKS_PER_DAY);
+
+    for (int location : locations) {
+        int toHit = determine_to_hit(obj_dude, target, location, hitMode);
+        int hits = 0;
+        int crits = 0;
+        int cripLeg = 0;
+        int cripArm = 0;
+        int blind = 0;
+        for (int trial = 0; trial < trials; trial++) {
+            Attack attack;
+            combat_ctd_init(&attack, obj_dude, target, hitMode, location);
+            if (combat_rt_compute_attack(&attack) == -1) {
+                continue;
+            }
+            // Misses can land on something else in the line of fire.
+            if (attack.defender != target || (attack.attackerFlags & DAM_HIT) == 0) {
+                continue;
+            }
+            hits++;
+            if ((attack.attackerFlags & DAM_CRITICAL) != 0) {
+                crits++;
+            }
+            if ((attack.defenderFlags & (DAM_CRIP_LEG_LEFT | DAM_CRIP_LEG_RIGHT)) != 0) {
+                cripLeg++;
+            }
+            if ((attack.defenderFlags & (DAM_CRIP_ARM_LEFT | DAM_CRIP_ARM_RIGHT)) != 0) {
+                cripArm++;
+            }
+            if ((attack.defenderFlags & DAM_BLIND) != 0) {
+                blind++;
+            }
+        }
+
+        // The roll is against the chance as computed; below 0 never hits.
+        int expected = std::max(0, std::min(toHit, 95));
+        int rate = hits * 100 / trials;
+        bool legs = location == HIT_LOCATION_LEFT_LEG || location == HIT_LOCATION_RIGHT_LEG;
+        bool arms = location == HIT_LOCATION_LEFT_ARM || location == HIT_LOCATION_RIGHT_ARM;
+        bool eyesOrHead = location == HIT_LOCATION_EYES || location == HIT_LOCATION_HEAD;
+        rateOk = rateOk && abs(rate - expected) <= 5;
+        effectsOk = effectsOk && (legs || cripLeg == 0) && (arms || cripArm == 0) && (eyesOrHead || blind == 0);
+        notGuaranteed = notGuaranteed && hits < trials && (hits == 0 || crits < hits);
+        if (location == HIT_LOCATION_TORSO) {
+            torsoCrits = crits;
+            torsoHits = hits;
+            torsoToHit = toHit;
+        } else {
+            // Every called body part is harder to hit than the torso.
+            penaltyOk = penaltyOk && toHit < torsoToHit;
+            if (hits > aimedHits) {
+                aimedHits = hits;
+                aimedCrits = crits;
+                aimedLocation = location;
+            }
+        }
+
+        char part[130];
+        snprintf(part, sizeof(part), "%s: shown %d%%, hit %d%%, crits %d, crippled leg/arm %d/%d, blinded %d; ",
+            rt_aimed_part_name(target, location), toHit, rate, crits, cripLeg, cripArm, blind);
+        SDL_strlcat(summary, part, sizeof(summary));
+    }
+
+    set_game_time(savedTime);
+
+    // The test computed attacks only: no ammunition moved.
+    item_w_set_curr_ammo(at_aim_pistol, ammo);
+    at_log("aim odds (%d trials per part, target adjacent): %s", trials, summary);
+
+    // Aiming at a body part costs hit chance but raises the critical chance
+    // (the original applies the body part penalty to both).
+    bool critsOk = aimedHits >= 50 && torsoHits > 0 && aimedCrits * torsoHits > torsoCrits * aimedHits;
+    at_check(C_AIM_ODDS, dayOneCrits == 0 && rateOk && effectsOk && notGuaranteed && penaltyOk && critsOk,
+        "day 1: %d criticals (original: none before day 2); day 2: hit rate within 5 points of the shown chance=%d, effects only on their body part=%d, no guaranteed hit/crit=%d, body parts harder than the torso=%d, more criticals per hit on %s (%d/%d vs torso %d/%d)=%d",
+        dayOneCrits, rateOk, effectsOk, notGuaranteed, penaltyOk,
+        aimedLocation != -1 ? rt_aimed_part_name(target, aimedLocation) : "?", aimedCrits, aimedHits, torsoCrits, torsoHits, critsOk);
+    return true;
+}
+
+// Cancel while planning, a dead target during execution, B during
+// execution, knockdown and the map-load reset.
+static bool at_aim_i_cancel_with_lb;
+static int at_aim_i_cancelled_before;
+
+static bool at_menu_aim_cancel_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (!state->selecting) {
+        return false;
+    }
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(400)) {
+            at_count_b = state->queueLength;
+            at_pb_tap(at_aim_i_cancel_with_lb ? GAMEPAD_BUTTON_LEFT_SHOULDER : GAMEPAD_BUTTON_B);
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        return true;
+    }
+    return false;
+}
+
+// Queues `count` attacks (A each), switching to the second rat first when
+// `second` is set, then RT.
+static int at_aim_i_count;
+static bool at_aim_i_second;
+
+static bool at_menu_aim_run_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (!state->selecting) {
+        return false;
+    }
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 6000) {
+        at_press(GAMEPAD_BUTTON_B);
+        return true;
+    }
+
+    if (at_pb_phase == 0) {
+        if (elapsed > 500) {
+            at_pb_next(1);
+        }
+    } else if (at_pb_phase == 1) {
+        if (at_pb_ready(300)) {
+            if (state->queueLength == 1 && at_aim_i_second && state->target != at_aim_rats[1] && at_aim_flick_tries++ < 3) {
+                at_aim_direction(state->target, at_aim_rats[1], &at_aim_flick_x, &at_aim_flick_y);
+                at_pad.rightX = at_aim_flick_x;
+                at_pad.rightY = at_aim_flick_y;
+                at_pb_last_press = SDL_GetTicks();
+                at_pb_next(2);
+            } else if (state->queueLength < at_aim_i_count) {
+                at_pb_tap(GAMEPAD_BUTTON_A);
+            } else {
+                at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+                at_pb_next(3);
+            }
+        }
+    } else if (at_pb_phase == 2) {
+        if (at_pb_ready(150)) {
+            at_pad.rightX = 0.0f;
+            at_pad.rightY = 0.0f;
+            at_pb_next(1);
+            at_pb_last_press = SDL_GetTicks();
+        }
+    } else {
+        return true;
+    }
+    return false;
+}
+
+static int at_aim_i_phase;
+static float at_aim_i_ap;
+static int at_aim_i_committed;
+static int at_aim_i_skipped;
+static int at_aim_i_cost;
+static int at_aim_i_attacks;
+
+static void at_aim_i_open(AtMenuScript* script)
+{
+    at_aim_flick_tries = 0;
+    at_pb_next(0);
+    at_pb_last_press = SDL_GetTicks();
+    at_expect_menu(NULL, script);
+    at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+}
+
+static bool step_aim_interrupt(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_aim_begin_fixture();
+        at_aim_i_phase = 0;
+        at_flag_a = false;
+        at_flag_b = false;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        obj_dude->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
+        at_check(C_AIM_INTERRUPT, false, "timed out in phase %d", at_aim_i_phase);
+        return true;
+    }
+
+    at_heal();
+    const RtAimedState* state = at_aim();
+    switch (at_aim_i_phase) {
+    case 0:
+    case 10:
+    case 20:
+    case 30:
+    case 40:
+        // Ready: pistol, rats, full AP, lock on the first rat, nothing in
+        // flight.
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats() || rt_get_pending_count() > 0 || rt_aimed_is_executing()) {
+            static unsigned int lastLog = 0;
+            if (now - lastLog > 3000) {
+                lastLog = now;
+                at_log("aim interrupt: waiting (pistol in hand %d, anim %d, busy %d, pending %d, executing %d, rats %d/%d)",
+                    at_aim_pistol != NULL && at_wield(at_aim_pistol), at_current_anim(), anim_busy(obj_dude) != 0,
+                    rt_get_pending_count(), rt_aimed_is_executing(), at_aim_rats[0] != NULL, at_aim_rats[1] != NULL);
+            }
+            break;
+        }
+        at_aim_full_ap();
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_aim_i_ap = rt_get_dude_ap();
+        at_aim_i_committed = state->committed;
+        at_aim_i_skipped = state->skipped;
+        at_aim_i_attacks = rt_get_stats()->aimedAttacks;
+        at_aim_i_cost = item_w_mp_cost(obj_dude, at_current_hit_mode(), true);
+        at_aim_i_cancelled_before = state->cancelled;
+        at_aim_i_phase++;
+        break;
+
+    // Cancel with B, then with LB: nothing spent.
+    case 1:
+    case 11:
+        at_aim_i_cancel_with_lb = at_aim_i_phase == 11;
+        at_aim_i_open(at_menu_aim_cancel_script);
+        at_aim_i_phase++;
+        break;
+    case 2:
+    case 12:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        {
+            bool ok = at_count_b == 1
+                && state->queueLength == 0 && !rt_aimed_is_executing()
+                && rt_get_dude_ap() >= at_aim_i_ap - 0.001f
+                && rt_get_stats()->aimedAttacks == at_aim_i_attacks
+                && state->cancelled == at_aim_i_cancelled_before + 1;
+            at_log("aim cancel with %s: queued %d before cancelling, queue now %d, AP %.2f -> %.2f, aimed attacks +%d",
+                at_aim_i_cancel_with_lb ? "LB" : "B", at_count_b, state->queueLength, at_aim_i_ap, rt_get_dude_ap(),
+                rt_get_stats()->aimedAttacks - at_aim_i_attacks);
+            if (at_aim_i_phase == 2) {
+                at_flag_a = ok;
+            } else {
+                at_check(C_AIM_CANCEL, at_flag_a && ok, "B cancel ok=%d, LB cancel ok=%d (one attack queued each time, no AP spent, no attack)", at_flag_a, ok);
+            }
+        }
+        at_aim_i_phase = at_aim_i_phase == 2 ? 10 : 20;
+        break;
+
+    // A dead target is skipped: one attack on rat 1, one on rat 2; rat 2
+    // dies (harness) once the first attack started.
+    case 21:
+        at_aim_i_count = 2;
+        at_aim_i_second = true;
+        at_aim_i_open(at_menu_aim_run_script);
+        at_aim_i_phase = 22;
+        break;
+    case 22:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_aim_i_ap = rt_get_dude_ap();
+        if (!rt_aimed_is_executing() || state->queueLength != 2 || state->queue[1].target != at_aim_rats[1]) {
+            at_check(C_AIM_SKIP_DEAD, false, "queue not set up (executing %d, %d entries)", rt_aimed_is_executing(), state->queueLength);
+            at_aim_i_phase = 30;
+            break;
+        }
+        at_obj_a = at_aim_rats[1];
+        at_aim_i_phase = 23;
+        break;
+    case 23:
+        if (state->committed - at_aim_i_committed >= 1 && at_obj_a != NULL && !critter_is_dead(at_obj_a)) {
+            critter_kill(at_obj_a, -1, true);
+            at_log("harness: rat 2 killed while the first aimed attack plays");
+        }
+        if (rt_aimed_is_executing()) {
+            break;
+        }
+        {
+            int committed = state->committed - at_aim_i_committed;
+            int skipped = state->skipped - at_aim_i_skipped;
+            float spent = at_aim_i_ap - rt_get_dude_ap();
+            at_check(C_AIM_SKIP_DEAD, committed == 1 && skipped == 1 && fabsf(spent - at_aim_i_cost) < 0.01f && state->reservedAp == 0,
+                "committed %d, skipped %d (target dead), AP spent %.2f (one attack = %d), still reserved %d",
+                committed, skipped, spent, at_aim_i_cost, state->reservedAp);
+        }
+        at_aim_rats[1] = NULL;
+        at_aim_i_phase = 30;
+        break;
+
+    // B during execution: three queued, B after the first started.
+    case 31:
+        at_aim_i_count = 3;
+        at_aim_i_second = false;
+        at_aim_i_open(at_menu_aim_run_script);
+        at_aim_i_phase = 32;
+        break;
+    case 32:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_aim_i_ap = rt_get_dude_ap();
+        at_aim_i_phase = 33;
+        break;
+    case 33:
+        if (state->committed - at_aim_i_committed >= 1) {
+            at_press(GAMEPAD_BUTTON_B);
+            at_aim_i_phase = 34;
+            at_time_a = now;
+        } else if (!rt_aimed_is_executing()) {
+            at_aim_i_phase = 34;
+            at_time_a = now;
+        }
+        break;
+    case 34:
+        // Checked on the first tick after the cancel (AP regenerates again
+        // from then on).
+        if (rt_aimed_is_executing() && now - at_time_a < 3000) {
+            break;
+        }
+        {
+            int committed = state->committed - at_aim_i_committed;
+            float spent = at_aim_i_ap - rt_get_dude_ap();
+            at_flag_b = !rt_aimed_is_executing() && committed >= 1 && committed < 3
+                && fabsf(spent - committed * at_aim_i_cost) < 0.01f && state->reservedAp == 0;
+            at_log("aim B during execution: committed %d of 3, AP spent %.2f, executing %d, reserved %d",
+                committed, spent, rt_aimed_is_executing(), state->reservedAp);
+        }
+        // Afterwards an ordinary RT press attacks normally.
+        at_aim_i_attacks = rt_get_stats()->playerAttacks;
+        at_count_a = rt_get_stats()->aimedAttacks;
+        at_aim_i_phase = 35;
+        at_time_a = now;
+        break;
+    case 35:
+        if (rt_get_pending_count() > 0 && now - at_time_a < 4000) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_aim_i_phase = 36;
+        at_time_a = now;
+        break;
+    case 36:
+        if (now - at_time_a < 2000) {
+            break;
+        }
+        at_flag_b = at_flag_b && rt_get_stats()->playerAttacks > at_aim_i_attacks && rt_get_stats()->aimedAttacks == at_count_a;
+        at_log("aim: ordinary RT after cancelling -> attacks +%d (aimed +%d)",
+            rt_get_stats()->playerAttacks - at_aim_i_attacks, rt_get_stats()->aimedAttacks - at_count_a);
+        at_aim_i_phase = 40;
+        break;
+
+    // Knockdown during execution, then the map-load reset.
+    case 41:
+        at_aim_i_count = 3;
+        at_aim_i_second = false;
+        at_aim_i_open(at_menu_aim_run_script);
+        at_aim_i_phase = 42;
+        break;
+    case 42:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_aim_i_phase = 43;
+        break;
+    case 43:
+        if (state->committed - at_aim_i_committed >= 1 || !rt_aimed_is_executing()) {
+            // Fixture: the player is knocked down (no animation needed).
+            obj_dude->data.critter.combat.results |= DAM_KNOCKED_DOWN;
+            at_aim_i_phase = 44;
+            at_time_a = now;
+        }
+        break;
+    case 44:
+        if (now - at_time_a < 300) {
+            break;
+        }
+        at_count_a = !rt_aimed_is_executing() && state->reservedAp == 0 ? 1 : 0;
+        at_log("aim knockdown: executing %d, reserved %d, message '%s'", rt_aimed_is_executing(), state->reservedAp, state->message);
+        obj_dude->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
+        at_aim_i_phase = 45;
+        at_time_a = now;
+        break;
+    case 45:
+        if (rt_get_pending_count() > 0 && now - at_time_a < 4000) {
+            break;
+        }
+        // Map load: queue two and reset as `map_load` does.
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats()) {
+            break;
+        }
+        at_aim_full_ap();
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_aim_i_count = 2;
+        at_aim_i_second = false;
+        at_aim_i_committed = state->committed;
+        at_aim_i_open(at_menu_aim_run_script);
+        at_aim_i_phase = 46;
+        break;
+    case 46:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        rt_reset();
+        at_aim_i_phase = 47;
+        at_time_a = now;
+        break;
+    case 47:
+        if (now - at_time_a < 300) {
+            break;
+        }
+        {
+            bool resetOk = !rt_aimed_is_executing() && state->queueLength == 0 && state->reservedAp == 0;
+            at_tile_a = obj_dude->tile;
+            at_stick_open_direction();
+            at_aim_i_phase = 48;
+            at_time_a = now;
+            at_count_b = resetOk ? 1 : 0;
+        }
+        break;
+    case 48:
+        at_stick_open_direction();
+        if (now - at_time_a < 3000) {
+            break;
+        }
+        at_stick_release();
+        {
+            bool walks = obj_dude->tile != at_tile_a;
+            at_check(C_AIM_INTERRUPT, at_flag_b && at_count_a == 1 && at_count_b == 1 && walks,
+                "B mid-queue cancelled the rest, AP only for committed, RT normal afterwards=%d; knockdown ended the queue=%d; map reset cleared it=%d; walks afterwards=%d",
+                at_flag_b, at_count_a, at_count_b, walks);
+        }
+        return true;
+    }
+    return false;
+}
+
+// Not enough ammunition, blocked and out-of-range targets, burst mode, and
+// a controller disconnect inside the screen.
+static bool at_menu_aim_limit_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (!state->selecting) {
+        return false;
+    }
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_count_a = state->refusals;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(350)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready(400)) {
+            at_count_b = state->queueLength;
+            at_count_a = state->refusals - at_count_a;
+            SDL_strlcpy(at_aim_message, state->message, sizeof(at_aim_message));
+            at_log("aim limit: badShot %d, queue %d, refusals +%d, message '%s'", state->badShot, state->queueLength, at_count_a, state->message);
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        return true;
+    }
+    return false;
+}
+
+// Disconnect: the controller is pulled with RT held, plugged back in; then
+// A queues one attack and B closes.
+static bool at_menu_aim_disconnect_script(unsigned int elapsed)
+{
+    const RtAimedState* state = at_aim();
+    if (!state->selecting) {
+        return false;
+    }
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+            at_pad.buttons[GAMEPAD_BUTTON_DPAD_DOWN] = true;
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (SDL_GetTicks() - at_pb_phase_time > 300) {
+            at_pad.connected = false;
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (SDL_GetTicks() - at_pb_phase_time > 800) {
+            // Back, with RT and the D-pad still held: not new presses.
+            at_pad.connected = true;
+            at_count_a = state->queueLength;
+            at_count_b = state->selected;
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (SDL_GetTicks() - at_pb_phase_time > 600) {
+            at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+            at_pad.buttons[GAMEPAD_BUTTON_DPAD_DOWN] = false;
+            at_flag_b = state->selecting && state->queueLength == at_count_a && state->selected == at_count_b;
+            at_pb_last_press = SDL_GetTicks();
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(400)) {
+            at_flag_b = at_flag_b && state->queueLength == at_count_a + 1;
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        return true;
+    }
+    return false;
+}
+
+static int at_aim_l_phase;
+static Object* at_aim_l_covered = NULL;
+static bool at_aim_l_blocked_tested = false;
+
+static bool step_aim_limits(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_aim_begin_fixture();
+        at_aim_l_phase = 0;
+        at_aim_l_covered = NULL;
+        at_aim_l_blocked_tested = false;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        at_check(C_AIM_BLOCKED, at_results[C_AIM_BLOCKED] == 1, "timed out in phase %d", at_aim_l_phase);
+        at_aim_end_fixture();
+        return true;
+    }
+
+    at_heal();
+    const RtAimedState* state = at_aim();
+    switch (at_aim_l_phase) {
+    case 0:
+        // One round left: the second attack has no ammunition.
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats() || rt_get_pending_count() > 0) {
+            break;
+        }
+        at_aim_full_ap();
+        item_w_set_curr_ammo(at_aim_pistol, 1);
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_aim_l_phase = 1;
+        break;
+    case 1:
+        at_aim_i_open(at_menu_aim_limit_script);
+        at_aim_l_phase = 2;
+        break;
+    case 2:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_check(C_AIM_LIMITS, at_count_b == 1 && at_count_a == 1 && strstr(at_aim_message, "ammunition") != NULL,
+            "1 round loaded: queued %d, refused %d ('%s')", at_count_b, at_count_a, at_aim_message);
+        item_w_set_curr_ammo(at_aim_pistol, item_w_max_ammo(at_aim_pistol));
+
+        // A rat behind cover.
+        {
+            int tile = at_covered_tile(8);
+            at_aim_l_covered = tile != -1 ? at_spawn_rat_at(tile, false) : NULL;
+        }
+        if (at_aim_l_covered == NULL) {
+            at_log("aim: no covered tile nearby; blocked case not tested");
+            at_aim_l_phase = 5;
+            break;
+        }
+        rt_debug_set_lock(at_aim_l_covered);
+        at_aim_l_phase = 3;
+        at_time_a = now;
+        break;
+    case 3:
+        if (now - at_time_a < 200) {
+            break;
+        }
+        at_aim_i_open(at_menu_aim_limit_script);
+        at_aim_l_phase = 4;
+        break;
+    case 4:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_aim_l_blocked_tested = true;
+        at_flag_a = state->badShot == COMBAT_BAD_SHOT_AIM_BLOCKED && at_count_b == 0 && at_count_a == 2;
+        at_log("aim blocked: badShot %d, queued %d, refused %d", state->badShot, at_count_b, at_count_a);
+        {
+            Rect rect;
+            rt_debug_set_lock(NULL);
+            obj_erase_object(at_aim_l_covered, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_aim_l_covered = NULL;
+        }
+        at_aim_l_phase = 5;
+        break;
+    case 5:
+        // Unarmed against a calm rat 3+ tiles away: out of range.
+        if (!at_unarmed() || anim_busy(obj_dude)) {
+            break;
+        }
+        at_aim_l_covered = at_spawn_rat_at(at_aim_open_tile(3, 6, NULL), false);
+        if (at_aim_l_covered == NULL) {
+            at_check(C_AIM_BLOCKED, false, "no free tile for the out-of-range rat");
+            at_aim_l_phase = 8;
+            break;
+        }
+        rt_debug_set_lock(at_aim_l_covered);
+        at_aim_l_phase = 6;
+        at_time_a = now;
+        break;
+    case 6:
+        if (now - at_time_a < 200) {
+            break;
+        }
+        at_aim_i_open(at_menu_aim_limit_script);
+        at_aim_l_phase = 7;
+        break;
+    case 7:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        {
+            bool range = state->badShot == COMBAT_BAD_SHOT_OUT_OF_RANGE && at_count_b == 0 && at_count_a == 2;
+            // A blocked target is checked only where cover was found; the
+            // note says so otherwise.
+            bool blockedOk = !at_aim_l_blocked_tested || at_flag_a;
+            at_check(C_AIM_BLOCKED, range && blockedOk,
+                "blocked target tested=%d refused=%d; unarmed at %d tiles: out of range shown=%d, nothing queued=%d",
+                at_aim_l_blocked_tested, at_flag_a, rt_get_lock() != NULL ? obj_dist(obj_dude, rt_get_lock()) : -1,
+                state->badShot == COMBAT_BAD_SHOT_OUT_OF_RANGE, at_count_b == 0);
+        }
+        if (at_aim_l_covered != NULL) {
+            Rect rect;
+            rt_debug_set_lock(NULL);
+            obj_erase_object(at_aim_l_covered, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_aim_l_covered = NULL;
+        }
+        at_aim_l_phase = 8;
+        break;
+    case 8:
+        // Burst mode: refused with a reason.
+        if (at_burst_weapon == NULL) {
+            at_burst_weapon = at_create_burst_weapon();
+        }
+        if (!at_wield(at_burst_weapon) || anim_busy(obj_dude)) {
+            break;
+        }
+        if (at_current_anim() != ANIM_FIRE_BURST) {
+            static unsigned int lastPress = 0;
+            if (now - lastPress > 600) {
+                lastPress = now;
+                at_press(GAMEPAD_BUTTON_BACK);
+            }
+            break;
+        }
+        at_count_a = state->refusals;
+        at_expect_menu(NULL, NULL);
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_aim_l_phase = 9;
+        at_time_a = now;
+        break;
+    case 9:
+        if (now - at_time_a < 800) {
+            break;
+        }
+        at_check(C_AIM_UNSUPPORTED, !at_menu_seen && state->refusals == at_count_a + 1 && strstr(state->message, "Burst") != NULL,
+            "burst mode: screen opened=%d, refused=%d, message '%s'", at_menu_seen, state->refusals - at_count_a, state->message);
+        at_menu_expected = false;
+        at_aim_l_phase = 10;
+        break;
+    case 10:
+        // Disconnect inside the screen.
+        if (!at_aim_released() || !at_aim_pistol_ready() || !at_aim_ensure_rats() || rt_get_pending_count() > 0) {
+            break;
+        }
+        at_aim_full_ap();
+        rt_debug_set_lock(at_aim_rats[0]);
+        at_flag_b = false;
+        at_count_a = 0;
+        at_aim_i_attacks = rt_get_stats()->playerAttacks;
+        at_aim_i_open(at_menu_aim_disconnect_script);
+        at_aim_l_phase = 11;
+        break;
+    case 11:
+        if (!at_menu_seen || at_aim()->selecting) {
+            break;
+        }
+        at_menu_expected = false;
+        at_time_a = now;
+        at_aim_l_phase = 12;
+        break;
+    case 12:
+        if (now - at_time_a < 800) {
+            break;
+        }
+        // Recorded for the combined check with the radial's focus loss.
+        at_flag_a = at_flag_b && !rt_aimed_is_executing() && state->queueLength == 0 && rt_get_stats()->playerAttacks == at_aim_i_attacks;
+        at_log("aim disconnect: screen kept its state through the disconnect=%d, no attack/queue after closing=%d",
+            at_flag_b, at_flag_a);
+        at_aim_disconnect_ok = at_flag_a;
+        at_aim_end_fixture();
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Steps: favorites
+// -----------------------------------------------------------------------------
+
+static int at_fav_saved[RT_FAVORITES_COUNT];
+static bool at_fav_saved_valid = false;
+static Object* at_fav_stim = NULL;
+static Object* at_fav_pistol = NULL;
+static Object* at_fav_knife = NULL;
+static Object* at_fav_cursor_item = NULL;
+static int at_fav_opens = 0;
+static int at_fav_refusals = 0;
+static bool at_fav_ok[8];
+
+static const RtFavoritesState* at_fav()
+{
+    return rt_favorites_get_state();
+}
+
+static bool at_fav_radial_open()
+{
+    return at_fav()->open;
+}
+
+static Object* at_fav_first_of(int pid, bool unequipped)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if (item->pid == pid && (!unequipped || (item->flags & OBJECT_EQUIPPED) == 0)) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+// Pip-Boy (B), Inventory: Y assigns the Stimpak (stick right = Right), the
+// pistol (D-pad up = Up), the knife over the pistol (replace), X clears
+// the knife's slot, B backs out, the pistol again, the knife to the left
+// (D-pad left = Left), and Y on ammunition is refused.
+static bool at_menu_fav_assign_script(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_log("favorites assign script: phase %d timed out (radial open %d)", at_pb_phase, at_fav_radial_open());
+        at_pad.leftX = 0.0f;
+        at_pad.leftY = 0.0f;
+        at_pad.buttons[GAMEPAD_BUTTON_DPAD_UP] = false;
+        at_pad.buttons[GAMEPAD_BUTTON_DPAD_LEFT] = false;
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        if (at_fav_radial_open() || at_pb_phase >= 27) {
+            at_pb_next(at_pb_phase >= 27 ? 31 : at_pb_phase + 1);
+        } else {
+            at_pb_next(31);
+        }
+        return false;
+    }
+
+    const RtFavoritesState* fav = at_fav();
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500 && at_pb_goto_tab(RT_PIPBOY_TAB_INVENTORY)) {
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(300) && at_pb_goto_page(3)) {
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready() && at_pb_goto_item(at_fav_stim) && at_pb_ready()) {
+            at_fav_cursor_item = state->cursorItem;
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_screenshot("fav_01_assign");
+            at_pad.leftX = 1.0f;
+            at_pad.leftY = 0.0f;
+            at_pb_last_press = SDL_GetTicks();
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        if (at_pb_ready(300)) {
+            at_pad.leftX = 0.0f;
+            at_fav_ok[0] = fav->selected == RT_FAVORITES_RIGHT;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (!at_fav_radial_open() && at_pb_ready(400)) {
+            at_fav_ok[0] = at_fav_ok[0] && fav->slots[RT_FAVORITES_RIGHT] == at_fav_stim->pid && state->cursorItem == at_fav_cursor_item;
+            at_log("favorites: Stimpak -> Right=%d, Pip-Boy selection kept=%d", fav->slots[RT_FAVORITES_RIGHT] == at_fav_stim->pid, state->cursorItem == at_fav_cursor_item);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        if (at_pb_ready(300) && at_pb_goto_page(1)) {
+            at_pb_next(7);
+        }
+        break;
+    case 7:
+        if (at_pb_ready() && at_pb_goto_item(at_fav_pistol) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(8);
+        }
+        break;
+    case 8:
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(10);
+        }
+        break;
+    case 10:
+        if (!at_fav_radial_open() && at_pb_ready(400)) {
+            at_fav_ok[1] = fav->slots[0] == at_fav_pistol->pid;
+            at_pb_next(11);
+        }
+        break;
+    case 11:
+        if (at_pb_ready() && at_pb_goto_item(at_fav_knife) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(12);
+        }
+        break;
+    case 12:
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            at_pb_next(13);
+        }
+        break;
+    case 13:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(14);
+        }
+        break;
+    case 14:
+        if (!at_fav_radial_open() && at_pb_ready(400)) {
+            // Replaced: the knife in slot 1, the pistol in none.
+            at_fav_ok[2] = fav->slots[0] == at_fav_knife->pid && rt_favorites_slot_of(at_fav_pistol->pid) == -1;
+            at_log("favorites: knife replaced the pistol in slot 1=%d (%s)", at_fav_ok[2], fav->lastMessage);
+            at_fav_cursor_item = state->cursorItem;
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(16);
+        }
+        break;
+    case 16:
+        // The radial opens on the knife's slot; X clears it.
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(17);
+        }
+        break;
+    case 17:
+        if (at_pb_ready(300)) {
+            at_fav_ok[3] = fav->slots[0] == -1 && at_fav_radial_open();
+            at_screenshot("fav_02_cleared");
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(18);
+        }
+        break;
+    case 18:
+        if (!at_fav_radial_open() && at_pb_ready(400)) {
+            at_fav_ok[3] = at_fav_ok[3] && fav->slots[0] == -1 && state->cursorItem == at_fav_cursor_item && state->open;
+            at_log("favorites: X cleared slot 1, B went back to the same item=%d", at_fav_ok[3]);
+            at_pb_next(19);
+        }
+        break;
+    case 19:
+        if (at_pb_ready() && at_pb_goto_item(at_fav_pistol) && at_pb_ready()) {
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(20);
+        }
+        break;
+    case 20:
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            at_pb_next(21);
+        }
+        break;
+    case 21:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(22);
+        }
+        break;
+    case 22:
+        if (!at_fav_radial_open() && at_pb_ready(400) && at_pb_goto_item(at_fav_knife) && at_pb_ready()) {
+            at_fav_ok[4] = fav->slots[0] == at_fav_pistol->pid;
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(23);
+        }
+        break;
+    case 23:
+        // D-pad left: the Left direction.
+        if (at_fav_radial_open() && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_LEFT);
+            at_pb_next(24);
+        }
+        break;
+    case 24:
+        if (at_pb_ready(300)) {
+            at_fav_ok[5] = fav->selected == RT_FAVORITES_LEFT;
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(25);
+        }
+        break;
+    case 25:
+        if (!at_fav_radial_open() && at_pb_ready(400)) {
+            at_fav_ok[5] = at_fav_ok[5] && fav->slots[RT_FAVORITES_LEFT] == at_fav_knife->pid;
+            at_pb_next(26);
+        }
+        break;
+    case 26:
+        if (at_pb_ready(300) && at_pb_goto_page(4)) {
+            at_pb_next(27);
+        }
+        break;
+    case 27:
+        if (at_pb_ready(300)) {
+            at_fav_opens = fav->opens;
+            at_fav_refusals = fav->refusals;
+            if (state->listCount > 0) {
+                at_pb_tap(GAMEPAD_BUTTON_Y);
+            }
+            at_pb_next(28);
+        }
+        break;
+    case 28:
+        if (at_pb_ready(600)) {
+            // The Pip-Boy checks eligibility first and says why (no radial).
+            at_fav_ok[6] = state->listCount > 0 && fav->opens == at_fav_opens && !at_fav_radial_open()
+                && strstr(state->lastMessage, "can't be a favorite") != NULL;
+            at_log("favorites: Y on ammunition refused=%d ('%s')", at_fav_ok[6], state->lastMessage);
+            at_pb_next(31);
+        }
+        break;
+    case 31:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_fav_assign(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        at_heal();
+        memset(at_fav_ok, 0, sizeof(at_fav_ok));
+        at_fav_pistol = at_find_inventory("10mm Pistol");
+        at_fav_knife = at_find_inventory("Knife");
+        for (int index = 1; index < 600 && at_chem_pid == -1; index++) {
+            int pid = (OBJ_TYPE_ITEM << 24) | index;
+            Proto* proto;
+            if (proto_ptr(pid, &proto) != -1 && proto->item.type == ITEM_TYPE_DRUG
+                && SDL_strcasecmp(proto_name(pid), "Stimpak") == 0) {
+                at_chem_pid = pid;
+            }
+        }
+        at_fav_stim = at_chem_pid != -1 ? at_pb_find_stack(at_chem_pid) : NULL;
+        if (at_fav_stim == NULL && at_chem_pid != -1) {
+            Object* chem;
+            if (obj_pid_new(&chem, at_chem_pid) != -1 && item_add_force(obj_dude, chem, 3) == 0) {
+                at_fav_stim = at_pb_find_stack(at_chem_pid);
+            }
+        }
+        if (at_fav_pistol == NULL || at_fav_knife == NULL || at_fav_stim == NULL) {
+            at_check(C_FAV_ASSIGN, false, "fixtures missing (pistol %d, knife %d, Stimpak %d)",
+                at_fav_pistol != NULL, at_fav_knife != NULL, at_fav_stim != NULL);
+            return true;
+        }
+        at_flag_a = false;
+        return false;
+    }
+
+    // The previous step's last press (B closing the Pip-Boy) is over first.
+    if (!at_flag_a) {
+        if (at_aim_released()) {
+            at_flag_a = true;
+            at_pb_next(0);
+            at_pb_last_press = SDL_GetTicks();
+            at_expect_menu(NULL, at_menu_fav_assign_script);
+            at_press(GAMEPAD_BUTTON_B);
+        }
+        return false;
+    }
+
+    if ((at_menu_seen && at_menu_done && elapsed > 300) || timedOut) {
+        at_check(C_FAV_ASSIGN,
+            at_fav_ok[0] && at_fav_ok[1] && at_fav_ok[2] && at_fav_ok[3] && at_fav_ok[4] && at_fav_ok[5] && at_fav_ok[6],
+            "Stimpak->Right (stick, selection kept)=%d, pistol->Up (D-pad)=%d, knife replaced pistol=%d, X cleared + B back to the item=%d, pistol again=%d, knife->Left (D-pad)=%d, ammo refused=%d",
+            at_fav_ok[0], at_fav_ok[1], at_fav_ok[2], at_fav_ok[3], at_fav_ok[4], at_fav_ok[5], at_fav_ok[6]);
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+// Direct favorites: a D-pad press activates that direction at once.
+static int at_fav_u_phase;
+static int at_fav_u_stims;
+static int at_fav_u_hp;
+static int at_fav_u_chem_uses;
+static int at_fav_u_activations;
+static int at_fav_u_refusals;
+static int at_fav_u_attacks;
+static int at_fav_u_interactions;
+static int at_fav_u_moves;
+static int at_fav_u_tile;
+static unsigned int at_fav_u_time;
+static bool at_fav_u_ok[8];
+static Object* at_fav_removed[16];
+static int at_fav_removed_quantity[16];
+static int at_fav_removed_count = 0;
+static Object* at_fav_u_active = NULL;
+
+// One D-pad press in gameplay, watched for menus.
+static void at_fav_press(GamepadButton button)
+{
+    at_expect_menu(NULL, NULL);
+    at_press(button);
+    at_fav_u_time = SDL_GetTicks();
+}
+
+static Object* at_fav_active_item()
+{
+    Object* active = NULL;
+    intface_get_current_item(&active);
+    return active;
+}
+
+static bool step_fav_use(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        // Nothing to interact with nearby, so left/right are favorites too.
+        at_move_to_clear_spot();
+        memset(at_fav_u_ok, 0, sizeof(at_fav_u_ok));
+        at_fav_u_phase = 0;
+        if (at_fav()->slots[RT_FAVORITES_UP] == -1 || at_fav()->slots[RT_FAVORITES_RIGHT] == -1) {
+            at_check(C_FAV_USE, false, "slots not assigned by the previous step");
+            return true;
+        }
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        at_check(C_FAV_USE, at_results[C_FAV_USE] == 1, "timed out in phase %d", at_fav_u_phase);
+        return true;
+    }
+
+    const RtFavoritesState* fav = at_fav();
+    int stimPid = fav->slots[RT_FAVORITES_RIGHT];
+    switch (at_fav_u_phase) {
+    case 0:
+        // The knife in hand (so readying the pistol changes the hand), and a
+        // few hit points missing for the Stimpak.
+        if (!at_aim_released() || !at_wield(at_find_inventory("Knife")) || anim_busy(obj_dude)) {
+            break;
+        }
+        at_heal();
+        critter_adjust_hits(obj_dude, -15);
+        intface_update_hit_points(false);
+        at_fav_u_stims = at_count_pid(stimPid);
+        at_fav_u_hp = critter_get_hits(obj_dude);
+        at_fav_u_chem_uses = rt_get_stats()->chemUses;
+        at_fav_u_attacks = rt_get_stats()->playerAttacks;
+        at_fav_u_interactions = rt_context_get_stats()->interactions;
+        at_fav_u_moves = rt_get_stats()->moveRequests;
+        at_fav_u_tile = obj_dude->tile;
+        // Right held for 1.5 s: one Stimpak, not one per frame.
+        at_expect_menu(NULL, NULL);
+        at_pad.buttons[GAMEPAD_BUTTON_DPAD_RIGHT] = true;
+        at_fav_u_phase = 1;
+        at_fav_u_time = now;
+        break;
+    case 1:
+        if (now - at_fav_u_time < 1500) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_DPAD_RIGHT] = false;
+        at_fav_u_phase = 2;
+        at_fav_u_time = now;
+        break;
+    case 2:
+        // The Stimpak animation plays out.
+        if (now - at_fav_u_time < 2500) {
+            break;
+        }
+        {
+            int stims = at_count_pid(stimPid);
+            int hp = critter_get_hits(obj_dude);
+            at_fav_u_ok[0] = !at_menu_seen && stims == at_fav_u_stims - 1 && hp > at_fav_u_hp
+                && rt_get_stats()->chemUses == at_fav_u_chem_uses + 1;
+            at_log("favorites: Right held 1.5 s: menu opened=%d, Stimpaks %d -> %d, HP %d -> %d, chem uses +%d",
+                at_menu_seen, at_fav_u_stims, stims, at_fav_u_hp, hp, rt_get_stats()->chemUses - at_fav_u_chem_uses);
+            bool quiet = rt_get_stats()->playerAttacks == at_fav_u_attacks
+                && rt_context_get_stats()->interactions == at_fav_u_interactions
+                && obj_dude->tile == at_fav_u_tile
+                && rt_get_stats()->moveRequests == at_fav_u_moves;
+            at_check(C_FAV_NO_LEAK, quiet, "after the direct use: attacks +%d, interactions +%d, moved=%d, movement requests +%d",
+                rt_get_stats()->playerAttacks - at_fav_u_attacks, rt_context_get_stats()->interactions - at_fav_u_interactions,
+                obj_dude->tile != at_fav_u_tile, rt_get_stats()->moveRequests - at_fav_u_moves);
+        }
+        at_menu_expected = false;
+        at_heal();
+        // Up: the pistol (waits for the Stimpak animation if it still plays).
+        at_fav_press(GAMEPAD_BUTTON_DPAD_UP);
+        at_fav_u_phase = 3;
+        break;
+    case 3: {
+        if (now - at_fav_u_time < 2500) {
+            break;
+        }
+        Object* active = at_fav_active_item();
+        at_fav_u_ok[1] = !at_menu_seen && active != NULL && active->pid == fav->slots[RT_FAVORITES_UP];
+        at_log("favorites: Up -> active item %s, menu opened=%d", active != NULL ? object_name(active) : "(none)", at_menu_seen);
+        at_menu_expected = false;
+
+        // An empty direction does nothing at all.
+        int empty = fav->slots[RT_FAVORITES_DOWN] == -1 ? RT_FAVORITES_DOWN : (fav->slots[RT_FAVORITES_LEFT] == -1 ? RT_FAVORITES_LEFT : -1);
+        if (empty == -1) {
+            rt_favorites_debug_set(RT_FAVORITES_DOWN, -1);
+            empty = RT_FAVORITES_DOWN;
+        }
+        at_fav_u_activations = fav->activations;
+        at_fav_u_refusals = fav->refusals;
+        at_fav_u_active = active;
+        at_count_a = empty;
+        at_fav_press(empty == RT_FAVORITES_DOWN ? GAMEPAD_BUTTON_DPAD_DOWN : GAMEPAD_BUTTON_DPAD_LEFT);
+        at_fav_u_phase = 4;
+        break;
+    }
+    case 4:
+        if (now - at_fav_u_time < 800) {
+            break;
+        }
+        at_fav_u_ok[2] = !at_menu_seen && fav->activations == at_fav_u_activations && fav->refusals == at_fav_u_refusals
+            && at_fav_active_item() == at_fav_u_active;
+        at_log("favorites: empty %s did nothing=%d", rt_favorites_slot_name(at_count_a), at_fav_u_ok[2]);
+        at_menu_expected = false;
+        at_check(C_FAV_USE, at_fav_u_ok[0] && at_fav_u_ok[1] && at_fav_u_ok[2],
+            "Right (Stimpak) held 1.5 s used exactly one, no menu=%d; Up readied the pistol=%d; empty direction did nothing=%d",
+            at_fav_u_ok[0], at_fav_u_ok[1], at_fav_u_ok[2]);
+
+        // Depleted: every Stimpak taken out (kept aside, not destroyed).
+        at_fav_removed_count = 0;
+        for (int pass = 0; pass < 16; pass++) {
+            Object* stim = at_fav_first_of(stimPid, false);
+            if (stim == NULL || at_fav_removed_count >= 16) {
+                break;
+            }
+            int quantity = item_count(obj_dude, stim);
+            if (item_remove_mult(obj_dude, stim, quantity) != 0) {
+                break;
+            }
+            at_fav_removed[at_fav_removed_count] = stim;
+            at_fav_removed_quantity[at_fav_removed_count] = quantity;
+            at_fav_removed_count++;
+        }
+        at_fav_u_refusals = fav->refusals;
+        at_fav_u_activations = fav->activations;
+        at_fav_u_active = at_fav_active_item();
+        at_fav_press(GAMEPAD_BUTTON_DPAD_RIGHT);
+        at_fav_u_phase = 5;
+        break;
+    case 5:
+        if (now - at_fav_u_time < 800) {
+            break;
+        }
+        at_fav_u_ok[3] = !at_menu_seen && fav->slots[RT_FAVORITES_RIGHT] == stimPid && rt_favorites_quantity(RT_FAVORITES_RIGHT) == 0
+            && fav->refusals == at_fav_u_refusals + 1 && fav->activations == at_fav_u_activations
+            && at_fav_active_item() == at_fav_u_active && strstr(fav->lastMessage, "don't have") != NULL;
+        at_log("favorites: Right with no Stimpaks: refused=%d ('%s'), slot kept=%d", at_fav_u_ok[3], fav->lastMessage, fav->slots[RT_FAVORITES_RIGHT] == stimPid);
+        at_menu_expected = false;
+        // Restocked: works again.
+        for (int index = 0; index < at_fav_removed_count; index++) {
+            item_add_force(obj_dude, at_fav_removed[index], at_fav_removed_quantity[index]);
+        }
+        at_fav_u_stims = at_count_pid(stimPid);
+        at_fav_u_chem_uses = rt_get_stats()->chemUses;
+        at_fav_press(GAMEPAD_BUTTON_DPAD_RIGHT);
+        at_fav_u_phase = 6;
+        break;
+    case 6:
+        // Holstering the pistol, using the Stimpak and drawing again take a while.
+        if (at_count_pid(stimPid) == at_fav_u_stims && now - at_fav_u_time < 6000) {
+            break;
+        }
+        {
+            int stims = at_count_pid(stimPid);
+            bool used = stims == at_fav_u_stims - 1 && rt_get_stats()->chemUses == at_fav_u_chem_uses + 1;
+            at_check(C_FAV_DEPLETED, at_fav_u_ok[3] && used && at_fav_u_stims > 0,
+                "no Stimpaks: feedback only, no menu, no other item=%d; restocked to %d: used again=%d (now %d)",
+                at_fav_u_ok[3], at_fav_u_stims, used, stims);
+        }
+        at_menu_expected = false;
+        at_heal();
+        return true;
+    }
+    return false;
+}
+
+// What the save holds, for the checks after loading (the favorites test
+// changed the hand since the Pip-Boy test).
+static void at_record_save_state()
+{
+    at_pb_saved_weapon_pid = inven_right_hand(obj_dude) != NULL ? inven_right_hand(obj_dude)->pid : -1;
+    memcpy(at_fav_saved, rt_favorites_get_state()->slots, sizeof(at_fav_saved));
+    at_fav_saved_valid = true;
+}
+
+static bool step_fav_persist(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!first) {
+        return true;
+    }
+
+    if (!at_fav_saved_valid) {
+        at_check(C_FAV_PERSIST, false, "no favorites recorded at save time");
+        return true;
+    }
+
+    const RtFavoritesState* fav = at_fav();
+    bool same = true;
+    int assigned = 0;
+    char line[200] = "";
+    for (int slot = 0; slot < RT_FAVORITES_COUNT; slot++) {
+        same = same && fav->slots[slot] == at_fav_saved[slot];
+        if (fav->slots[slot] != -1) {
+            assigned++;
+            char part[48];
+            snprintf(part, sizeof(part), "%s:%s(%d) ", rt_favorites_slot_name(slot), proto_name(fav->slots[slot]), rt_favorites_quantity(slot));
+            SDL_strlcat(line, part, sizeof(line));
+        }
+    }
+    bool resolves = rt_favorites_find_item(RT_FAVORITES_UP) != NULL && rt_favorites_find_item(RT_FAVORITES_RIGHT) != NULL;
+    at_check(C_FAV_PERSIST, same && assigned >= 2 && resolves,
+        "after load: slots identical=%d, %d assigned [%s], items found in the loaded inventory=%d", same, assigned, line, resolves);
+
+    // The eight-slot layout of earlier saves (the same function the loader
+    // uses): up=A, up-right=B, right=C, down=D, down-left=E, up-left=F,
+    // down-right and left empty. A, C, D keep their direction; E moves to
+    // the free left; B (up and right taken) and F (left now taken, up
+    // taken) are dropped and reported; a duplicate of A is not moved.
+    int a = at_fav_saved[RT_FAVORITES_UP];
+    int c = at_fav_saved[RT_FAVORITES_RIGHT];
+    int items[4] = { -1, -1, -1, -1 };
+    int found = 0;
+    for (int index = 1; index < 600 && found < 4; index++) {
+        int pid = (OBJ_TYPE_ITEM << 24) | index;
+        Proto* proto;
+        if (pid != a && pid != c && proto_ptr(pid, &proto) != -1) {
+            items[found++] = pid;
+        }
+    }
+    int oldSlots[RT_FAVORITES_OLD_COUNT] = { a, items[0], c, a, items[1], items[2], -1, items[3] };
+    int slots[RT_FAVORITES_COUNT];
+    int moved;
+    char report[512];
+    int dropped = rt_favorites_migrate(oldSlots, slots, &moved, report, sizeof(report));
+    bool migrated = slots[RT_FAVORITES_UP] == a && slots[RT_FAVORITES_RIGHT] == c && slots[RT_FAVORITES_DOWN] == items[1]
+        && slots[RT_FAVORITES_LEFT] == items[2] && moved == 1 && dropped == 2
+        && strstr(report, "dropped") != NULL && strstr(report, "moved") != NULL;
+    at_check(C_FAV_MIGRATE, migrated && found == 4,
+        "8 slots -> Up/Right/Down/Left kept cardinals=%d, moved %d, dropped %d, report '%s'",
+        slots[RT_FAVORITES_UP] == a && slots[RT_FAVORITES_RIGHT] == c && slots[RT_FAVORITES_DOWN] == items[1], moved, dropped, report);
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Steps: interaction selection
+// -----------------------------------------------------------------------------
+
+// Fixture items around the player: P1 next to the player, P2 next to the
+// player and 1 hex from P1, P3 next to the player on the other side (2 hexes
+// from P1), P4 2 hexes from the player behind P3 (3 hexes from P1).
+static Object* at_int_items[4] = { NULL, NULL, NULL, NULL };
+static Object* at_int_rat = NULL;
+static int at_int_phase;
+static unsigned int at_int_time;
+static int at_int_cycles;
+static int at_int_favorites;
+static int at_int_engagements;
+static int at_int_interactions;
+static bool at_int_ok[8];
+static int at_int_pid = -1;
+static Object* at_int_sequence[16];
+static int at_int_sequence_count = 0;
+static int at_int_presses = 0;
+
+static bool at_int_on_map(Object* target)
+{
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+        if (obj == target) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static void at_int_erase(Object** obj)
+{
+    if (*obj != NULL && at_int_on_map(*obj)) {
+        Rect rect;
+        obj_erase_object(*obj, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+    *obj = NULL;
+}
+
+// Test fixture: an item (ammunition) on the ground at `tile`.
+static Object* at_int_place_item(int tile)
+{
+    Object* item;
+    if (tile == -1 || at_int_pid == -1 || obj_pid_new(&item, at_int_pid) == -1) {
+        return NULL;
+    }
+    Rect rect;
+    obj_move_to_tile(item, tile, obj_dude->elevation, &rect);
+    tile_refresh_rect(&rect, obj_dude->elevation);
+    return item;
+}
+
+static int at_int_index(Object* obj)
+{
+    for (int index = 0; index < 4; index++) {
+        if (at_int_items[index] != NULL && at_int_items[index] == obj) {
+            return index;
+        }
+    }
+    return -1;
+}
+
+static bool at_int_free(int tile)
+{
+    return tile != -1 && obj_blocking_at(NULL, tile, obj_dude->elevation) == NULL;
+}
+
+// Places the four items in the first orientation where all their tiles are
+// free; true on success.
+// The orientation (0-5) where all four item tiles around `spot` are free, or -1.
+static int at_int_cluster_base(int spot)
+{
+    for (int base = 0; base < ROTATION_COUNT; base++) {
+        int p1 = tile_num_in_direction(spot, base, 1);
+        int p2 = tile_num_in_direction(spot, (base + 1) % ROTATION_COUNT, 1);
+        int p3 = tile_num_in_direction(spot, (base + 3) % ROTATION_COUNT, 1);
+        int p4 = tile_num_in_direction(spot, (base + 3) % ROTATION_COUNT, 2);
+        if (at_int_free(p1) && at_int_free(p2) && at_int_free(p3) && at_int_free(p4)) {
+            return base;
+        }
+    }
+    return -1;
+}
+
+// Nothing else to interact with within 4 hexes of `spot`.
+static bool at_int_spot_clear(int spot)
+{
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+        int type = FID_TYPE(obj->fid);
+        if (obj == obj_dude || (obj->flags & OBJECT_HIDDEN) != 0
+            || (type != OBJ_TYPE_ITEM && type != OBJ_TYPE_CRITTER && type != OBJ_TYPE_SCENERY)) {
+            continue;
+        }
+        if (tile_dist(spot, obj->tile) <= 4 && rt_context_is_interactable(obj)) {
+            return false;
+        }
+    }
+    return true;
+}
+
+// Places the four items around the player, moving the player (harness) to
+// the nearest clear spot with room for them; true on success.
+static bool at_int_place_cluster()
+{
+    int spot = -1;
+    int base = -1;
+    for (int distance = 0; distance <= 12 && spot == -1; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT && spot == -1; rotation++) {
+            int corner = distance == 0 ? obj_dude->tile : tile_num_in_direction(obj_dude->tile, rotation, distance);
+            int steps = distance == 0 ? 1 : distance;
+            for (int step = 0; step < steps && corner != -1 && spot == -1; step++) {
+                int tile = distance == 0 ? corner : tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step);
+                if (tile == -1 || (tile != obj_dude->tile && obj_blocking_at(obj_dude, tile, obj_dude->elevation) != NULL)) {
+                    continue;
+                }
+                int candidate = at_int_cluster_base(tile);
+                if (candidate != -1 && at_int_spot_clear(tile)) {
+                    spot = tile;
+                    base = candidate;
+                }
+            }
+        }
+    }
+    if (spot == -1) {
+        return false;
+    }
+
+    Rect rect;
+    if (spot != obj_dude->tile) {
+        obj_move_to_tile(obj_dude, spot, obj_dude->elevation, &rect);
+        tile_set_center(spot, TILE_SET_CENTER_REFRESH_WINDOW);
+    }
+
+    int p1 = tile_num_in_direction(spot, base, 1);
+    int p2 = tile_num_in_direction(spot, (base + 1) % ROTATION_COUNT, 1);
+    int p3 = tile_num_in_direction(spot, (base + 3) % ROTATION_COUNT, 1);
+    int p4 = tile_num_in_direction(spot, (base + 3) % ROTATION_COUNT, 2);
+    at_int_items[0] = at_int_place_item(p1);
+    at_int_items[1] = at_int_place_item(p2);
+    at_int_items[2] = at_int_place_item(p3);
+    at_int_items[3] = at_int_place_item(p4);
+    // Facing P1, so it is what is highlighted first.
+    if (obj_set_rotation(obj_dude, base, &rect) == 0) {
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+    at_log("harness: items P1..P4: P1-P2 %d hexes, P1-P3 %d, P1-P4 %d, P3-P4 %d; from the player %d %d %d %d",
+        tile_dist(p1, p2), tile_dist(p1, p3), tile_dist(p1, p4), tile_dist(p3, p4),
+        tile_dist(spot, p1), tile_dist(spot, p2), tile_dist(spot, p3), tile_dist(spot, p4));
+    return at_int_items[0] != NULL && at_int_items[1] != NULL && at_int_items[2] != NULL && at_int_items[3] != NULL;
+}
+
+
+static void at_int_cleanup()
+{
+    for (Object*& item : at_int_items) {
+        at_int_erase(&item);
+    }
+    rt_debug_set_lock(NULL);
+    at_int_erase(&at_int_rat);
+}
+
+static bool step_int_cycle(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_move_to_clear_spot();
+        memset(at_int_ok, 0, sizeof(at_int_ok));
+        if (at_aim_pistol == NULL) {
+            at_aim_pistol = at_find_inventory("10mm Pistol");
+        }
+        Proto* proto;
+        at_int_pid = at_aim_pistol != NULL && proto_ptr(at_aim_pistol->pid, &proto) != -1 ? proto->item.data.weapon.ammoTypePid : -1;
+        if (!at_int_place_cluster()) {
+            at_check(C_INT_CYCLE, false, "no free tiles for the four items around the player");
+            at_int_cleanup();
+            return true;
+        }
+        // A neutral rat out of reach, locked: cycling mustn't touch it.
+        at_int_rat = at_spawn_rat(6, 8, false);
+        if (at_int_rat != NULL) {
+            rt_debug_set_lock(at_int_rat);
+        }
+        at_int_engagements = rt_get_stats()->engagements;
+        at_int_phase = 0;
+        at_int_time = now;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_menu_expected = false;
+        at_check(C_INT_CYCLE, at_results[C_INT_CYCLE] == 1, "timed out in phase %d", at_int_phase);
+        at_int_cleanup();
+        return true;
+    }
+
+    at_heal();
+    switch (at_int_phase) {
+    case 0: {
+        if (now - at_int_time < 400 || !at_aim_released()) {
+            break;
+        }
+        // P1 highlighted, in reach: its name and action, no helper text.
+        Object* target = rt_get_interact_target();
+        const char* label = rt_get_interact_label();
+        at_int_ok[0] = target != NULL && at_int_index(target) != -1 && tile_dist(obj_dude->tile, target->tile) <= 1 && strstr(label, object_name(target)) != NULL && strstr(label, "A Pick up") != NULL
+            && strstr(label, "D-pad") == NULL && strstr(label, "next") == NULL && strstr(label, "favorites") == NULL;
+        at_log("interaction: highlighted P%d, label '%s'", at_int_index(target) + 1, label);
+        at_screenshot("int_01_label");
+        at_int_sequence[0] = target;
+        at_int_sequence_count = 1;
+        at_int_presses = 0;
+        at_int_cycles = rt_get_stats()->interactCycles;
+        at_int_favorites = rt_get_stats()->favoritesOpened;
+        at_int_phase = 1;
+        break;
+    }
+    case 1:
+        // Right four times, then left four times.
+        if (now - at_int_time < 350) {
+            break;
+        }
+        if (at_int_presses > 0) {
+            at_int_sequence[at_int_sequence_count++] = rt_get_interact_target();
+        }
+        if (at_int_presses < 8) {
+            at_expect_menu(NULL, NULL);
+            at_press(at_int_presses < 4 ? GAMEPAD_BUTTON_DPAD_RIGHT : GAMEPAD_BUTTON_DPAD_LEFT);
+            at_int_presses++;
+            at_int_time = now;
+            break;
+        }
+        {
+            bool within = true;
+            bool farJump = false;
+            char line[160] = "";
+            for (int index = 1; index < at_int_sequence_count; index++) {
+                Object* previous = at_int_sequence[index - 1];
+                Object* next = at_int_sequence[index];
+                within = within && previous != NULL && next != NULL && tile_dist(previous->tile, next->tile) <= 2;
+                farJump = farJump || ((at_int_index(previous) == 0 && at_int_index(next) == 3) || (at_int_index(previous) == 3 && at_int_index(next) == 0));
+                char part[16];
+                snprintf(part, sizeof(part), "P%d ", at_int_index(next) + 1);
+                SDL_strlcat(line, part, sizeof(line));
+            }
+            bool cyclesOnly = rt_get_stats()->interactCycles == at_int_cycles + 8 && rt_get_stats()->favoritesOpened == at_int_favorites && !at_menu_seen;
+            at_int_ok[1] = within && !farJump && cyclesOnly;
+            at_log("interaction: from the first highlight (P%d), right x4 then left x4: %s(each step within 2 hexes=%d, P1<->P4 (3 apart) directly=%d, only cycled=%d)",
+                at_int_index(at_int_sequence[0]) + 1, line, within, farJump, cyclesOnly);
+        }
+        at_menu_expected = false;
+        at_int_phase = 2;
+        at_int_presses = 0;
+        break;
+    case 2:
+        // Onto P4 (2 hexes from the player): highlighted, but no label and A
+        // doesn't act from there.
+        if (now - at_int_time < 350) {
+            break;
+        }
+        if (rt_get_interact_target() != at_int_items[3]) {
+            if (at_int_presses++ < 8) {
+                at_press(GAMEPAD_BUTTON_DPAD_RIGHT);
+                at_int_time = now;
+            } else {
+                at_log("interaction: could not highlight P4");
+                at_int_phase = 4;
+            }
+            break;
+        }
+        at_int_ok[2] = rt_get_interact_label()[0] == '\0';
+        at_int_interactions = rt_context_get_stats()->interactions;
+        at_tile_a = obj_dude->tile;
+        at_press(GAMEPAD_BUTTON_A);
+        at_int_phase = 3;
+        at_int_time = now;
+        break;
+    case 3:
+        if (now - at_int_time < 1200) {
+            break;
+        }
+        at_int_ok[3] = rt_context_get_stats()->interactions == at_int_interactions && obj_dude->tile == at_tile_a && at_int_on_map(at_int_items[3]);
+        at_log("interaction: A on P4 (%d hexes away): interactions +%d, player moved=%d, still on the ground=%d",
+            tile_dist(obj_dude->tile, at_int_items[3]->tile), rt_context_get_stats()->interactions - at_int_interactions,
+            obj_dude->tile != at_tile_a, at_int_on_map(at_int_items[3]));
+        at_int_phase = 4;
+        at_int_presses = 0;
+        break;
+    case 4:
+        // Back to P1 for the rest.
+        if (now - at_int_time < 350) {
+            break;
+        }
+        if (rt_get_interact_target() != at_int_items[0] && at_int_presses++ < 8) {
+            at_press(GAMEPAD_BUTTON_DPAD_LEFT);
+            at_int_time = now;
+            break;
+        }
+        at_check(C_INT_LABEL, at_int_ok[0] && at_int_ok[2],
+            "P1 (1 hex): label with name and 'A Pick up', no D-pad/favorites text=%d; P4 (2 hexes): no label=%d", at_int_ok[0], at_int_ok[2]);
+        at_check(C_INT_NO_COMBAT, rt_get_lock() == at_int_rat && at_int_rat != NULL && !rt_is_engaged(at_int_rat)
+                && rt_get_stats()->engagements == at_int_engagements,
+            "lock still on the neutral rat=%d, rat engaged=%d, new engagements=%d",
+            rt_get_lock() == at_int_rat, at_int_rat != NULL && rt_is_engaged(at_int_rat), rt_get_stats()->engagements - at_int_engagements);
+
+        // Only P1 and P4 (3 hexes apart): left/right have nobody to step to
+        // and use the favorites; up too.
+        at_int_erase(&at_int_items[1]);
+        at_int_erase(&at_int_items[2]);
+        at_int_cycles = rt_get_stats()->interactCycles;
+        at_int_favorites = rt_get_stats()->favoritesOpened;
+        at_int_phase = 5;
+        at_int_time = now;
+        break;
+    case 5:
+        if (now - at_int_time < 400) {
+            break;
+        }
+        at_expect_menu(NULL, NULL);
+        at_press(GAMEPAD_BUTTON_DPAD_LEFT);
+        at_int_phase = 6;
+        at_int_time = now;
+        break;
+    case 6:
+        if (now - at_int_time < 500) {
+            break;
+        }
+        at_int_ok[4] = rt_get_stats()->interactCycles == at_int_cycles && rt_get_stats()->favoritesOpened == at_int_favorites + 1
+            && rt_get_interact_target() == at_int_items[0] && !at_menu_seen;
+        at_press(GAMEPAD_BUTTON_DPAD_UP);
+        at_int_phase = 7;
+        at_int_time = now;
+        break;
+    case 7:
+        if (now - at_int_time < 500) {
+            break;
+        }
+        {
+            bool up = rt_get_stats()->interactCycles == at_int_cycles && rt_get_stats()->favoritesOpened == at_int_favorites + 2 && !at_menu_seen;
+            at_check(C_INT_CONTEXT, at_int_ok[1] && at_int_ok[4] && up,
+                "with neighbors within 2 hexes left/right only cycled=%d; P1 and P4 3 hexes apart: left went to favorites, highlight kept=%d; up went to favorites=%d (no menu)",
+                at_int_ok[1], at_int_ok[4], up);
+            at_check(C_INT_CYCLE, at_int_ok[1], "see the log: each step within 2 hexes of the highlighted item, never P1<->P4 (3 apart)");
+        }
+        at_menu_expected = false;
+        // A on P1 (in reach) picks it up.
+        at_obj_a = rt_get_interact_target();
+        at_count_a = at_count_pid(at_int_pid);
+        at_press(GAMEPAD_BUTTON_A);
+        at_int_phase = 8;
+        at_int_time = now;
+        break;
+    case 8:
+        if ((at_int_on_map(at_obj_a) || anim_busy(obj_dude)) && now - at_int_time < 5000) {
+            break;
+        }
+        {
+            bool picked = at_obj_a == at_int_items[0] && !at_int_on_map(at_obj_a) && at_count_pid(at_int_pid) > at_count_a;
+            at_check(C_INT_ACTIVATE, picked && at_int_ok[3],
+                "A on P1 (1 hex): picked up=%d (ammo %d -> %d); A on P4 (2 hexes): refused without moving=%d",
+                picked, at_count_a, at_count_pid(at_int_pid), at_int_ok[3]);
+            at_int_items[0] = NULL;
+        }
+        at_int_cleanup();
+        at_int_phase = 11;
+        break;
+    case 11: {
+        // Barrier: a spot near a wall with a free tile 2 hexes away on the
+        // other side (no short walk there), and one in the open.
+        int found = -1;
+        int hidden = -1;
+        for (int distance = 0; distance <= 10 && found == -1; distance++) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && found == -1; rotation++) {
+                int corner = distance == 0 ? obj_dude->tile : tile_num_in_direction(obj_dude->tile, rotation, distance);
+                int steps = distance == 0 ? 1 : distance;
+                for (int step = 0; step < steps && corner != -1 && found == -1; step++) {
+                    int spot = distance == 0 ? corner : tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step);
+                    if (spot == -1 || obj_blocking_at(obj_dude, spot, obj_dude->elevation) != NULL) {
+                        continue;
+                    }
+                    for (int side = 0; side < ROTATION_COUNT && found == -1; side++) {
+                        int other = tile_num_in_direction(spot, side, 2);
+                        if (other == -1 || obj_blocking_at(NULL, other, obj_dude->elevation) != NULL
+                            || !combat_is_shot_blocked(obj_dude, spot, other, NULL, NULL)) {
+                            continue;
+                        }
+                        int length = make_path(obj_dude, spot, other, NULL, 0);
+                        bool openTile = false;
+                        for (int around = 0; around < ROTATION_COUNT; around++) {
+                            int next = tile_num_in_direction(spot, around, 1);
+                            openTile = openTile || (next != -1 && next != other && obj_blocking_at(NULL, next, obj_dude->elevation) == NULL);
+                        }
+                        if (openTile && (length == 0 || length > 6)) {
+                            found = spot;
+                            hidden = other;
+                        }
+                    }
+                }
+            }
+        }
+        if (found == -1) {
+            at_log("interaction: no wall with a free tile behind it nearby; barrier not tested");
+            return true;
+        }
+        Rect rect;
+        obj_move_to_tile(obj_dude, found, obj_dude->elevation, &rect);
+        tile_set_center(found, TILE_SET_CENTER_REFRESH_WINDOW);
+        at_int_items[0] = at_int_place_item(hidden);
+        // The item in the open: right next to the player.
+        for (int rotation = 0; rotation < ROTATION_COUNT && at_int_items[1] == NULL; rotation++) {
+            int tile = tile_num_in_direction(found, rotation, 1);
+            if (tile != -1 && tile != hidden && obj_blocking_at(NULL, tile, obj_dude->elevation) == NULL) {
+                at_int_items[1] = at_int_place_item(tile);
+            }
+        }
+        at_log("harness: wall test: player at a wall spot, item behind it %d hexes away (path %d), item in the open placed=%d",
+            tile_dist(found, hidden), make_path(obj_dude, found, hidden, NULL, 0), at_int_items[1] != NULL);
+        at_int_phase = 12;
+        at_int_time = now;
+        break;
+    }
+    case 12: {
+        // After the pickup animation, with the candidates refreshed.
+        if (now - at_int_time < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        Object* candidates[8];
+        int count = rt_get_interact_candidates(candidates, 8);
+        bool hiddenOut = at_int_items[0] != NULL;
+        bool openIn = false;
+        for (int index = 0; index < count; index++) {
+            hiddenOut = hiddenOut && candidates[index] != at_int_items[0];
+            openIn = openIn || (at_int_items[1] != NULL && candidates[index] == at_int_items[1]);
+        }
+        at_screenshot("int_03_wall");
+        at_check(C_INT_BARRIER, hiddenOut && openIn,
+            "item 2 hexes away behind a wall offered=%d (should be 0); item in the open offered=%d",
+            !hiddenOut, openIn);
+        at_int_cleanup();
+        return true;
+    }
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Steps: loot screen
+// -----------------------------------------------------------------------------
+
+#define AT_LOOT_ITEMS 10
+
+static Object* at_loot_corpse = NULL;
+static Object* at_loot_single = NULL;
+static int at_loot_single_pid = -1;
+static Object* at_loot_stack = NULL;
+static Object* at_loot_heavy = NULL;
+static int at_loot_pids[AT_LOOT_ITEMS + 1];
+static int at_loot_totals[AT_LOOT_ITEMS + 1];
+static int at_loot_pid_count = 0;
+static int at_loot_phase;
+static unsigned int at_loot_time;
+static int at_loot_presses;
+static bool at_loot_ok[16];
+static bool at_loot_quantity_seen = false;
+static int at_loot_carry_bonus = 0;
+static bool at_loot_carry_set = false;
+static Object* at_loot_equipped[3];
+static int at_loot_attacks;
+static int at_loot_interactions;
+static int at_loot_reloads;
+static Object* at_loot_lock;
+static bool at_loot_empty_test = false;
+static int at_loot_player_before[AT_LOOT_ITEMS + 1];
+
+static int at_count_pid_in(Object* owner, int pid)
+{
+    int quantity = 0;
+    Inventory* inventory = &(owner->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        if (inventory->items[index].item->pid == pid) {
+            quantity += inventory->items[index].quantity;
+        }
+    }
+    return quantity;
+}
+
+static const InvenRtLootState* at_loot()
+{
+    return inven_rt_loot_state();
+}
+
+// A dead rat next to the player (the corpse to loot).
+static Object* at_loot_new_corpse()
+{
+    Object* rat = at_spawn_rat(1, 1, false);
+    if (rat == NULL) {
+        return NULL;
+    }
+    critter_kill(rat, -1, true);
+    Rect rect;
+    if (obj_set_rotation(obj_dude, tile_dir(obj_dude->tile, rat->tile), &rect) == 0) {
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+    return rat;
+}
+
+// An empty human corpse next to the player (humans can hold items; the
+// original rules refuse items for other body types).
+static Object* at_loot_new_human_corpse()
+{
+    int tile = -1;
+    for (int rotation = 0; rotation < ROTATION_COUNT && tile == -1; rotation++) {
+        int candidate = tile_num_in_direction(obj_dude->tile, rotation, 1);
+        if (candidate != -1 && obj_blocking_at(NULL, candidate, obj_dude->elevation) == NULL) {
+            tile = candidate;
+        }
+    }
+    if (tile == -1) {
+        return NULL;
+    }
+
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        Object* critter;
+        if (proto_ptr(pid, &proto) == -1 || obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+        if (critter_body_type(critter) != BODY_TYPE_BIPED || critter->data.inventory.length != 0) {
+            Rect rect;
+            obj_erase_object(critter, &rect);
+            continue;
+        }
+        Rect rect;
+        obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        if (critter->sid != -1) {
+            scr_remove(critter->sid);
+            critter->sid = -1;
+        }
+        critter->data.critter.combat.team = 77;
+        critter_kill(critter, -1, true);
+        if (obj_set_rotation(obj_dude, tile_dir(obj_dude->tile, tile), &rect) == 0) {
+            tile_refresh_rect(&rect, obj_dude->elevation);
+        }
+        at_log("harness: empty corpse of a %s (pid 0x%08X) next to the player", critter_name(critter), pid);
+        return critter;
+    }
+    return NULL;
+}
+
+// Fixture items in the corpse: one stack of 5, light single items, and the
+// heaviest item there is.
+static bool at_loot_fill(Object* corpse)
+{
+    at_loot_pid_count = 0;
+    int heavyPid = -1;
+    int heavyWeight = 0;
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_ITEM << 24) | index;
+        Proto* proto;
+        if (proto_ptr(pid, &proto) == -1 || pid == PROTO_ID_MONEY || proto->item.type == ITEM_TYPE_CONTAINER || proto->item.type == ITEM_TYPE_KEY) {
+            continue;
+        }
+        int weight = proto->item.weight;
+        if (weight > heavyWeight && weight < 200) {
+            heavyWeight = weight;
+            heavyPid = pid;
+        }
+        if (weight >= 1 && weight <= 2 && at_loot_pid_count < AT_LOOT_ITEMS - 1 && at_count_pid_in(obj_dude, pid) == 0
+            && (proto->item.type == ITEM_TYPE_MISC || proto->item.type == ITEM_TYPE_DRUG || proto->item.type == ITEM_TYPE_AMMO)) {
+            at_loot_pids[at_loot_pid_count++] = pid;
+        }
+    }
+    if (at_loot_pid_count < AT_LOOT_ITEMS - 1 || heavyPid == -1) {
+        return false;
+    }
+    at_loot_pids[at_loot_pid_count++] = heavyPid;
+
+    at_loot_single = NULL;
+    at_loot_stack = NULL;
+    at_loot_heavy = NULL;
+    for (int index = 0; index < at_loot_pid_count; index++) {
+        Object* item;
+        if (obj_pid_new(&item, at_loot_pids[index]) == -1) {
+            return false;
+        }
+        int quantity = index == 0 ? 5 : 1;
+        Rect rect;
+        if (item_add_force(corpse, item, quantity) != 0) {
+            return false;
+        }
+        obj_disconnect(item, &rect);
+        if (index == 0) {
+            at_loot_stack = item;
+        } else if (index == 1) {
+            at_loot_single = item;
+            at_loot_single_pid = item->pid;
+        } else if (index == at_loot_pid_count - 1) {
+            at_loot_heavy = item;
+        }
+    }
+
+    for (int index = 0; index < at_loot_pid_count; index++) {
+        at_loot_totals[index] = at_count_pid_in(obj_dude, at_loot_pids[index]) + at_count_pid_in(corpse, at_loot_pids[index]);
+        at_loot_player_before[index] = at_count_pid_in(obj_dude, at_loot_pids[index]);
+    }
+    at_log("harness: corpse with %d stacks (stack of 5 %s, single %s, heavy %s weighing %d)",
+        corpse->data.inventory.length, object_name(at_loot_stack), object_name(at_loot_single), object_name(at_loot_heavy), heavyWeight);
+    return true;
+}
+
+static bool at_menu_loot_script(unsigned int elapsed)
+{
+    const InvenRtLootState* state = at_loot();
+    if (!state->open) {
+        return false;
+    }
+
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_log("loot script: phase %d timed out (side %d, selected %d/%d, quantity open %d)",
+            at_pb_phase, state->side, state->selected[state->side], state->count[state->side], state->quantityOpen);
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        if (!state->quantityOpen) {
+            return true;
+        }
+        return false;
+    }
+
+    if (state->quantityOpen) {
+        at_loot_quantity_seen = true;
+    }
+
+    Object* corpse = at_loot_corpse;
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 600) {
+            Object* first = corpse->data.inventory.length > 0 ? corpse->data.inventory.items[0].item : NULL;
+            at_loot_ok[0] = state->side == INVEN_RT_LOOT_SIDE_LOOT && state->selected[INVEN_RT_LOOT_SIDE_LOOT] == 0
+                && state->count[INVEN_RT_LOOT_SIDE_LOOT] == at_loot_pid_count && state->selectedItem == first && first != NULL;
+            at_log("loot: opened on side %d, item %d of %d (%s)", state->side, state->selected[state->side],
+                state->count[state->side], state->selectedItem != NULL ? object_name(state->selectedItem) : "(none)");
+            at_screenshot("loot_01_open");
+            // Equipped items aren't in the player's list.
+            at_loot_ok[1] = true;
+            Inventory* carried = &(obj_dude->data.inventory);
+            for (int index = 0; index < carried->length; index++) {
+                for (Object* equipped : at_loot_equipped) {
+                    if (equipped != NULL && carried->items[index].item == equipped) {
+                        at_loot_ok[1] = false;
+                    }
+                }
+            }
+            at_loot_presses = 0;
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        // Down 7 times through the 10 loot stacks: the list scrolls.
+        if (at_pb_ready(200)) {
+            if (at_loot_presses < 7) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+                at_loot_presses++;
+            } else {
+                at_loot_ok[2] = state->selected[INVEN_RT_LOOT_SIDE_LOOT] == 7 && state->offset[INVEN_RT_LOOT_SIDE_LOOT] > 0;
+                at_log("loot: after 7 x down: item %d, first row %d", state->selected[INVEN_RT_LOOT_SIDE_LOOT], state->offset[INVEN_RT_LOOT_SIDE_LOOT]);
+                at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+                at_loot_presses = 0;
+                at_pb_next(2);
+            }
+        }
+        break;
+    case 2:
+        if (at_pb_ready(250)) {
+            if (at_loot_presses == 0) {
+                at_loot_ok[3] = state->side == INVEN_RT_LOOT_SIDE_PLAYER;
+            }
+            if (at_loot_presses < 2) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+                at_loot_presses++;
+            } else {
+                at_loot_ok[3] = at_loot_ok[3] && state->selected[INVEN_RT_LOOT_SIDE_PLAYER] == std::min(2, state->count[INVEN_RT_LOOT_SIDE_PLAYER] - 1);
+                at_screenshot("loot_02_player_side");
+                at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+                at_pb_next(3);
+            }
+        }
+        break;
+    case 3:
+        if (at_pb_ready(250)) {
+            // Back on the loot side, on the item it was on.
+            at_loot_ok[3] = at_loot_ok[3] && state->side == INVEN_RT_LOOT_SIDE_LOOT && state->selected[INVEN_RT_LOOT_SIDE_LOOT] == 7;
+            at_log("loot: LT -> player side, down x2 -> %d; RT -> loot side on item %d", state->selected[INVEN_RT_LOOT_SIDE_PLAYER], state->selected[INVEN_RT_LOOT_SIDE_LOOT]);
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        // The single item: A moves it at once.
+        if (state->selectedItem != at_loot_single) {
+            if (at_pb_ready(150) && at_pb_tries++ < 30) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            }
+            break;
+        }
+        if (at_pb_ready(200)) {
+            at_loot_quantity_seen = false;
+            at_count_a = at_count_pid_in(obj_dude, at_loot_single_pid);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(500)) {
+            at_loot_ok[4] = !at_loot_quantity_seen && at_count_pid_in(obj_dude, at_loot_single_pid) == at_count_a + 1
+                && at_count_pid_in(corpse, at_loot_single_pid) == 0;
+            at_log("loot: single %s taken at once=%d (%s)", proto_name(at_loot_single_pid), at_loot_ok[4], state->lastMessage);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        // The stack of 5: the quantity selector, up twice -> 3, A.
+        if (state->selectedItem != at_loot_stack) {
+            if (at_pb_ready(150) && at_pb_tries++ < 30) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            }
+            break;
+        }
+        if (at_pb_ready(200)) {
+            at_count_a = at_count_pid_in(obj_dude, at_loot_stack->pid);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(7);
+        }
+        break;
+    case 7:
+        if (state->quantityOpen && at_pb_ready(400)) {
+            at_loot_ok[5] = state->quantityValue == 1 && state->quantityMax == 5;
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            at_loot_presses = 1;
+            at_pb_next(8);
+        }
+        break;
+    case 8:
+        if (at_pb_ready(250)) {
+            if (at_loot_presses < 2) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+                at_loot_presses++;
+            } else {
+                at_loot_ok[5] = at_loot_ok[5] && state->quantityValue == 3;
+                at_screenshot("loot_03_quantity");
+                at_pb_tap(GAMEPAD_BUTTON_A);
+                at_pb_next(9);
+            }
+        }
+        break;
+    case 9:
+        if (!state->quantityOpen && at_pb_ready(500)) {
+            at_loot_ok[5] = at_loot_ok[5] && at_count_pid_in(obj_dude, at_loot_stack->pid) == at_count_a + 3
+                && at_count_pid_in(corpse, at_loot_stack->pid) == 2;
+            at_log("loot: stack: 3 of 5 moved=%d (%s)", at_loot_ok[5], state->lastMessage);
+            at_pb_next(10);
+        }
+        break;
+    case 10:
+        // The rest of the stack: A, then B cancels.
+        if (state->selectedItem == NULL || state->selectedItem->pid != at_loot_stack->pid) {
+            if (at_pb_ready(150) && at_pb_tries++ < 30) {
+                at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            }
+            break;
+        }
+        if (at_pb_ready(200)) {
+            at_count_a = at_count_pid_in(corpse, at_loot_stack->pid);
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(11);
+        }
+        break;
+    case 11:
+        if (state->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(12);
+        }
+        break;
+    case 12:
+        if (!state->quantityOpen && at_pb_ready(400)) {
+            at_loot_ok[6] = state->open && at_count_pid_in(corpse, at_loot_stack->pid) == at_count_a;
+            at_log("loot: B in the quantity selector: still looting=%d, nothing moved=%d", state->open, at_count_pid_in(corpse, at_loot_stack->pid) == at_count_a);
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_next(13);
+        }
+        break;
+    case 13:
+        // Player side: the single item back into the corpse.
+        if (state->side != INVEN_RT_LOOT_SIDE_PLAYER || !at_pb_ready(250)) {
+            break;
+        }
+        if (state->selectedItem == NULL || state->selectedItem->pid != at_loot_single_pid) {
+            if (at_pb_tries++ < 60) {
+                at_pb_tap(state->selected[INVEN_RT_LOOT_SIDE_PLAYER] + 1 < state->count[INVEN_RT_LOOT_SIDE_PLAYER] && at_pb_tries < 40 ? GAMEPAD_BUTTON_DPAD_DOWN : GAMEPAD_BUTTON_DPAD_UP);
+            }
+            break;
+        }
+        at_count_a = at_count_pid_in(obj_dude, at_loot_single_pid);
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(14);
+        break;
+    case 14:
+        if (at_pb_ready(500)) {
+            // The corpse can hold only what the rat could carry (`item_add`):
+            // over that the item stays with the player, with a message.
+            bool moved = at_count_pid_in(obj_dude, at_loot_single_pid) == at_count_a - 1 && at_count_pid_in(corpse, at_loot_single_pid) == 1;
+            bool stayed = at_count_pid_in(obj_dude, at_loot_single_pid) == at_count_a && at_count_pid_in(corpse, at_loot_single_pid) == 0;
+            bool full = stayed && (critter_body_type(corpse) != BODY_TYPE_BIPED
+                || item_total_weight(corpse) + item_weight(state->selectedItem != NULL ? state->selectedItem : at_loot_heavy) > stat_level(corpse, STAT_CARRY_WEIGHT));
+            at_loot_ok[7] = !state->quantityOpen && (moved || (full && strstr(state->lastMessage, "no space") != NULL));
+            at_loot_ok[11] = full;
+            at_log("loot: single into the corpse (corpse %d of %d lbs, full=%d): moved=%d stayed=%d (%s)",
+                item_total_weight(corpse), stat_level(corpse, STAT_CARRY_WEIGHT), full, moved, stayed, state->lastMessage);
+
+            // Carry limit for Take All: everything light fits, the heavy item
+            // doesn't (fixture: the carry weight bonus, removed afterwards).
+            int lightWeight = 0;
+            Inventory* loot = &(corpse->data.inventory);
+            for (int index = 0; index < loot->length; index++) {
+                if (loot->items[index].item != at_loot_heavy) {
+                    lightWeight += item_weight(loot->items[index].item) * loot->items[index].quantity;
+                }
+            }
+            int free = lightWeight + 1;
+            if (item_weight(at_loot_heavy) > free) {
+                at_loot_carry_bonus = stat_get_bonus(obj_dude, STAT_CARRY_WEIGHT);
+                stat_set_bonus(obj_dude, STAT_CARRY_WEIGHT, at_loot_carry_bonus + item_total_weight(obj_dude) + free - stat_level(obj_dude, STAT_CARRY_WEIGHT));
+                at_loot_carry_set = true;
+                at_log("harness: carry weight set so %d more fits (light items %d, heavy %d)", free, lightWeight, item_weight(at_loot_heavy));
+            }
+            for (int index = 0; index < at_loot_pid_count; index++) {
+                at_loot_player_before[index] = at_count_pid_in(obj_dude, at_loot_pids[index]);
+            }
+            // X with the player side focused: takes from the loot side only.
+            at_count_b = obj_dude->data.inventory.length;
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(15);
+        }
+        break;
+    case 15:
+        if (at_pb_ready(600)) {
+            Inventory* loot = &(corpse->data.inventory);
+            bool onlyHeavy = loot->length == 1 && loot->items[0].item == at_loot_heavy;
+            bool noDeposit = true;
+            for (int index = 0; index < at_loot_pid_count; index++) {
+                noDeposit = noDeposit && at_count_pid_in(obj_dude, at_loot_pids[index]) >= at_loot_player_before[index];
+            }
+            at_loot_ok[8] = at_loot_carry_set ? onlyHeavy && state->takeAllLeft == 1 && strstr(state->lastMessage, "too heavy") != NULL : loot->length == 0;
+            at_loot_ok[8] = at_loot_ok[8] && noDeposit;
+            at_log("loot: X: loot left %d (only the heavy item=%d), never deposited=%d, message '%s'",
+                loot->length, onlyHeavy, noDeposit, state->lastMessage);
+            at_screenshot("loot_04_take_all");
+            if (at_loot_carry_set) {
+                stat_set_bonus(obj_dude, STAT_CARRY_WEIGHT, at_loot_carry_bonus);
+                at_loot_carry_set = false;
+            }
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// An empty corpse: A, X, D-pad, LT/RT do nothing harmful; a focus loss in
+// the screen; B closes.
+static bool at_menu_loot_empty_script(unsigned int elapsed)
+{
+    const InvenRtLootState* state = at_loot();
+    if (!state->open) {
+        return false;
+    }
+
+    static const GamepadButton presses[] = {
+        GAMEPAD_BUTTON_A, GAMEPAD_BUTTON_X, GAMEPAD_BUTTON_DPAD_DOWN, GAMEPAD_BUTTON_DPAD_UP,
+        GAMEPAD_BUTTON_LEFT_TRIGGER, GAMEPAD_BUTTON_DPAD_DOWN, GAMEPAD_BUTTON_RIGHT_TRIGGER, GAMEPAD_BUTTON_X
+    };
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_loot_ok[9] = state->count[INVEN_RT_LOOT_SIDE_LOOT] == 0 && state->selectedItem == NULL && state->side == INVEN_RT_LOOT_SIDE_LOOT;
+            at_count_a = obj_dude->data.inventory.length;
+            at_loot_presses = 0;
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (at_pb_ready(250)) {
+            if (at_loot_presses < 8) {
+                at_pb_tap(presses[at_loot_presses++]);
+            } else {
+                at_loot_ok[9] = at_loot_ok[9] && state->open && at_loot_corpse->data.inventory.length == 0;
+                at_screenshot("loot_05_empty");
+                // Focus lost while the screen is open.
+                at_focus_lost = true;
+                at_focus_regained = false;
+                at_focus_polls = 0;
+                at_focus_lost_at = SDL_GetTicks();
+                SDL_Event event;
+                memset(&event, 0, sizeof(event));
+                event.type = SDL_WINDOWEVENT;
+                event.window.event = SDL_WINDOWEVENT_FOCUS_LOST;
+                SDL_PushEvent(&event);
+                at_pb_next(2);
+            }
+        }
+        break;
+    case 2:
+        if (at_focus_regained && SDL_GetTicks() - at_focus_lost_at > 2200) {
+            at_loot_ok[10] = state->open && at_loot_corpse->data.inventory.length == 0;
+            at_focus_lost = false;
+            // Into the empty corpse from the player side, and back.
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (state->side != INVEN_RT_LOOT_SIDE_PLAYER || !at_pb_ready(200)) {
+            break;
+        }
+        if (state->selectedItem == NULL || state->selectedItem->pid != at_loot_single_pid) {
+            if (at_pb_tries++ < 60) {
+                at_pb_tap(state->selected[INVEN_RT_LOOT_SIDE_PLAYER] + 1 < state->count[INVEN_RT_LOOT_SIDE_PLAYER] && at_pb_tries < 40 ? GAMEPAD_BUTTON_DPAD_DOWN : GAMEPAD_BUTTON_DPAD_UP);
+            }
+            break;
+        }
+        at_count_a = at_count_pid_in(obj_dude, at_loot_single_pid);
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(4);
+        break;
+    case 4:
+        if (at_pb_ready(500)) {
+            at_loot_ok[12] = at_count_pid_in(at_loot_corpse, at_loot_single_pid) == 1 && at_count_pid_in(obj_dude, at_loot_single_pid) == at_count_a - 1;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(300)) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        if (at_pb_ready(500)) {
+            at_loot_ok[13] = at_count_pid_in(at_loot_corpse, at_loot_single_pid) == 0 && at_count_pid_in(obj_dude, at_loot_single_pid) == at_count_a;
+            at_log("loot: empty corpse: put the %s in=%d, took it back=%d", proto_name(at_loot_single_pid), at_loot_ok[12], at_loot_ok[13]);
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// The 50,000 caps: A opens the selector; RT tapped (+100), RT held (keeps
+// adding 100s), LT tapped (-100), A confirms.
+static int at_loot_caps_max = 0;
+static int at_loot_caps_tap = 0;
+static int at_loot_caps_held = 0;
+static int at_loot_caps_value = 0;
+static int at_loot_caps_all = 0;
+
+static bool at_menu_loot_caps_script(unsigned int elapsed)
+{
+    const InvenRtLootState* state = at_loot();
+    if (!state->open) {
+        return false;
+    }
+    if (at_pb_phase > 0 && SDL_GetTicks() - at_pb_phase_time > 8000) {
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        return !state->quantityOpen;
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 500) {
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (state->quantityOpen && at_pb_ready(400)) {
+            at_loot_caps_max = state->quantityMax;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(2);
+        }
+        break;
+    case 2:
+        if (at_pb_ready(300)) {
+            at_loot_caps_tap = state->quantityValue;
+            // Held: after the repeat delay, 100 more every repeat.
+            at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+            at_pb_last_press = SDL_GetTicks();
+            at_pb_next(3);
+        }
+        break;
+    case 3:
+        if (at_pb_ready(1500)) {
+            at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+            at_pb_last_press = SDL_GetTicks();
+            at_pb_next(4);
+        }
+        break;
+    case 4:
+        if (at_pb_ready(300)) {
+            at_loot_caps_held = state->quantityValue;
+            at_screenshot("loot_06_caps");
+            at_pb_tap(GAMEPAD_BUTTON_LEFT_TRIGGER);
+            at_pb_next(5);
+        }
+        break;
+    case 5:
+        if (at_pb_ready(300)) {
+            at_loot_caps_value = state->quantityValue;
+            at_log("loot: caps selector max %d, RT tap -> %d, RT held -> %d, LT tap -> %d",
+                at_loot_caps_max, at_loot_caps_tap, at_loot_caps_held, at_loot_caps_value);
+            at_pb_tap(GAMEPAD_BUTTON_Y);
+            at_pb_next(7);
+        }
+        break;
+    case 7:
+        // Y: the whole stack, confirmed with A.
+        if (at_pb_ready(300)) {
+            at_loot_caps_all = state->quantityValue;
+            at_screenshot("loot_07_caps_all");
+            at_pb_tap(GAMEPAD_BUTTON_A);
+            at_pb_next(6);
+        }
+        break;
+    case 6:
+        if (!state->quantityOpen && at_pb_ready(400)) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static void at_loot_open(AtMenuScript* script)
+{
+    at_pb_next(0);
+    at_pb_last_press = SDL_GetTicks();
+    at_expect_menu(NULL, script);
+    at_press(GAMEPAD_BUTTON_A);
+}
+
+static bool step_loot(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_move_to_clear_spot();
+        memset(at_loot_ok, 0, sizeof(at_loot_ok));
+        at_loot_corpse = at_loot_new_corpse();
+        if (at_loot_corpse == NULL || !at_loot_fill(at_loot_corpse)) {
+            at_check(C_LOOT_FOCUS, false, "could not set up the corpse fixture");
+            return true;
+        }
+        at_loot_equipped[0] = inven_left_hand(obj_dude);
+        at_loot_equipped[1] = inven_right_hand(obj_dude);
+        at_loot_equipped[2] = inven_worn(obj_dude);
+        at_loot_phase = 0;
+        at_loot_time = now;
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_focus_lost = false;
+        at_menu_expected = false;
+        if (at_loot_carry_set) {
+            stat_set_bonus(obj_dude, STAT_CARRY_WEIGHT, at_loot_carry_bonus);
+            at_loot_carry_set = false;
+        }
+        at_check(C_LOOT_FOCUS, at_results[C_LOOT_FOCUS] == 1, "timed out in phase %d", at_loot_phase);
+        return true;
+    }
+
+    at_heal();
+    switch (at_loot_phase) {
+    case 0:
+        // A on the corpse opens the loot screen.
+        if (now - at_loot_time < 500 || !at_aim_released() || anim_busy(obj_dude)) {
+            break;
+        }
+        at_log("loot: A target is %s", rt_get_interact_target() != NULL ? object_name(rt_get_interact_target()) : "(none)");
+        at_loot_open(at_menu_loot_script);
+        at_loot_phase = 1;
+        at_loot_time = now;
+        break;
+    case 1:
+        if (!at_menu_seen || at_loot()->open) {
+            break;
+        }
+        at_menu_expected = false;
+        // Nothing done in the screen reaches the game afterwards.
+        at_loot_attacks = rt_get_stats()->playerAttacks;
+        at_loot_interactions = rt_context_get_stats()->interactions;
+        at_loot_reloads = rt_get_stats()->reloadsStarted;
+        at_loot_lock = rt_get_lock();
+        at_loot_phase = 2;
+        at_loot_time = now;
+        break;
+    case 2: {
+        if (now - at_loot_time < 1500) {
+            break;
+        }
+        bool conserved = true;
+        char line[300] = "";
+        for (int index = 0; index < at_loot_pid_count; index++) {
+            int total = at_count_pid_in(obj_dude, at_loot_pids[index]) + at_count_pid_in(at_loot_corpse, at_loot_pids[index]);
+            conserved = conserved && total == at_loot_totals[index];
+            if (total != at_loot_totals[index]) {
+                char part[64];
+                snprintf(part, sizeof(part), "%s %d->%d ", proto_name(at_loot_pids[index]), at_loot_totals[index], total);
+                SDL_strlcat(line, part, sizeof(line));
+            }
+        }
+        bool quiet = rt_get_stats()->playerAttacks == at_loot_attacks && rt_context_get_stats()->interactions == at_loot_interactions
+            && rt_get_stats()->reloadsStarted == at_loot_reloads && rt_get_lock() == at_loot_lock && !rt_is_reloading();
+        at_check(C_LOOT_FOCUS, at_loot_ok[0], "opened on the loot side, first of %d items highlighted=%d", at_loot_pid_count, at_loot_ok[0]);
+        at_check(C_LOOT_NAV, at_loot_ok[2] && at_loot_ok[3],
+            "7 x down scrolled the 10-item loot list=%d; LT player side, down x2, RT back on the same loot item=%d", at_loot_ok[2], at_loot_ok[3]);
+        at_check(C_LOOT_QUANTITY, at_loot_ok[5] && at_loot_ok[6],
+            "stack of 5: selector opened on 1 of 5, up x2 -> 3, A moved exactly 3=%d; B in the selector moved nothing, loot stayed open=%d", at_loot_ok[5], at_loot_ok[6]);
+        at_check(C_LOOT_TAKE_ALL, at_loot_ok[8],
+            "X with the player side focused took the loot side's light items, left the too-heavy one with a message, deposited nothing=%d", at_loot_ok[8]);
+        at_check(C_LOOT_SAFETY, conserved && at_loot_ok[1] && quiet && at_loot_ok[7],
+            "item totals conserved=%d %s; equipped items not in the player's list=%d; no attack/interaction/reload/lock change after closing=%d; deposit into the rat corpse refused by the original rules (rats hold no items; over its carry weight=%d) with a message, nothing lost=%d",
+            conserved, line, at_loot_ok[1], quiet, at_loot_ok[11], at_loot_ok[7]);
+
+        // An empty corpse.
+        Rect rect;
+        obj_erase_object(at_loot_corpse, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        at_loot_corpse = at_loot_new_human_corpse();
+        if (at_loot_corpse == NULL) {
+            at_check(C_LOOT_EMPTY, false, "no empty corpse fixture");
+            return true;
+        }
+        at_loot_phase = 3;
+        at_loot_time = now;
+        break;
+    }
+    case 3:
+        if (now - at_loot_time < 500 || !at_aim_released() || anim_busy(obj_dude)) {
+            break;
+        }
+        at_loot_open(at_menu_loot_empty_script);
+        at_loot_phase = 4;
+        break;
+    case 4:
+        if (!at_menu_seen || at_loot()->open) {
+            break;
+        }
+        at_menu_expected = false;
+        at_check(C_LOOT_EMPTY, at_loot_ok[9], "empty corpse: nothing selected, A/X/D-pad/LT/RT harmless, still open=%d; B closed it", at_loot_ok[9]);
+        at_check(C_LOOT_TRANSFER, at_loot_ok[4] && at_loot_ok[12] && at_loot_ok[13],
+            "single item taken at once (no quantity selector)=%d; from the player side put into the empty corpse=%d and taken back=%d",
+            at_loot_ok[4], at_loot_ok[12], at_loot_ok[13]);
+        at_check(C_MODAL_INTERRUPT, at_aim_disconnect_ok && at_loot_ok[10],
+            "AIMED SHOT: disconnect with RT/D-pad held kept the screen's state, no phantom press=%d; loot screen open through a focus loss (%d polls), nothing moved, B closed=%d",
+            at_aim_disconnect_ok, at_focus_polls, at_loot_ok[10]);
+        {
+            Rect rect;
+            obj_erase_object(at_loot_corpse, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_loot_corpse = NULL;
+        }
+        // A corpse with 50,000 caps.
+        at_loot_corpse = at_loot_new_human_corpse();
+        if (at_loot_corpse == NULL) {
+            at_check(C_LOOT_BIG_STACK, false, "no corpse fixture for the caps");
+            return true;
+        }
+        {
+            Object* caps;
+            Rect rect;
+            if (obj_pid_new(&caps, PROTO_ID_MONEY) == -1 || item_add_force(at_loot_corpse, caps, 50000) != 0) {
+                at_check(C_LOOT_BIG_STACK, false, "could not put 50,000 caps in the corpse");
+                return true;
+            }
+            obj_disconnect(caps, &rect);
+        }
+        at_count_a = item_caps_total(obj_dude);
+        at_loot_phase = 5;
+        at_loot_time = now;
+        break;
+    case 5:
+        if (now - at_loot_time < 500 || !at_aim_released() || anim_busy(obj_dude)) {
+            break;
+        }
+        at_loot_open(at_menu_loot_caps_script);
+        at_loot_phase = 6;
+        break;
+    case 6:
+        if (!at_menu_seen || at_loot()->open) {
+            break;
+        }
+        at_menu_expected = false;
+        {
+            int taken = item_caps_total(obj_dude) - at_count_a;
+            int left = item_caps_total(at_loot_corpse);
+            bool moved = at_loot_caps_all == 50000 && taken == 50000 && left == 0;
+            at_check(C_LOOT_BIG_STACK, at_loot_caps_max == 50000 && at_loot_caps_tap == 101 && at_loot_caps_held >= 101 + 500
+                    && (at_loot_caps_held - 101) % 100 == 0 && at_loot_caps_value == at_loot_caps_held - 100 && moved,
+                "selector max %d (stack 50000); RT tap 1 -> %d; RT held 1.5 s -> %d (by 100s); LT tap -> %d; Y -> %d; confirmed: took %d in one go, %d left in the corpse",
+                at_loot_caps_max, at_loot_caps_tap, at_loot_caps_held, at_loot_caps_value, at_loot_caps_all, taken, left);
+        }
+        {
+            Rect rect;
+            obj_erase_object(at_loot_corpse, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            at_loot_corpse = NULL;
+        }
+        return true;
+    }
+    return false;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -5505,17 +9058,27 @@ static const AtStep at_steps[] = {
     { "melee reach", step_range, 15000 },
     { "blocked line of fire", step_blocked, 8000 },
     { "companion and simultaneous actions", step_companion, 45000 },
+    { "aimed shot: entry and anatomy", step_aim_entry, 40000 },
+    { "aimed shot: queue and execution", step_aim_queue, 60000 },
+    { "aimed shot: hit chances and criticals", step_aim_odds, 20000 },
+    { "aimed shot: cancel, dead target, interruptions", step_aim_interrupt, 120000 },
+    { "aimed shot: limits, burst, disconnect", step_aim_limits, 90000 },
     { "combat summary", step_combat_summary, 8000 },
     { "interaction", step_interact, 20000 },
+    { "interaction cycling (D-pad)", step_int_cycle, 40000 },
+    { "loot screen (controller)", step_loot, 90000 },
     { "contextual skills", step_skills, 60000 },
     { "chems and no healing on A", step_chem, 30000 },
     { "controller disconnect", step_disconnect, 12000 },
     { "focus loss", step_focus, 12000 },
     { "Pip-Boy shortcuts", step_pipboy_shortcuts, 40000 },
     { "Pip-Boy tabs and actions", step_pipboy, 120000 },
+    { "favorites assignment (Pip-Boy Y)", step_fav_assign, 90000 },
+    { "favorites (direct D-pad)", step_fav_use, 60000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
     { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
+    { "favorites after load", step_fav_persist, 3000 },
     { "map transition", step_map_change, 30000 },
     { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },

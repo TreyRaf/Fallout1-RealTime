@@ -2563,6 +2563,31 @@ int combat_rt_compute_attack(Attack* attack)
     return compute_attack(attack);
 }
 
+// RT: The pieces of the original called shot window, for the controller's
+// aimed shot screen: the body part name for this critter's art (combat.msg),
+// the big to-hit digits, and the window's two columns of body parts.
+char* combat_rt_loc_name(Object* critter, int hitLocation)
+{
+    return combat_get_loc_name(critter, hitLocation);
+}
+
+void combat_rt_print_tohit(unsigned char* dest, int destPitch, int accuracy)
+{
+    print_tohit(dest, destPitch, accuracy);
+}
+
+// `index` 0-3: left column (top to bottom), 4-7: right column.
+int combat_rt_called_shot_location(int index)
+{
+    return index < 4 ? hit_loc_left[index] : hit_loc_right[index - 4];
+}
+
+// The y of a row of the called shot window, as the original draws it.
+int combat_rt_called_shot_row_y(int row)
+{
+    return call_ty[row] - 86;
+}
+
 // 0x420EB0
 int combat_bullet_start(const Object* a1, const Object* a2)
 {

@@ -1,6 +1,7 @@
 #include "game/inventry.h"
 
 #include <assert.h>
+#include <stdarg.h>
 #include <limits.h>
 #include <stdio.h>
 #include <string.h>
@@ -29,6 +30,7 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/reaction.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/skill.h"
@@ -39,6 +41,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -214,6 +217,7 @@ static void barter_move_inventory(Object* a1, int quantity, int a3, int a4, Obje
 static void barter_move_from_table_inventory(Object* a1, int quantity, int a3, Object* a4, Object* a5, bool a6);
 static void display_table_inventories(int win, Object* a2, Object* a3, int a4);
 static int do_move_timer(int inventoryWindowType, Object* item, int a3);
+static int loot_transfer(Object* item, Object* target, bool fromDude, int quantity, bool quiet);
 static int setup_move_timer_win(int inventoryWindowType, Object* item);
 static int exit_move_timer_win(int inventoryWindowType);
 
@@ -221,6 +225,17 @@ static int exit_move_timer_win(int inventoryWindowType);
 //
 // 0x50563C
 static int inven_cur_disp = 6;
+
+// RT: controller layer of the loot screen (see `inven_rt_loot_state`).
+static InvenRtLootState loot_rt;
+
+// RT: the move items counter shows up to 7 digits (stacks such as caps can
+// be far above the original 999); LT/RT held repeat after the delay.
+#define INVEN_RT_AMOUNT_DIGITS 7
+#define INVEN_RT_AMOUNT_MAX 9999999
+#define INVEN_RT_AMOUNT_REPEAT_DELAY 350
+#define INVEN_RT_AMOUNT_REPEAT_RATE 70
+static int mt_digits = 3;
 
 // 0x505640
 static Object* inven_dude = NULL;
@@ -3610,6 +3625,246 @@ void inven_action_cursor(int keyCode, int inventoryWindowType)
 }
 
 // 0x466B10
+// -----------------------------------------------------------------------------
+// RT: loot screen controller layer
+// -----------------------------------------------------------------------------
+
+// The info panel on the empty plate between the two body views.
+#define LOOT_RT_PANEL_X 140
+#define LOOT_RT_PANEL_Y 172
+#define LOOT_RT_PANEL_WIDTH 262
+#define LOOT_RT_PANEL_HEIGHT 52
+
+static unsigned int loot_rt_message_until = 0;
+
+const InvenRtLootState* inven_rt_loot_state()
+{
+    return &loot_rt;
+}
+
+static void loot_rt_say(const char* format, ...)
+{
+    va_list args;
+    va_start(args, format);
+    vsnprintf(loot_rt.lastMessage, sizeof(loot_rt.lastMessage), format, args);
+    va_end(args);
+    loot_rt_message_until = SDL_GetTicks() + 3500;
+    rt_log("loot: %s", loot_rt.lastMessage);
+}
+
+static Inventory* loot_rt_list(int side)
+{
+    return side == INVEN_RT_LOOT_SIDE_PLAYER ? pud : target_pud;
+}
+
+static int* loot_rt_offset(int side)
+{
+    return side == INVEN_RT_LOOT_SIDE_PLAYER ? &(stack_offset[curr_stack]) : &(target_stack_offset[target_curr_stack]);
+}
+
+// Keeps both selections inside their lists (after a transfer an item may be
+// gone) and on screen.
+static void loot_rt_clamp()
+{
+    for (int side = 0; side < 2; side++) {
+        Inventory* list = loot_rt_list(side);
+        int count = list->length;
+        int* offset = loot_rt_offset(side);
+        int* selected = &(loot_rt.selected[side]);
+
+        *selected = std::clamp(*selected, 0, std::max(count - 1, 0));
+        *offset = std::clamp(*offset, 0, std::max(count - inven_cur_disp, 0));
+        if (count > 0) {
+            if (*selected < *offset) {
+                *offset = *selected;
+            } else if (*selected >= *offset + inven_cur_disp) {
+                *offset = *selected - inven_cur_disp + 1;
+            }
+        }
+
+        loot_rt.offset[side] = *offset;
+        loot_rt.count[side] = count;
+    }
+
+    Inventory* list = loot_rt_list(loot_rt.side);
+    if (list->length > 0) {
+        InventoryItem* entry = &(list->items[loot_rt.selected[loot_rt.side]]);
+        loot_rt.selectedItem = entry->item;
+        loot_rt.selectedQuantity = entry->quantity;
+    } else {
+        loot_rt.selectedItem = NULL;
+        loot_rt.selectedQuantity = 0;
+    }
+}
+
+static void loot_rt_text(unsigned char* buffer, int x, int y, const char* text, int color, int width)
+{
+    text_to_buf(buffer + INVENTORY_LOOT_WINDOW_WIDTH * y + x, text, width, INVENTORY_LOOT_WINDOW_WIDTH, color);
+}
+
+static void loot_rt_text_centered(unsigned char* buffer, int y, const char* text, int color)
+{
+    int width = std::min(text_width(text), LOOT_RT_PANEL_WIDTH);
+    loot_rt_text(buffer, LOOT_RT_PANEL_X + (LOOT_RT_PANEL_WIDTH - width) / 2, y, text, color, LOOT_RT_PANEL_WIDTH);
+}
+
+// Both lists, the selection boxes (bright on the focused side, dim on the
+// other) and the info panel.
+static void loot_rt_draw()
+{
+    loot_rt_clamp();
+    display_target_inventory(target_stack_offset[target_curr_stack], -1, target_pud, INVENTORY_WINDOW_TYPE_LOOT);
+    display_inventory(stack_offset[curr_stack], -1, INVENTORY_WINDOW_TYPE_LOOT);
+
+    unsigned char* buffer = win_get_buf(i_wid);
+    int bright = colorTable[32747];
+    int green = colorTable[992];
+    int dim = colorTable[8804];
+    int amber = colorTable[(31 << 10) | (24 << 5) | 0];
+
+    for (int side = 0; side < 2; side++) {
+        if (loot_rt.count[side] == 0) {
+            continue;
+        }
+        int x = side == INVEN_RT_LOOT_SIDE_PLAYER ? INVENTORY_LOOT_LEFT_SCROLLER_X : INVENTORY_LOOT_RIGHT_SCROLLER_X;
+        int y = (side == INVEN_RT_LOOT_SIDE_PLAYER ? INVENTORY_LOOT_LEFT_SCROLLER_Y : INVENTORY_LOOT_RIGHT_SCROLLER_Y)
+            + INVENTORY_SLOT_HEIGHT * (loot_rt.selected[side] - loot_rt.offset[side]);
+        bool focused = side == loot_rt.side;
+        draw_box(buffer, INVENTORY_LOOT_WINDOW_WIDTH, x, y, x + INVENTORY_SLOT_WIDTH - 1, y + INVENTORY_SLOT_HEIGHT - 1, focused ? bright : dim);
+        if (focused) {
+            draw_box(buffer, INVENTORY_LOOT_WINDOW_WIDTH, x + 1, y + 1, x + INVENTORY_SLOT_WIDTH - 2, y + INVENTORY_SLOT_HEIGHT - 2, bright);
+        }
+    }
+
+    // The panel's background comes from the window art.
+    CacheEntry* handle;
+    unsigned char* data = art_ptr_lock_data(art_id(OBJ_TYPE_INTERFACE, 114, 0, 0, 0), 0, 0, &handle);
+    if (data != NULL) {
+        int offset = INVENTORY_LOOT_WINDOW_WIDTH * LOOT_RT_PANEL_Y + LOOT_RT_PANEL_X;
+        buf_to_buf(data + offset, LOOT_RT_PANEL_WIDTH, LOOT_RT_PANEL_HEIGHT, INVENTORY_LOOT_WINDOW_WIDTH, buffer + offset, INVENTORY_LOOT_WINDOW_WIDTH);
+        art_ptr_unlock(handle);
+    }
+
+    int oldFont = text_curr();
+    text_font(101);
+    int line = text_height() + 2;
+    int y = LOOT_RT_PANEL_Y;
+    bool playerSide = loot_rt.side == INVEN_RT_LOOT_SIDE_PLAYER;
+    const char* left = playerSide ? "< YOUR ITEMS (LT)" : "Your items (LT)";
+    const char* right = playerSide ? "Loot (RT)" : "(RT) LOOT >";
+    loot_rt_text(buffer, LOOT_RT_PANEL_X, y, left, playerSide ? bright : dim, LOOT_RT_PANEL_WIDTH / 2);
+    loot_rt_text(buffer, LOOT_RT_PANEL_X + LOOT_RT_PANEL_WIDTH - text_width(right), y, right, playerSide ? dim : bright, LOOT_RT_PANEL_WIDTH / 2);
+    y += line;
+
+    char text[96];
+    if (loot_rt.selectedItem != NULL) {
+        if (loot_rt.selectedQuantity > 1) {
+            snprintf(text, sizeof(text), "%s x%d", object_name(loot_rt.selectedItem), loot_rt.selectedQuantity);
+        } else {
+            snprintf(text, sizeof(text), "%s", object_name(loot_rt.selectedItem));
+        }
+    } else {
+        snprintf(text, sizeof(text), "%s", playerSide ? "You carry nothing to give." : "Nothing here.");
+    }
+    loot_rt_text_centered(buffer, y, text, green);
+    y += line;
+
+    if (loot_rt.lastMessage[0] != '\0' && SDL_GetTicks() < loot_rt_message_until) {
+        loot_rt_text_centered(buffer, y, loot_rt.lastMessage, amber);
+    }
+    y += line;
+
+    loot_rt_text_centered(buffer, y, "A Move   X Take all   B Close", green);
+    text_font(oldFont);
+
+    win_draw(i_wid);
+}
+
+// A: the selected item to the other side; a stack asks how many first.
+// Returns the result of `loot_transfer` (1 caught stealing, 2 moved).
+static int loot_rt_move_selected()
+{
+    loot_rt_clamp();
+    int side = loot_rt.side;
+    Inventory* list = loot_rt_list(side);
+    if (list->length == 0) {
+        loot_rt_say(side == INVEN_RT_LOOT_SIDE_PLAYER ? "You carry nothing to give." : "Nothing to take.");
+        return 0;
+    }
+
+    InventoryItem* entry = &(list->items[loot_rt.selected[side]]);
+    Object* item = entry->item;
+    int quantity = entry->quantity;
+    char name[64];
+    SDL_strlcpy(name, object_name(item), sizeof(name));
+
+    int amount = 1;
+    if (quantity > 1) {
+        amount = do_move_timer(INVENTORY_WINDOW_TYPE_MOVE_ITEMS, item, quantity);
+        if (amount == -1) {
+            loot_rt_say("Nothing moved.");
+            return 0;
+        }
+    }
+
+    // As the mouse path counts them (used when stealing).
+    gStealCount += 1;
+    gStealSize += item_size(stack[curr_stack]);
+
+    bool fromDude = side == INVEN_RT_LOOT_SIDE_PLAYER;
+    int rc = loot_transfer(item, target_stack[target_curr_stack], fromDude, amount, false);
+    if (rc == 2) {
+        loot_rt.transfers++;
+        gsound_play_sfx_file("iputdown");
+        if (amount > 1) {
+            loot_rt_say(fromDude ? "Put in %d x %s." : "Took %d x %s.", amount, name);
+        } else {
+            loot_rt_say(fromDude ? "Put in the %s." : "Took the %s.", name);
+        }
+    } else if (rc == 0) {
+        loot_rt_say(fromDude ? "There is no space left for that." : "You can't carry that much.");
+    }
+    return rc;
+}
+
+// X: every stack the player can carry from the loot side, whole stacks,
+// never anything back. What doesn't fit stays.
+static void loot_rt_take_all()
+{
+    if (gIsSteal) {
+        loot_rt_say("You can't take everything while stealing.");
+        return;
+    }
+
+    Object* source = target_stack[target_curr_stack];
+    int moved = 0;
+    int left = 0;
+    // From the end, so removed stacks don't shift the ones still to come.
+    for (int index = target_pud->length - 1; index >= 0; index--) {
+        if (index >= target_pud->length) {
+            continue;
+        }
+        InventoryItem* entry = &(target_pud->items[index]);
+        if (loot_transfer(entry->item, source, false, entry->quantity, true) == 2) {
+            moved++;
+        } else {
+            left++;
+        }
+    }
+
+    loot_rt.takeAlls++;
+    loot_rt.takeAllLeft = left;
+    if (moved == 0 && left == 0) {
+        loot_rt_say("Nothing to take.");
+    } else if (left > 0) {
+        gsound_play_sfx_file(moved > 0 ? "iputdown" : "iisxxxx1");
+        loot_rt_say("Took %d, left %d: too heavy to carry.", moved, left);
+    } else {
+        gsound_play_sfx_file("iputdown");
+        loot_rt_say("Took everything.");
+    }
+}
+
 int loot_container(Object* a1, Object* a2)
 {
     // 0x46E708
@@ -3796,6 +4051,16 @@ int loot_container(Object* a1, Object* a2)
     display_body(a2->fid, INVENTORY_WINDOW_TYPE_LOOT);
     inven_set_mouse(INVENTORY_WINDOW_CURSOR_HAND);
 
+    // RT: the controller drives the screen with keys (see `inventry.h`);
+    // the loot side is focused, on its first item.
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    gamepad_set_menu_key_mode(true);
+    memset(&loot_rt, 0, sizeof(loot_rt));
+    loot_rt.open = true;
+    loot_rt.side = INVEN_RT_LOOT_SIDE_LOOT;
+    loot_rt_draw();
+    rt_log("loot: open (%d items here, %d carried)", loot_rt.count[INVEN_RT_LOOT_SIDE_LOOT], loot_rt.count[INVEN_RT_LOOT_SIDE_PLAYER]);
+
     bool isCaughtStealing = false;
     int stealingXp = 0;
     int stealingXpBonus = 10;
@@ -3818,6 +4083,40 @@ int loot_container(Object* a1, Object* a2)
 
         if (game_user_wants_to_quit != 0) {
             break;
+        }
+
+        // RT: controller keys first; whatever they handle goes no further.
+        bool rtHandled = true;
+        switch (keyCode) {
+        case GAMEPAD_KEY_LT:
+        case GAMEPAD_KEY_RT:
+            loot_rt.side = keyCode == GAMEPAD_KEY_LT ? INVEN_RT_LOOT_SIDE_PLAYER : INVEN_RT_LOOT_SIDE_LOOT;
+            gsound_play_sfx_file("ib1p1xx1");
+            break;
+        case KEY_ARROW_UP:
+        case KEY_ARROW_DOWN:
+            loot_rt.selected[loot_rt.side] += keyCode == KEY_ARROW_DOWN ? 1 : -1;
+            break;
+        case KEY_RETURN: {
+            int rc = loot_rt_move_selected();
+            if (rc == 1) {
+                isCaughtStealing = true;
+            } else if (rc == 2 && gIsSteal) {
+                stealingXp += stealingXpBonus;
+                stealingXpBonus += 10;
+            }
+            break;
+        }
+        case GAMEPAD_KEY_X:
+            loot_rt_take_all();
+            break;
+        default:
+            rtHandled = false;
+            break;
+        }
+        if (rtHandled) {
+            loot_rt_draw();
+            keyCode = -1;
         }
 
         if (keyCode == KEY_UPPERCASE_A) {
@@ -3991,9 +4290,22 @@ int loot_container(Object* a1, Object* a2)
             break;
         }
 
+        // RT: anything the original handling did (mouse transfers, another
+        // corpse on the tile) redraws the lists: the selection follows.
+        if (keyCode != -1) {
+            if (keyCode == KEY_PAGE_UP || keyCode == KEY_PAGE_DOWN) {
+                loot_rt.selected[INVEN_RT_LOOT_SIDE_LOOT] = 0;
+            }
+            loot_rt_draw();
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
     }
+
+    loot_rt.open = false;
+    gamepad_set_menu_key_mode(keyModeWas);
+    rt_log("loot: closed (%d transfers, %d take all)", loot_rt.transfers, loot_rt.takeAlls);
 
     if (critterCount != 0) {
         obj_delete_list(critters);
@@ -4165,7 +4477,6 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
     }
 
     int rc = 0;
-    MessageListItem messageListItem;
 
     if (a4) {
         if (mouseHitTestInWindow(i_wid, INVENTORY_LOOT_RIGHT_SCROLLER_X, INVENTORY_LOOT_RIGHT_SCROLLER_Y, INVENTORY_LOOT_RIGHT_SCROLLER_MAX_X, INVENTORY_SLOT_HEIGHT * inven_cur_disp + INVENTORY_LOOT_RIGHT_SCROLLER_Y)) {
@@ -4177,23 +4488,7 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
             }
 
             if (quantityToMove != -1) {
-                if (gIsSteal) {
-                    if (skill_check_stealing(inven_dude, a3, a1, true) == 0) {
-                        rc = 1;
-                    }
-                }
-
-                if (rc != 1) {
-                    if (item_move(inven_dude, a3, a1, quantityToMove) != -1) {
-                        rc = 2;
-                    } else {
-                        // There is no space left for that item.
-                        messageListItem.num = 26;
-                        if (message_search(&inventry_message_file, &messageListItem)) {
-                            display_print(messageListItem.text);
-                        }
-                    }
-                }
+                rc = loot_transfer(a1, a3, true, quantityToMove, false);
             }
         }
     } else {
@@ -4206,34 +4501,69 @@ int move_inventory(Object* a1, int a2, Object* a3, bool a4)
             }
 
             if (quantityToMove != -1) {
-                if (gIsSteal) {
-                    if (skill_check_stealing(inven_dude, a3, a1, false) == 0) {
-                        rc = 1;
-                    }
-                }
-
-                if (rc != 1) {
-                    if (item_move(a3, inven_dude, a1, quantityToMove) == 0) {
-                        if ((a1->flags & OBJECT_IN_RIGHT_HAND) != 0) {
-                            a3->fid = art_id(FID_TYPE(a3->fid), a3->fid & 0xFFF, FID_ANIM_TYPE(a3->fid), 0, a3->rotation + 1);
-                        }
-
-                        a3->flags &= ~OBJECT_EQUIPPED;
-
-                        rc = 2;
-                    } else {
-                        // You cannot pick that up. You are at your maximum weight capacity.
-                        messageListItem.num = 25;
-                        if (message_search(&inventry_message_file, &messageListItem)) {
-                            display_print(messageListItem.text);
-                        }
-                    }
-                }
+                rc = loot_transfer(a1, a3, false, quantityToMove, false);
             }
         }
     }
 
     inven_set_mouse(INVENTORY_WINDOW_CURSOR_HAND);
+
+    return rc;
+}
+
+// The transfer part of `move_inventory` (RT: shared with the controller
+// layer): `quantity` of `item` from the player to `target` (`fromDude`) or
+// back, with the steal check when stealing. Returns 1 when caught stealing,
+// 2 when the items moved, 0 otherwise. `quiet` leaves out the "no space"
+// and "too heavy" messages (Take All reports once instead).
+static int loot_transfer(Object* item, Object* target, bool fromDude, int quantity, bool quiet)
+{
+    int rc = 0;
+    MessageListItem messageListItem;
+
+    if (fromDude) {
+        if (gIsSteal) {
+            if (skill_check_stealing(inven_dude, target, item, true) == 0) {
+                rc = 1;
+            }
+        }
+
+        if (rc != 1) {
+            if (item_move(inven_dude, target, item, quantity) != -1) {
+                rc = 2;
+            } else if (!quiet) {
+                // There is no space left for that item.
+                messageListItem.num = 26;
+                if (message_search(&inventry_message_file, &messageListItem)) {
+                    display_print(messageListItem.text);
+                }
+            }
+        }
+    } else {
+        if (gIsSteal) {
+            if (skill_check_stealing(inven_dude, target, item, false) == 0) {
+                rc = 1;
+            }
+        }
+
+        if (rc != 1) {
+            if (item_move(target, inven_dude, item, quantity) == 0) {
+                if ((item->flags & OBJECT_IN_RIGHT_HAND) != 0) {
+                    target->fid = art_id(FID_TYPE(target->fid), target->fid & 0xFFF, FID_ANIM_TYPE(target->fid), 0, target->rotation + 1);
+                }
+
+                target->flags &= ~OBJECT_EQUIPPED;
+
+                rc = 2;
+            } else if (!quiet) {
+                // You cannot pick that up. You are at your maximum weight capacity.
+                messageListItem.num = 25;
+                if (message_search(&inventry_message_file, &messageListItem)) {
+                    display_print(messageListItem.text);
+                }
+            }
+        }
+    }
 
     return rc;
 }
@@ -5077,22 +5407,24 @@ void draw_amount(int value, int inventoryWindowType)
     unsigned char* windowBuffer = win_get_buf(mt_wid);
 
     if (inventoryWindowType == INVENTORY_WINDOW_TYPE_MOVE_ITEMS) {
-        rect.ulx = 153;
-        rect.uly = 45;
+        // RT: as many digits as the stack needs (3 in the original), ending
+        // where the original counter ends; extra ones extend it to the left.
         rect.lrx = 195;
+        rect.ulx = rect.lrx + 1 - 14 * mt_digits;
+        rect.uly = 45;
         rect.lry = 69;
-
-        int ranks[3];
-        ranks[2] = value % 10;
-        ranks[1] = value / 10 % 10;
-        ranks[0] = value / 100 % 10;
 
         windowBuffer += rect.uly * windowWidth + rect.ulx;
 
-        for (int index = 0; index < 3; index++) {
-            unsigned char* src = data + 14 * ranks[index];
+        int divisor = 1;
+        for (int index = 1; index < mt_digits; index++) {
+            divisor *= 10;
+        }
+        for (int index = 0; index < mt_digits; index++) {
+            unsigned char* src = data + 14 * (value / divisor % 10);
             buf_to_buf(src, 14, 24, 336, windowBuffer, windowWidth);
             windowBuffer += 14;
+            divisor /= 10;
         }
     } else {
         rect.ulx = 133;
@@ -5119,8 +5451,12 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
     int min;
     if (inventoryWindowType == INVENTORY_WINDOW_TYPE_MOVE_ITEMS) {
         value = 1;
-        if (max > 999) {
-            max = 999;
+        // RT: up to the whole stack (the original stopped at 999); the
+        // counter gets as many digits as the stack's size needs.
+        max = std::min(max, INVEN_RT_AMOUNT_MAX);
+        mt_digits = 3;
+        for (int limit = 1000; limit <= max && mt_digits < INVEN_RT_AMOUNT_DIGITS; limit *= 10) {
+            mt_digits++;
         }
         min = 1;
     } else {
@@ -5130,14 +5466,75 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
 
     draw_amount(value, inventoryWindowType);
 
+    loot_rt.quantityOpen = true;
+    loot_rt.quantityMax = max;
+
+    // RT: LT/RT change the amount by 100 (held, they keep changing it); Y
+    // picks the whole stack.
+    int heldTrigger = -1;
+    int heldStep = 0;
+    unsigned int heldNext = 0;
+
     bool v5 = false;
     for (;;) {
         sharedFpsLimiter.mark();
 
+        loot_rt.quantityValue = value;
+
         int keyCode = get_input();
         if (keyCode == KEY_ESCAPE) {
+            loot_rt.quantityOpen = false;
+            mt_digits = 3;
             exit_move_timer_win(inventoryWindowType);
             return -1;
+        }
+
+        if (inventoryWindowType == INVENTORY_WINDOW_TYPE_MOVE_ITEMS) {
+            unsigned int now = SDL_GetTicks();
+            if (keyCode == GAMEPAD_KEY_Y) {
+                // Y: the whole stack (the window's All button).
+                heldTrigger = -1;
+                v5 = false;
+                value = max;
+                draw_amount(value, inventoryWindowType);
+            } else if (keyCode == GAMEPAD_KEY_RT || keyCode == GAMEPAD_KEY_LT) {
+                heldTrigger = keyCode == GAMEPAD_KEY_RT ? GAMEPAD_BUTTON_RIGHT_TRIGGER : GAMEPAD_BUTTON_LEFT_TRIGGER;
+                heldStep = keyCode == GAMEPAD_KEY_RT ? 100 : -100;
+                heldNext = now + INVEN_RT_AMOUNT_REPEAT_DELAY;
+                v5 = false;
+                value = std::clamp(value + heldStep, min, max);
+                draw_amount(value, inventoryWindowType);
+            } else if (heldTrigger != -1) {
+                if (!gamepad_get_state()->buttons[heldTrigger]) {
+                    heldTrigger = -1;
+                } else if (now >= heldNext) {
+                    heldNext = now + INVEN_RT_AMOUNT_REPEAT_RATE;
+                    value = std::clamp(value + heldStep, min, max);
+                    draw_amount(value, inventoryWindowType);
+                }
+            }
+        }
+
+        // RT: the controller's D-pad and left stick (arrow keys in menu key
+        // mode, with its repeat delay) change the amount by one, LB/RB by
+        // ten, within 1 and the stack's size.
+        if (inventoryWindowType == INVENTORY_WINDOW_TYPE_MOVE_ITEMS) {
+            int step = 0;
+            if (keyCode == KEY_ARROW_UP || keyCode == KEY_ARROW_RIGHT) {
+                step = 1;
+            } else if (keyCode == KEY_ARROW_DOWN || keyCode == KEY_ARROW_LEFT) {
+                step = -1;
+            } else if (keyCode == KEY_PAGE_DOWN) {
+                step = 10;
+            } else if (keyCode == KEY_PAGE_UP) {
+                step = -10;
+            }
+            if (step != 0) {
+                v5 = false;
+                value = std::clamp(value + step, min, max);
+                draw_amount(value, inventoryWindowType);
+                continue;
+            }
         }
 
         if (keyCode == KEY_RETURN) {
@@ -5186,7 +5583,11 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
                     value = 0;
                 }
 
-                value = 10 * value % 1000 + number;
+                int limit = 1;
+                for (int digit = 0; digit < mt_digits; digit++) {
+                    limit *= 10;
+                }
+                value = 10 * value % limit + number;
                 v5 = true;
 
                 draw_amount(value, inventoryWindowType);
@@ -5208,6 +5609,8 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
         sharedFpsLimiter.throttle();
     }
 
+    loot_rt.quantityOpen = false;
+    mt_digits = 3;
     exit_move_timer_win(inventoryWindowType);
 
     return value;

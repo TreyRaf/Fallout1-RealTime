@@ -35,6 +35,7 @@
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/trait.h"
+#include "game/rt_favorites.h"
 #include "game/version.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
@@ -1566,6 +1567,11 @@ static int SaveSlot()
         debug_printf("LOADSAVE: Save function #%d data size written: %d bytes.\n", index, db_ftell(flptr) - pos);
     }
 
+    // RT: Favorites, after the original data (other readers ignore it).
+    if (rt_favorites_save(flptr) == -1) {
+        debug_printf("\nLOADSAVE: ** Error writing favorites! **\n");
+    }
+
     debug_printf("LOADSAVE: Total save data written: %ld bytes.\n", db_ftell(flptr));
 
     db_fclose(flptr);
@@ -1643,6 +1649,9 @@ static int LoadSlot(int slot)
 
         debug_printf("LOADSAVE: Load function #%d data size read: %d bytes.\n", index, db_ftell(flptr) - pos);
     }
+
+    // RT: Favorites, after the original data (absent in older saves).
+    rt_favorites_load(flptr);
 
     debug_printf("LOADSAVE: Total load data read: %ld bytes.\n", db_ftell(flptr));
     db_fclose(flptr);

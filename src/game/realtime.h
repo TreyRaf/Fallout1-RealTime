@@ -16,7 +16,8 @@ namespace fallout {
 // - Attacks are resolved with the vanilla `compute_attack`/`action_attack`/
 //   `apply_damage` pipeline (same hit chance, damage and animations), gated
 //   by per-attacker cooldowns instead of action points.
-// - Action points are only used for running and regenerate over time.
+// - Action points are used for running and for AIMED SHOT (see
+//   `rt_aimed.h`) and regenerate over time; ordinary attacks cost none.
 // - The player is controlled with a game controller (see `gamepad.h`).
 
 typedef struct RtStats {
@@ -65,6 +66,19 @@ typedef struct RtStats {
     int cameraRecenters;
     int cameraLimitStops;
     int cameraPans;
+    // AIMED SHOT: player attacks on a chosen body part.
+    int aimedAttacks;
+    int aimedHits;
+    int aimedCriticals;
+    // The body part aimed at (a ranged miss is recorded as a torso miss by
+    // the original calculation).
+    int lastAimedLocation;
+    int lastAimedToHit;
+    int lastAimedFlags;
+    Object* lastAimedDefender;
+    // Interaction candidates cycled with the D-pad.
+    int interactCycles;
+    int favoritesOpened;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -104,12 +118,46 @@ Object* rt_get_interact_target();
 int rt_get_camera_margin_pct();
 bool rt_is_hostile(Object* critter);
 void rt_debug_set_lock(Object* target);
+// Test fixture: sets the player's current AP.
+void rt_debug_set_ap(float ap);
 float rt_get_dude_ap();
 bool rt_is_run_toggled();
 bool rt_is_engaged(Object* critter);
 const char* rt_get_log_dir();
 unsigned int rt_get_time();
 int rt_get_pending_count();
+
+// AIMED SHOT support (see `rt_aimed.h`).
+// The locked target when it is valid, otherwise the nearest enemy (never a
+// neutral NPC unless it is the deliberately locked target), or NULL.
+Object* rt_aim_default_target();
+// The target in the flicked screen direction (lock-on switching rules).
+Object* rt_aim_switch_target(Object* from, float fx, float fy);
+bool rt_aim_target_valid(Object* target);
+// `COMBAT_BAD_SHOT_*` for the player attacking `target` (no AP check).
+int rt_aim_check_shot(Object* target, int hitMode);
+bool rt_aim_player_in_attack();
+
+#define RT_AIM_ATTACK_STARTED 0
+#define RT_AIM_ATTACK_WAIT 1
+#define RT_AIM_ATTACK_FAILED 2
+
+// Commits an aimed attack: the original attack on `hitLocation`, spending
+// `apCost` AP once it has started.
+int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost);
+
+// Favorites support (see `rt_favorites.h`).
+// No attack, reload, chem use or aimed queue is in progress.
+bool rt_player_can_change_equipment();
+// Uses a chem on the player, as RT with a chem does (waits for a moment
+// when nothing else involves the player).
+void rt_use_item_on_self(Object* item);
+
+// Interaction candidates (A): what is highlighted and how many there are.
+int rt_get_interact_candidate_count();
+int rt_get_interact_candidates(Object** out, int capacity);
+// The interaction label shown above the highlighted object ("" when none).
+const char* rt_get_interact_label();
 
 } // namespace fallout
 

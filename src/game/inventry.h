@@ -103,6 +103,40 @@ int inven_rt_use(Object* item);
 int inven_rt_drop(Object* item, int quantity);
 int inven_rt_unload(Object* weapon);
 
+// RT: controller layer of the loot screen (corpses and containers).
+// The loot side is focused when it opens; LT focuses the player's items, RT
+// the loot; D-pad/left stick up and down move through the focused list; A
+// moves the selected item to the other side (a stack asks how many: D-pad or
+// stick changes it by 1, LB/RB by 10, LT/RT by 100 (held, they repeat), Y
+// picks the whole stack, A confirms, B cancels); X takes everything it
+// can from the loot side; B closes. Transfers go through the original rules
+// (`move_inventory`'s steal check, `item_move`'s weight and space limits).
+#define INVEN_RT_LOOT_SIDE_PLAYER 0
+#define INVEN_RT_LOOT_SIDE_LOOT 1
+
+typedef struct InvenRtLootState {
+    bool open;
+    int side;
+    // Absolute index of the selected item and first shown row, per side.
+    int selected[2];
+    int offset[2];
+    int count[2];
+    // The focused side's selected item (NULL when that side is empty).
+    Object* selectedItem;
+    int selectedQuantity;
+    // The quantity selector (`do_move_timer`) while it is open.
+    bool quantityOpen;
+    int quantityValue;
+    int quantityMax;
+    int transfers;
+    int takeAlls;
+    // Stacks left behind by the last Take All.
+    int takeAllLeft;
+    char lastMessage[128];
+} InvenRtLootState;
+
+const InvenRtLootState* inven_rt_loot_state();
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_INVENTRY_H_ */

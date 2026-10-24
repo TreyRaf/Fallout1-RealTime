@@ -32,7 +32,9 @@
 #include "game/perk.h"
 #include "game/proto.h"
 #include "game/roll.h"
+#include "game/rt_aimed.h"
 #include "game/rt_context.h"
+#include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -79,6 +81,8 @@ namespace fallout {
 #define RT_MOVE_STALL_MS 1500
 // A reload press waits this long for an attack involving the player to end.
 #define RT_RELOAD_BUFFER_MS 1500
+// A favorite picked while an animation of the player's plays waits this long.
+#define RT_FAVORITE_BUFFER_MS 2500
 
 // Results of `rt_reload`.
 #define RT_RELOAD_STARTED 0
@@ -89,7 +93,12 @@ namespace fallout {
 #define RT_PLAYER_ATTACK_STARTED 0
 #define RT_PLAYER_ATTACK_WAIT 1
 #define RT_PLAYER_ATTACK_FAILED 2
+// Interaction: objects up to this far are highlighted (and can be stepped
+// through); A acts only on one within RT_INTERACT_REACH; left/right steps
+// only to an object within RT_INTERACT_CYCLE_DISTANCE of the highlighted one.
 #define RT_INTERACT_MAX_DISTANCE 3
+#define RT_INTERACT_REACH 1
+#define RT_INTERACT_CYCLE_DISTANCE 2
 #define RT_MOVE_LOOKAHEAD 8
 #define RT_ENGAGE_TEAM_RADIUS 12
 #define RT_COMPANION_RADIUS 14
@@ -126,7 +135,7 @@ static bool rt_is_known_critter(Object* obj);
 static bool rt_is_alive(Object* critter);
 static bool rt_is_player_team(Object* critter);
 static bool rt_obj_in_attack(Object* obj);
-static int rt_attack(Object* attacker, Object* defender, int hitMode);
+static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation = HIT_LOCATION_UNCALLED);
 static void rt_note_critical_deaths(RtPendingAttack* pending);
 static void rt_stop_for_attack(Object* obj);
 static void rt_refresh_death_flags(RtPendingAttack* pending);
@@ -143,6 +152,7 @@ static void rt_update_dude(float dtMs);
 static void rt_update_ap(float dtMs);
 static void rt_sync_weapon_sprite();
 static void rt_update_movement(bool canAct);
+static void rt_stop_walking();
 static int rt_find_move_dest(int rotation);
 static int rt_rotation_from_vector(float x, float y);
 static bool rt_rotation_vector(int rotation, float* x, float* y);
@@ -163,11 +173,18 @@ static int rt_reload_finish(void* a1, void* a2);
 static void rt_update_reload();
 static bool rt_get_play_area(int* width, int* height);
 static bool rt_is_automatic(int hitMode);
-static void rt_update_chem_input(bool pressAttack, Object* chem);
+static void rt_request_chem(Object* chem);
+static void rt_update_chem_request();
+static void rt_update_favorite_request();
 static void rt_update_attack_input(bool pressAttack);
 static int rt_player_attack(bool explicitPress);
 static int rt_player_hit_mode(int* hitMode);
 static Object* rt_find_interactable();
+static void rt_collect_interactables();
+static bool rt_interact_reachable(Object* obj);
+static void rt_cycle_interaction(int delta);
+static bool rt_can_cycle_interaction(Object* current);
+static void rt_update_label(Object* target);
 static void rt_interact(Object* obj);
 static int rt_reload();
 static void rt_set_interact_highlight(Object* obj);
@@ -211,15 +228,23 @@ static int rt_move_progress_tile = -1;
 static unsigned int rt_move_progress_at = 0;
 static unsigned int rt_dude_next_attack_at = 0;
 static Object* rt_lock = NULL;
+
+// Something drawn over the map by `rt_render_overlay`. Map scrolling shifts
+// the drawn screen (overlay included), so the camera position at the time
+// it was drawn is kept to erase the old image where it moved to.
+typedef struct RtOverlay {
+    bool drawn;
+    Rect rect;
+    int refTile;
+    int refX;
+    int refY;
+} RtOverlay;
+
+static void rt_overlay_place(RtOverlay* overlay, bool visible, const Rect* rect, bool contentChanged);
+
 // Lock-on indicator: crosshair art plus hit chance, drawn over the map.
 static RtIndicator rt_indicator;
-static Rect rt_indicator_rect;
-// Camera position when the indicator was drawn: map scrolling shifts the
-// drawn screen (indicator included), so the old image moves with it.
-static int rt_indicator_ref_tile = -1;
-static int rt_indicator_ref_x = 0;
-static int rt_indicator_ref_y = 0;
-static bool rt_indicator_drawn = false;
+static RtOverlay rt_indicator_overlay = { false, { 0, 0, -1, -1 }, -1, 0, 0 };
 static unsigned char* rt_indicator_buf = NULL;
 static int rt_indicator_width = 0;
 static int rt_indicator_height = 0;
@@ -256,9 +281,37 @@ static Object* rt_reload_weapon = NULL;
 static unsigned int rt_reload_until = 0;
 static unsigned int rt_reload_requested_until = 0;
 
-// Chem use with RT (see `rt_update_chem_input`).
+// Chem use with RT or a favorite (see `rt_update_chem_request`).
 static bool rt_chem_active = false;
 static unsigned int rt_chem_requested_until = 0;
+static Object* rt_chem_request_item = NULL;
+
+// A favorite (weapon, armor, item) waiting to be activated.
+static int rt_fav_pending_slot = -1;
+static unsigned int rt_fav_pending_until = 0;
+
+// Interaction (A): the objects in reach, in a stable clockwise order around
+// the player, and the one picked with the D-pad (kept while it stays valid).
+static std::vector<Object*> rt_interact_candidates;
+static Object* rt_interact_manual = NULL;
+
+// Whether an object near the player can be reached on foot (no wall in
+// between), computed again only when either of them moved.
+typedef struct RtReach {
+    int dudeTile;
+    int objTile;
+    bool reachable;
+} RtReach;
+static std::unordered_map<Object*, RtReach> rt_reach_cache;
+
+// Interaction label: the highlighted object's name, what A does and, with
+// several objects in reach, the D-pad prompts.
+static RtOverlay rt_label = { false, { 0, 0, -1, -1 }, -1, 0, 0 };
+static char rt_label_text[200] = "";
+static unsigned char* rt_label_buf = NULL;
+static int rt_label_capacity = 0;
+static int rt_label_width = 0;
+static int rt_label_height = 0;
 
 bool rt_enabled()
 {
@@ -396,8 +449,10 @@ void rt_reset()
         return;
     }
 
-    // Objects referenced by pending attacks may be gone after a map change.
+    // Objects referenced by pending attacks may be gone after a map change;
+    // those attacks never land (counted as dropped).
     for (RtPendingAttack* pending : rt_pending) {
+        rt_stats.attacksDropped++;
         delete pending;
     }
     rt_pending.clear();
@@ -414,7 +469,7 @@ void rt_reset()
     rt_move_dest = -1;
     rt_lock = NULL;
     rt_indicator.visible = false;
-    rt_indicator_drawn = false;
+    rt_indicator_overlay.drawn = false;
     rt_attack_buffered_until = 0;
     rt_fire_hold = false;
     rt_fire_press_done = false;
@@ -435,6 +490,14 @@ void rt_reset()
     rt_reload_weapon = NULL;
     rt_dude_next_attack_at = 0;
     rt_player_recovery_until = 0;
+    rt_chem_request_item = NULL;
+    rt_fav_pending_slot = -1;
+    rt_interact_manual = NULL;
+    rt_interact_candidates.clear();
+    rt_reach_cache.clear();
+    rt_label_text[0] = '\0';
+    rt_label.drawn = false;
+    rt_aimed_reset("map load");
 
     gamepad_reset_gameplay_input();
 
@@ -453,6 +516,16 @@ void rt_object_erased(Object* obj)
     if (rt_interact_target == obj) {
         rt_interact_target = NULL;
     }
+    if (rt_interact_manual == obj) {
+        rt_interact_manual = NULL;
+    }
+    rt_interact_candidates.erase(std::remove(rt_interact_candidates.begin(), rt_interact_candidates.end(), obj), rt_interact_candidates.end());
+    rt_reach_cache.erase(obj);
+    if (rt_chem_request_item == obj) {
+        rt_chem_request_item = NULL;
+        rt_chem_requested_until = 0;
+    }
+    rt_aimed_object_erased(obj);
     if (rt_lock == obj) {
         rt_lock = NULL;
         rt_fire_hold = false;
@@ -558,6 +631,12 @@ void rt_debug_set_lock(Object* target)
     rt_set_lock(target);
 }
 
+void rt_debug_set_ap(float ap)
+{
+    rt_dude_ap = ap;
+    rt_dude_ap_shown = -1;
+}
+
 float rt_get_dude_ap()
 {
     return rt_dude_ap;
@@ -599,6 +678,7 @@ void rt_tick()
     rt_now += realDelta;
 
     if (obj_dude == NULL || critter_is_dead(obj_dude)) {
+        rt_aimed_reset("player dead");
         return;
     }
 
@@ -690,7 +770,7 @@ static bool rt_obj_in_attack(Object* obj)
     return false;
 }
 
-static int rt_attack(Object* attacker, Object* defender, int hitMode)
+static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation)
 {
     if (rt_obj_in_attack(attacker) || rt_obj_in_attack(defender)) {
         return RT_ATTACK_BUSY;
@@ -706,7 +786,10 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
 
     RtPendingAttack* pending = new RtPendingAttack();
     Attack* attack = &(pending->attack);
-    combat_ctd_init(attack, attacker, defender, hitMode, HIT_LOCATION_UNCALLED);
+    combat_ctd_init(attack, attacker, defender, hitMode, hitLocation);
+
+    // The hit chance `compute_attack` rolls against (same state, same call).
+    int toHit = determine_to_hit(attacker, defender, hitLocation, hitMode);
 
     // Vanilla to-hit roll, critical and damage calculations.
     if (combat_rt_compute_attack(attack) == -1) {
@@ -772,6 +855,20 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
         rt_stats.playerAttacks++;
         critter_set_who_hit_me(attacker, defender);
 
+        if (hitLocation != HIT_LOCATION_UNCALLED) {
+            rt_stats.aimedAttacks++;
+            rt_stats.lastAimedLocation = hitLocation;
+            rt_stats.lastAimedToHit = toHit;
+            rt_stats.lastAimedFlags = attack->defenderFlags;
+            rt_stats.lastAimedDefender = defender;
+            if ((attack->attackerFlags & DAM_HIT) != 0) {
+                rt_stats.aimedHits++;
+            }
+            if ((attack->attackerFlags & DAM_CRITICAL) != 0) {
+                rt_stats.aimedCriticals++;
+            }
+        }
+
         // Attacking someone who wasn't fighting (a neutral NPC) makes them and
         // their nearby teammates hostile, hit or miss, as starting combat does
         // in the original game. Locking on alone never gets here.
@@ -818,15 +915,19 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode)
         rt_stats.maxConcurrentAttackers = (int)attackers.size();
     }
 
-    rt_log("attack: %s -> %s (hitMode=%d, anim=%d, rounds=%d, dist=%d) %s dmg=%d",
+    rt_log("attack: %s -> %s (hitMode=%d, anim=%d, rounds=%d, dist=%d, location=%d%s) %s%s dmg=%d flags=0x%X",
         critter_name(attacker),
         rt_name(attack->defender),
         attack->hitMode,
         item_w_anim(attacker, attack->hitMode),
         attack->ammoQuantity,
         obj_dist(attacker, defender),
+        attack->defenderHitLocation,
+        hitLocation != HIT_LOCATION_UNCALLED ? " aimed" : "",
         (attack->attackerFlags & DAM_HIT) != 0 ? "HIT" : "MISS",
-        attack->defenderDamage);
+        (attack->attackerFlags & DAM_CRITICAL) != 0 ? " CRITICAL" : "",
+        attack->defenderDamage,
+        attack->defenderFlags);
 
     return 0;
 }
@@ -1419,7 +1520,8 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
             // chem use of theirs is waiting.
             if ((rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until)
                 || (rt_reload_requested_until != 0 && rt_now <= rt_reload_requested_until)
-                || (rt_chem_requested_until != 0 && rt_now <= rt_chem_requested_until)) {
+                || (rt_chem_requested_until != 0 && rt_now <= rt_chem_requested_until)
+                || rt_aimed_wants_window()) {
                 state->nextActionAt = rt_now + 100;
                 return;
             }
@@ -1683,9 +1785,10 @@ static void rt_update_dude(float dtMs)
     bool pressDown = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_DOWN);
     bool pressLeft = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_LEFT);
     bool pressRight = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_RIGHT);
-    // Y is reserved; R3 is unused.
+    // R3 opens the Skilldex (the D-pad now belongs to favorites and
+    // interaction selection). Y is reserved.
+    bool pressR3 = gamepad_consume_press(GAMEPAD_BUTTON_RIGHT_STICK);
     gamepad_consume_press(GAMEPAD_BUTTON_Y);
-    gamepad_consume_press(GAMEPAD_BUTTON_RIGHT_STICK);
     float flickX;
     float flickY;
     bool flick = gamepad_consume_flick(&flickX, &flickY);
@@ -1710,11 +1813,45 @@ static void rt_update_dude(float dtMs)
         GNW_add_input_buffer(KEY_ESCAPE);
     }
 
+    // Aimed attacks being carried out: B cancels the ones not started yet.
+    bool aimedRunning = rt_aimed_is_executing();
+    rt_aimed_update(canAct, aimedRunning && pressB);
+    if (aimedRunning) {
+        pressB = false;
+    }
+
     if (!canAct) {
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
         rt_set_interact_highlight(NULL);
+        rt_update_label(NULL);
         rt_move_active = false;
+        return;
+    }
+
+    // Nothing may interfere with queued aimed attacks: no movement, attacks,
+    // reloads, interactions or equipment changes until the queue is done.
+    // The lock can still be moved (it doesn't change any queued target).
+    if (rt_aimed_is_executing()) {
+        if (pressAttack || pressX || pressA || pressRB || pressBack || pressLB || pressR3
+            || pressUp || pressDown || pressLeft || pressRight || pressRun) {
+            rt_print("Aimed attacks in progress. B cancels the rest.");
+        }
+        if (pressLock) {
+            rt_set_lock(rt_lock != NULL ? NULL : rt_find_lock_candidate());
+        }
+        if (flick && rt_lock != NULL) {
+            rt_switch_lock(flickX, flickY);
+        }
+        rt_fire_hold = false;
+        rt_attack_buffered_until = 0;
+        rt_reload_requested_until = 0;
+        rt_fav_pending_slot = -1;
+        rt_interact_manual = NULL;
+        rt_interact_target = NULL;
+        rt_set_interact_highlight(NULL);
+        rt_update_label(NULL);
+        rt_update_movement(false);
         return;
     }
 
@@ -1731,24 +1868,21 @@ static void rt_update_dude(float dtMs)
     if (pressBack) {
         GNW_add_input_buffer(KEY_LOWERCASE_N);
     }
-    if (pressUp) {
-        GNW_add_input_buffer(KEY_LOWERCASE_P);
-    }
-    if (pressDown) {
-        GNW_add_input_buffer(KEY_TAB);
-    }
-    if (pressLeft) {
-        GNW_add_input_buffer(KEY_LOWERCASE_C);
-    }
-    if (pressRight) {
+    if (pressR3) {
         GNW_add_input_buffer(KEY_LOWERCASE_S);
     }
 
     if (pressLB) {
-        // Reserved for the dedicated targeting system (not designed yet).
-        rt_print("Targeting system (LB) is not implemented yet.");
-        rt_log("input: LB targeting system requested (pending feature)");
+        // AIMED SHOT: plans aimed attacks (modal, the game is paused).
         rt_stats.targetingRequests++;
+        rt_stop_walking();
+        rt_set_interact_highlight(NULL);
+        rt_update_label(NULL);
+        rt_aimed_open();
+        if (rt_aimed_is_executing()) {
+            rt_update_movement(false);
+            return;
+        }
     }
 
     if (pressRun) {
@@ -1796,19 +1930,54 @@ static void rt_update_dude(float dtMs)
     }
 
     rt_update_attack_input(pressAttack);
+    rt_update_chem_request();
+    rt_update_favorite_request();
 
-    // Interaction.
+    // Interaction: what A would act on.
+    rt_collect_interactables();
     Object* interactable = rt_find_interactable();
+
+    // D-pad: left/right steps through nearby interactions when another one
+    // is within 2 hexes of the highlighted one; otherwise every direction
+    // activates its favorite right away. One action per press (a press, not
+    // a hold, so a held direction never uses up a stack).
+    int direction = -1;
+    if (pressUp) {
+        direction = RT_FAVORITES_UP;
+    } else if (pressRight) {
+        direction = RT_FAVORITES_RIGHT;
+    } else if (pressDown) {
+        direction = RT_FAVORITES_DOWN;
+    } else if (pressLeft) {
+        direction = RT_FAVORITES_LEFT;
+    }
+
+    bool horizontal = direction == RT_FAVORITES_LEFT || direction == RT_FAVORITES_RIGHT;
+    if (horizontal && rt_can_cycle_interaction(interactable)) {
+        rt_cycle_interaction(direction == RT_FAVORITES_RIGHT ? 1 : -1);
+        interactable = rt_find_interactable();
+    } else if (direction != -1) {
+        rt_stats.favoritesOpened++;
+        rt_fav_pending_slot = direction;
+        rt_fav_pending_until = rt_now + RT_FAVORITE_BUFFER_MS;
+        rt_update_favorite_request();
+        rt_update_chem_request();
+    }
+
     rt_interact_target = interactable;
     rt_set_interact_highlight(interactable);
+    rt_update_label(interactable);
 
     if (pressA) {
         if (rt_reload_active) {
             rt_log("interact: ignored while reloading");
-        } else if (interactable != NULL) {
-            rt_interact(interactable);
-        } else {
+        } else if (interactable == NULL) {
             rt_log("interact: nothing nearby");
+        } else if (tile_dist(obj_dude->tile, interactable->tile) > RT_INTERACT_REACH) {
+            // Highlighted but out of reach: A never acts from farther away.
+            rt_print("Too far away. Move next to the %s.", rt_name(interactable));
+        } else {
+            rt_interact(interactable);
         }
     }
 
@@ -1836,7 +2005,11 @@ static void rt_update_ap(float dtMs)
             }
         }
     } else {
-        rt_dude_ap += dtMs / rt_ap_regen_ms;
+        // Frozen while aimed attacks are carried out, so regeneration can't
+        // pay for more of them than were reserved.
+        if (!rt_aimed_is_executing()) {
+            rt_dude_ap += dtMs / rt_ap_regen_ms;
+        }
     }
 
     if (rt_dude_ap > maxAp) {
@@ -1950,6 +2123,19 @@ static int rt_find_move_dest(int rotation)
         tile = next;
     }
     return dest;
+}
+
+// Ends the player's walk now (before a screen that pauses the game), so it
+// doesn't carry on to the end of its path afterwards.
+static void rt_stop_walking()
+{
+    if (rt_move_active && anim_busy(obj_dude)) {
+        int anim = FID_ANIM_TYPE(obj_dude->fid);
+        if (anim == ANIM_WALK || anim == ANIM_RUNNING) {
+            register_clear(obj_dude);
+        }
+    }
+    rt_move_active = false;
 }
 
 static void rt_update_movement(bool canAct)
@@ -2204,18 +2390,18 @@ static Object* rt_find_lock_candidate()
     return best;
 }
 
-// Moves the lock to the nearest candidate in the flicked screen direction,
-// or keeps it when there is none.
-static void rt_switch_lock(float fx, float fy)
+// The nearest lock candidate from `from` in the flicked screen direction,
+// or NULL when there is none.
+static Object* rt_find_switch_target(Object* from, float fx, float fy)
 {
     int cx;
     int cy;
-    rt_screen_pos(rt_lock, &cx, &cy);
+    rt_screen_pos(from, &cx, &cy);
 
     Object* best = NULL;
     float bestScore = 0.0f;
     for (Object* critter : rt_critters) {
-        if (critter == rt_lock || !rt_is_lock_candidate(critter)) {
+        if (critter == from || !rt_is_lock_candidate(critter)) {
             continue;
         }
 
@@ -2243,6 +2429,14 @@ static void rt_switch_lock(float fx, float fy)
         }
     }
 
+    return best;
+}
+
+// Moves the lock to the nearest candidate in the flicked screen direction,
+// or keeps it when there is none.
+static void rt_switch_lock(float fx, float fy)
+{
+    Object* best = rt_find_switch_target(rt_lock, fx, fy);
     if (best == NULL) {
         rt_stats.lockSwitchMisses++;
         rt_log("lock: no target in direction (%.2f, %.2f), keeping %s", fx, fy, critter_name(rt_lock));
@@ -2414,62 +2608,162 @@ static void rt_update_indicator()
         }
     }
 
-    bool scrolled = rt_indicator_drawn && rt_indicator_ref_tile != tile_center_tile;
-    bool changed = scrolled
-        || next.visible != rt_indicator_drawn
-        || (next.visible
-            && (rect.ulx != rt_indicator_rect.ulx
-                || rect.uly != rt_indicator_rect.uly
-                || strcmp(next.text, rt_indicator.text) != 0));
+    bool textChanged = strcmp(next.text, rt_indicator.text) != 0;
     rt_indicator = next;
+    rt_overlay_place(&rt_indicator_overlay, next.visible, &rect, textChanged);
+}
 
+// Shows `overlay` at `rect` (or hides it), erasing the previous image, also
+// where map scrolling moved it to.
+static void rt_overlay_place(RtOverlay* overlay, bool visible, const Rect* rect, bool contentChanged)
+{
+    bool scrolled = overlay->drawn && overlay->refTile != tile_center_tile;
+    bool moved = rect->ulx != overlay->rect.ulx
+        || rect->uly != overlay->rect.uly
+        || rect->lrx != overlay->rect.lrx
+        || rect->lry != overlay->rect.lry;
+    bool changed = scrolled
+        || visible != overlay->drawn
+        || (visible && (moved || contentChanged));
     if (!changed) {
         return;
     }
 
-    if (rt_indicator_drawn) {
+    if (overlay->drawn) {
         // Erase: the overlay must not be drawn while its old area redraws.
-        rt_indicator_drawn = false;
-        tile_refresh_rect(&rt_indicator_rect, map_elevation);
+        overlay->drawn = false;
+        tile_refresh_rect(&(overlay->rect), map_elevation);
 
-        // Where scrolling moved the old image to.
         int x;
         int y;
-        if (scrolled && tile_coord(rt_indicator_ref_tile, &x, &y, map_elevation) == 0) {
-            Rect shifted = rt_indicator_rect;
-            rectOffset(&shifted, x - rt_indicator_ref_x, y - rt_indicator_ref_y);
+        if (scrolled && tile_coord(overlay->refTile, &x, &y, map_elevation) == 0) {
+            Rect shifted = overlay->rect;
+            rectOffset(&shifted, x - overlay->refX, y - overlay->refY);
             tile_refresh_rect(&shifted, map_elevation);
         }
     }
 
-    rt_indicator_drawn = next.visible;
-    if (next.visible) {
-        rt_indicator_rect = rect;
-        rt_indicator_ref_tile = tile_center_tile;
-        tile_coord(rt_indicator_ref_tile, &rt_indicator_ref_x, &rt_indicator_ref_y, map_elevation);
-        tile_refresh_rect(&rt_indicator_rect, map_elevation);
+    overlay->drawn = visible;
+    if (visible) {
+        overlay->rect = *rect;
+        overlay->refTile = tile_center_tile;
+        tile_coord(overlay->refTile, &(overlay->refX), &(overlay->refY), map_elevation);
+        tile_refresh_rect(&(overlay->rect), map_elevation);
     }
 }
 
-void rt_render_overlay(unsigned char* buffer, int pitch, Rect* rect)
+static void rt_overlay_draw(const RtOverlay* overlay, unsigned char* src, int srcPitch, unsigned char* buffer, int pitch, Rect* rect)
 {
-    if (!rt_indicator_drawn || rt_indicator_buf == NULL) {
+    if (!overlay->drawn || src == NULL) {
         return;
     }
 
     Rect clipped;
-    if (rect_inside_bound(&rt_indicator_rect, rect, &clipped) != 0) {
+    if (rect_inside_bound(&(overlay->rect), rect, &clipped) != 0) {
         return;
     }
 
-    int srcX = clipped.ulx - rt_indicator_rect.ulx;
-    int srcY = clipped.uly - rt_indicator_rect.uly;
-    trans_buf_to_buf(rt_indicator_buf + rt_indicator_width * srcY + srcX,
+    int srcX = clipped.ulx - overlay->rect.ulx;
+    int srcY = clipped.uly - overlay->rect.uly;
+    trans_buf_to_buf(src + srcPitch * srcY + srcX,
         clipped.lrx - clipped.ulx + 1,
         clipped.lry - clipped.uly + 1,
-        rt_indicator_width,
+        srcPitch,
         buffer + pitch * clipped.uly + clipped.ulx,
         pitch);
+}
+
+void rt_render_overlay(unsigned char* buffer, int pitch, Rect* rect)
+{
+    rt_overlay_draw(&rt_label, rt_label_buf, rt_label_width, buffer, pitch, rect);
+    rt_overlay_draw(&rt_indicator_overlay, rt_indicator_buf, rt_indicator_width, buffer, pitch, rect);
+}
+
+// -----------------------------------------------------------------------------
+// Interaction label
+// -----------------------------------------------------------------------------
+
+// The highlighted object's name and what A does, above it, once the player
+// is within reach of it. Drawn in the interaction color, unlike the lock-on
+// crosshair.
+static void rt_update_label(Object* target)
+{
+    char text[sizeof(rt_label_text)] = "";
+    if (target != NULL && tile_dist(obj_dude->tile, target->tile) <= RT_INTERACT_REACH) {
+        char actions[96];
+        rt_context_describe(target, actions, sizeof(actions));
+        snprintf(text, sizeof(text), "%s: A %s", rt_name(target), actions);
+    }
+
+    bool visible = text[0] != '\0';
+    bool textChanged = strcmp(text, rt_label_text) != 0;
+    if (textChanged) {
+        SDL_strlcpy(rt_label_text, text, sizeof(rt_label_text));
+    }
+
+    Rect rect = { 0, 0, -1, -1 };
+    if (visible) {
+        int oldFont = text_curr();
+        text_font(101);
+        int lineHeight = text_height() + 1;
+
+        char lines[2][sizeof(rt_label_text)];
+        int lineCount = 0;
+        const char* start = rt_label_text;
+        while (start != NULL && lineCount < 2) {
+            const char* end = strchr(start, '\n');
+            size_t length = end != NULL ? (size_t)(end - start) : strlen(start);
+            memcpy(lines[lineCount], start, length);
+            lines[lineCount][length] = '\0';
+            lineCount++;
+            start = end != NULL ? end + 1 : NULL;
+        }
+
+        if (textChanged || rt_label_buf == NULL) {
+            int width = 0;
+            for (int line = 0; line < lineCount; line++) {
+                width = std::max(width, text_width(lines[line]));
+            }
+            rt_label_width = width + 4;
+            rt_label_height = lineHeight * lineCount + 3;
+            if (rt_label_width * rt_label_height > rt_label_capacity) {
+                delete[] rt_label_buf;
+                rt_label_capacity = rt_label_width * rt_label_height;
+                rt_label_buf = new unsigned char[rt_label_capacity];
+            }
+            memset(rt_label_buf, 0, rt_label_width * rt_label_height);
+            for (int line = 0; line < lineCount; line++) {
+                int lineWidth = text_width(lines[line]);
+                text_to_buf(rt_label_buf + rt_label_width * (1 + line * lineHeight) + (rt_label_width - lineWidth) / 2,
+                    lines[line],
+                    rt_label_width - 2,
+                    rt_label_width,
+                    line == 0 ? colorTable[32747] : colorTable[992]);
+            }
+            buf_outline(rt_label_buf, rt_label_width, rt_label_height, rt_label_width, colorTable[0]);
+        }
+        text_font(oldFont);
+
+        // Centered above the object, kept inside the play area.
+        Rect bounds;
+        obj_bound(target, &bounds);
+        int width;
+        int height;
+        rt_get_play_area(&width, &height);
+        int x = (bounds.ulx + bounds.lrx) / 2 - rt_label_width / 2;
+        int y = bounds.uly - rt_label_height - 2;
+        if (y < 2) {
+            y = bounds.lry + 4;
+        }
+        x = std::max(2, std::min(x, width - rt_label_width - 2));
+        y = std::max(2, std::min(y, height - rt_label_height - 2));
+        rect.ulx = x;
+        rect.uly = y;
+        rect.lrx = x + rt_label_width - 1;
+        rect.lry = y + rt_label_height - 1;
+    }
+
+    rt_overlay_place(&rt_label, visible, &rect, textChanged);
 }
 
 // -----------------------------------------------------------------------------
@@ -2491,16 +2785,27 @@ static bool rt_is_automatic(int hitMode)
     return anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS;
 }
 
-// RT with a chem (drug) in the active item slot uses it on the player,
-// through the same action as using it on yourself in the original game (the
-// hands animation, then one item from the stack is taken). One use per press.
-static void rt_update_chem_input(bool pressAttack, Object* chem)
+// RT with a chem (drug) in the active item slot, or a chem picked from the
+// favorites, uses it on the player through the same action as using it on
+// yourself in the original game (the hands animation, then one item from the
+// stack is taken). One use per press.
+static void rt_request_chem(Object* chem)
 {
-    if (pressAttack) {
-        rt_chem_requested_until = rt_now + RT_CHEM_BUFFER_MS;
+    rt_chem_request_item = chem;
+    rt_chem_requested_until = rt_now + RT_CHEM_BUFFER_MS;
+}
+
+static void rt_update_chem_request()
+{
+    if (rt_chem_requested_until == 0) {
+        return;
     }
 
-    if (rt_chem_requested_until == 0) {
+    Object* chem = rt_chem_request_item;
+    if (chem == NULL || inven_rt_quantity(chem) == 0) {
+        rt_chem_requested_until = 0;
+        rt_chem_request_item = NULL;
+        rt_print("You don't have that any more.");
         return;
     }
 
@@ -2509,12 +2814,14 @@ static void rt_update_chem_input(bool pressAttack, Object* chem)
     if (rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active) {
         if (rt_now > rt_chem_requested_until) {
             rt_chem_requested_until = 0;
+            rt_chem_request_item = NULL;
             rt_print("You can't use that right now.");
         }
         return;
     }
 
     rt_chem_requested_until = 0;
+    rt_chem_request_item = NULL;
     rt_move_active = false;
     rt_set_interact_highlight(NULL);
 
@@ -2530,16 +2837,37 @@ static void rt_update_chem_input(bool pressAttack, Object* chem)
     rt_log("chem: using %s (%d in the stack)", object_name(chem), item_count(obj_dude, chem));
 }
 
+// A favorite chosen in the radial: weapons and armor wait for an attack,
+// reload or chem animation of the player's to end, then change hands.
+static void rt_update_favorite_request()
+{
+    if (rt_fav_pending_slot == -1) {
+        return;
+    }
+
+    int rc = rt_favorites_activate(rt_fav_pending_slot);
+    if (rc != RT_FAVORITES_WAIT) {
+        rt_fav_pending_slot = -1;
+        return;
+    }
+
+    if (rt_now > rt_fav_pending_until) {
+        rt_fav_pending_slot = -1;
+        rt_favorites_refuse("You can't do that right now.");
+    }
+}
+
 static void rt_update_attack_input(bool pressAttack)
 {
     Object* activeItem = NULL;
     if (intface_get_current_item(&activeItem) == 0 && activeItem != NULL && item_get_type(activeItem) == ITEM_TYPE_DRUG) {
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
-        rt_update_chem_input(pressAttack, activeItem);
+        if (pressAttack) {
+            rt_request_chem(activeItem);
+        }
         return;
     }
-    rt_chem_requested_until = 0;
 
     bool held = gamepad_is_held(GAMEPAD_BUTTON_RIGHT_TRIGGER);
 
@@ -2667,6 +2995,111 @@ static int rt_player_attack(bool explicitPress)
     return RT_PLAYER_ATTACK_FAILED;
 }
 
+// -----------------------------------------------------------------------------
+// AIMED SHOT and favorites support
+// -----------------------------------------------------------------------------
+
+Object* rt_aim_default_target()
+{
+    if (rt_lock != NULL && rt_is_lock_candidate(rt_lock)) {
+        return rt_lock;
+    }
+
+    // The nearest enemy (in plain view first); neutral NPCs only through the
+    // lock, never picked automatically.
+    Object* best = NULL;
+    int bestScore = 0;
+    for (Object* critter : rt_critters) {
+        if (!rt_is_lock_candidate(critter) || !rt_is_hostile_to_player(critter)) {
+            continue;
+        }
+
+        int score = obj_dist(obj_dude, critter);
+        if (combat_is_shot_blocked(obj_dude, obj_dude->tile, critter->tile, critter, NULL)) {
+            score += 100;
+        }
+
+        if (best == NULL || score < bestScore) {
+            best = critter;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+Object* rt_aim_switch_target(Object* from, float fx, float fy)
+{
+    return from != NULL ? rt_find_switch_target(from, fx, fy) : NULL;
+}
+
+bool rt_aim_target_valid(Object* target)
+{
+    return target != NULL && rt_lock_is_valid(target);
+}
+
+int rt_aim_check_shot(Object* target, int hitMode)
+{
+    return rt_check_shot(obj_dude, target, hitMode);
+}
+
+bool rt_aim_player_in_attack()
+{
+    return rt_obj_in_attack(obj_dude);
+}
+
+int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost)
+{
+    if (rt_reload_active || rt_chem_active) {
+        return RT_AIM_ATTACK_WAIT;
+    }
+
+    if (rt_check_shot(obj_dude, target, hitMode) != COMBAT_BAD_SHOT_OK) {
+        return RT_AIM_ATTACK_FAILED;
+    }
+
+    // The previous attack (or an enemy hit on the player) finishes first,
+    // and the weapon must be ready, as for an RT press.
+    if (rt_obj_in_attack(obj_dude) || rt_obj_in_attack(target) || rt_now < rt_dude_next_attack_at) {
+        return RT_AIM_ATTACK_WAIT;
+    }
+
+    if ((int)rt_dude_ap < apCost) {
+        return RT_AIM_ATTACK_FAILED;
+    }
+
+    rt_move_active = false;
+    int rc = rt_attack(obj_dude, target, hitMode, hitLocation);
+    if (rc == RT_ATTACK_BUSY) {
+        return RT_AIM_ATTACK_WAIT;
+    }
+    if (rc != 0) {
+        return RT_AIM_ATTACK_FAILED;
+    }
+
+    // Spent exactly once, when the attack is committed (hit or miss).
+    rt_dude_ap -= (float)apCost;
+    if (rt_dude_ap < 0.0f) {
+        rt_dude_ap = 0.0f;
+    }
+    rt_dude_ap_shown = (int)rt_dude_ap;
+    obj_dude->data.critter.combat.ap = rt_dude_ap_shown;
+    intface_update_move_points(rt_dude_ap_shown, 0);
+    return RT_AIM_ATTACK_STARTED;
+}
+
+bool rt_player_can_change_equipment()
+{
+    return !rt_obj_in_attack(obj_dude)
+        && !rt_reload_active
+        && !rt_chem_active
+        && !rt_aimed_is_executing();
+}
+
+void rt_use_item_on_self(Object* item)
+{
+    rt_request_chem(item);
+}
+
 static void rt_set_outline(Object** slot, Object* obj, int outlineType)
 {
     if (*slot == obj) {
@@ -2690,24 +3123,58 @@ static void rt_set_outline(Object** slot, Object* obj, int outlineType)
     }
 }
 
-static Object* rt_find_interactable()
+// Can the player walk to `obj` (doors that can be opened count as passable)?
+// Objects behind a wall are only reachable by a long detour.
+static bool rt_interact_reachable(Object* obj)
 {
-    float fx;
-    float fy;
-    if (!rt_facing_vector(&fx, &fy)) {
-        return NULL;
+    int distance = tile_dist(obj_dude->tile, obj->tile);
+    if (distance <= 1) {
+        return true;
     }
 
-    Object* best = NULL;
-    float bestScore = 1000.0f;
+    auto it = rt_reach_cache.find(obj);
+    if (it != rt_reach_cache.end() && it->second.dudeTile == obj_dude->tile && it->second.objTile == obj->tile) {
+        return it->second.reachable;
+    }
+
+    // The destination itself may be blocking (a door, a container, a
+    // critter); `make_path` doesn't check it.
+    int steps = make_path(obj_dude, obj_dude->tile, obj->tile, NULL, 0);
+    bool reachable = steps > 0 && steps <= RT_INTERACT_MAX_DISTANCE + 2;
+    rt_reach_cache[obj] = { obj_dude->tile, obj->tile, reachable };
+    return reachable;
+}
+
+// Screen angle of `obj` around the player, clockwise from straight up.
+static float rt_interact_angle(Object* obj)
+{
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    tile_coord(obj_dude->tile, &x1, &y1, obj_dude->elevation);
+    tile_coord(obj->tile, &x2, &y2, obj->elevation);
+    if (x1 == x2 && y1 == y2) {
+        return 0.0f;
+    }
+    float angle = atan2f((float)(x2 - x1), (float)(y1 - y2));
+    return angle < 0.0f ? angle + 6.2831853f : angle;
+}
+
+// Everything A can act on right now: in reach, not hidden, with an ordinary
+// or skill interaction (see `rt_context.h`), and not behind a wall. Ordered
+// clockwise around the player (then by distance), so D-pad left/right step
+// through them predictably.
+static void rt_collect_interactables()
+{
+    rt_interact_candidates.clear();
 
     for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
         if (obj == obj_dude || (obj->flags & OBJECT_HIDDEN) != 0) {
             continue;
         }
 
-        int distance = tile_dist(obj_dude->tile, obj->tile);
-        if (distance > RT_INTERACT_MAX_DISTANCE) {
+        if (tile_dist(obj_dude->tile, obj->tile) > RT_INTERACT_MAX_DISTANCE) {
             continue;
         }
 
@@ -2716,13 +3183,64 @@ static Object* rt_find_interactable()
             continue;
         }
 
-        // Anything with an ordinary or skill interaction (see `rt_context.h`).
         if (!rt_context_is_interactable(obj)) {
             continue;
         }
 
+        rt_interact_candidates.push_back(obj);
+    }
+
+    // The path check is the expensive part: only for what passed the rest.
+    rt_interact_candidates.erase(std::remove_if(rt_interact_candidates.begin(), rt_interact_candidates.end(), [](Object* obj) {
+        return !rt_interact_reachable(obj);
+    }),
+        rt_interact_candidates.end());
+
+    std::sort(rt_interact_candidates.begin(), rt_interact_candidates.end(), [](Object* a, Object* b) {
+        float angleA = rt_interact_angle(a);
+        float angleB = rt_interact_angle(b);
+        if (fabsf(angleA - angleB) > 0.01f) {
+            return angleA < angleB;
+        }
+        int distanceA = tile_dist(obj_dude->tile, a->tile);
+        int distanceB = tile_dist(obj_dude->tile, b->tile);
+        if (distanceA != distanceB) {
+            return distanceA < distanceB;
+        }
+        return a->id < b->id;
+    });
+
+    if (rt_interact_manual != NULL
+        && std::find(rt_interact_candidates.begin(), rt_interact_candidates.end(), rt_interact_manual) == rt_interact_candidates.end()) {
+        rt_log("interact: selection %s no longer in reach", rt_name(rt_interact_manual));
+        rt_interact_manual = NULL;
+    }
+}
+
+// What A acts on: the one picked with the D-pad while it stays highlighted,
+// otherwise the candidate the player faces (the stick direction while
+// moving), one within reach first, nearer ones first.
+static Object* rt_find_interactable()
+{
+    if (rt_interact_manual != NULL) {
+        return rt_interact_manual;
+    }
+
+    float fx;
+    float fy;
+    if (!rt_facing_vector(&fx, &fy)) {
+        return NULL;
+    }
+
+    Object* best = NULL;
+    float bestScore = 1000.0f;
+    for (Object* obj : rt_interact_candidates) {
+        int distance = tile_dist(obj_dude->tile, obj->tile);
         float facing = rt_facing_cos(obj, fx, fy);
         float score = distance + (1.0f - facing) * 1.5f;
+        if (distance > RT_INTERACT_REACH) {
+            score += 10.0f;
+        }
         if (score < bestScore) {
             bestScore = score;
             best = obj;
@@ -2730,6 +3248,72 @@ static Object* rt_find_interactable()
     }
 
     return best;
+}
+
+// The candidate `delta` steps (1 clockwise, -1 counter-clockwise) from
+// `current` among those within RT_INTERACT_CYCLE_DISTANCE hexes of it (map
+// hex distance, measured from the highlighted object each time, so distant
+// objects are never chained together), or NULL.
+static Object* rt_next_interaction(Object* current, int delta)
+{
+    int count = (int)rt_interact_candidates.size();
+    int index = (int)(std::find(rt_interact_candidates.begin(), rt_interact_candidates.end(), current) - rt_interact_candidates.begin());
+    if (current == NULL || index >= count) {
+        return NULL;
+    }
+
+    for (int step = 1; step < count; step++) {
+        Object* candidate = rt_interact_candidates[((index + delta * step) % count + count) % count];
+        if (tile_dist(candidate->tile, current->tile) <= RT_INTERACT_CYCLE_DISTANCE) {
+            return candidate;
+        }
+    }
+    return NULL;
+}
+
+static bool rt_can_cycle_interaction(Object* current)
+{
+    return rt_next_interaction(current, 1) != NULL;
+}
+
+// D-pad left/right: the previous/next nearby interaction becomes the
+// highlighted one. Only the highlight changes: no interaction, no movement,
+// never the combat lock.
+static void rt_cycle_interaction(int delta)
+{
+    Object* current = rt_find_interactable();
+    Object* next = rt_next_interaction(current, delta);
+    if (next == NULL) {
+        return;
+    }
+
+    rt_interact_manual = next;
+    rt_stats.interactCycles++;
+    gsound_play_sfx_file("ib1p1xx1");
+    rt_log("interact: selected %s (%d hexes from %s, %d from the player)",
+        rt_name(next), tile_dist(next->tile, current->tile), rt_name(current), tile_dist(next->tile, obj_dude->tile));
+}
+
+const char* rt_get_interact_label()
+{
+    return rt_label.drawn ? rt_label_text : "";
+}
+
+int rt_get_interact_candidate_count()
+{
+    return (int)rt_interact_candidates.size();
+}
+
+int rt_get_interact_candidates(Object** out, int capacity)
+{
+    int count = 0;
+    for (Object* obj : rt_interact_candidates) {
+        if (count >= capacity) {
+            break;
+        }
+        out[count++] = obj;
+    }
+    return count;
 }
 
 static void rt_interact(Object* obj)

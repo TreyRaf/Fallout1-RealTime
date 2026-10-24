@@ -34,6 +34,7 @@
 #include "game/perk.h"
 #include "game/pipboy.h"
 #include "game/proto.h"
+#include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/queue.h"
 #include "game/roll.h"
@@ -380,6 +381,7 @@ void game_reset()
     pip_init();
     ResetLoadSave();
     gdialog_reset();
+    rt_favorites_reset();
     combat_reset();
     game_user_wants_to_quit = 0;
     automap_reset();

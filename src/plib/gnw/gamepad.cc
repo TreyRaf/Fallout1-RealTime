@@ -60,6 +60,11 @@ static bool gamepad_flick_armed = false;
 static bool gamepad_flick_pending = false;
 static float gamepad_flick_x = 0.0f;
 static float gamepad_flick_y = 0.0f;
+// Right stick flicks in menu key mode (aimed shot target switching).
+static bool gamepad_menu_flick_armed = false;
+static bool gamepad_menu_flick_pending = false;
+static float gamepad_menu_flick_x = 0.0f;
+static float gamepad_menu_flick_y = 0.0f;
 static int gamepad_interruptions = 0;
 
 static float gamepad_cursor_accum_x = 0.0f;
@@ -209,6 +214,8 @@ static void gamepad_interrupt_gameplay_input()
     gamepad_look_gated = true;
     gamepad_flick_armed = false;
     gamepad_flick_pending = false;
+    gamepad_menu_flick_armed = false;
+    gamepad_menu_flick_pending = false;
 }
 
 void gamepad_update()
@@ -556,6 +563,8 @@ void gamepad_set_menu_key_mode(bool enabled)
     gamepad_repeat_button = -1;
     // A stick already pushed doesn't count as a new move.
     gamepad_stick_key = -2;
+    gamepad_menu_flick_armed = false;
+    gamepad_menu_flick_pending = false;
 }
 
 bool gamepad_is_menu_key_mode()
@@ -625,24 +634,39 @@ void gamepad_get_move_stick(float* x, float* y)
 #define GAMEPAD_FLICK_ON 0.7f
 #define GAMEPAD_FLICK_OFF 0.3f
 
-static void gamepad_update_flick()
+// One flick detector: armed by a neutral reading, pending once pushed past
+// FLICK_ON.
+static void gamepad_detect_flick(bool* armed, bool* pending, float* outX, float* outY)
 {
-    if (!gamepad_gameplay_mode || !gamepad_state.connected || !gamepad_focused) {
-        gamepad_flick_armed = false;
-        gamepad_flick_pending = false;
-        return;
-    }
-
     float x = gamepad_state.rightX;
     float y = gamepad_state.rightY;
     float magnitude = sqrtf(x * x + y * y);
     if (magnitude <= GAMEPAD_FLICK_OFF) {
-        gamepad_flick_armed = true;
-    } else if (magnitude >= GAMEPAD_FLICK_ON && gamepad_flick_armed) {
+        *armed = true;
+    } else if (magnitude >= GAMEPAD_FLICK_ON && *armed) {
+        *armed = false;
+        *pending = true;
+        *outX = x / magnitude;
+        *outY = y / magnitude;
+    }
+}
+
+static void gamepad_update_flick()
+{
+    bool usable = gamepad_state.connected && gamepad_focused;
+
+    if (!gamepad_gameplay_mode || !usable) {
         gamepad_flick_armed = false;
-        gamepad_flick_pending = true;
-        gamepad_flick_x = x / magnitude;
-        gamepad_flick_y = y / magnitude;
+        gamepad_flick_pending = false;
+    } else {
+        gamepad_detect_flick(&gamepad_flick_armed, &gamepad_flick_pending, &gamepad_flick_x, &gamepad_flick_y);
+    }
+
+    if (gamepad_gameplay_mode || !gamepad_key_mode || !usable) {
+        gamepad_menu_flick_armed = false;
+        gamepad_menu_flick_pending = false;
+    } else {
+        gamepad_detect_flick(&gamepad_menu_flick_armed, &gamepad_menu_flick_pending, &gamepad_menu_flick_x, &gamepad_menu_flick_y);
     }
 }
 
@@ -667,6 +691,18 @@ bool gamepad_consume_flick(float* x, float* y)
     gamepad_flick_pending = false;
     *x = gamepad_flick_x;
     *y = gamepad_flick_y;
+    return true;
+}
+
+bool gamepad_consume_menu_flick(float* x, float* y)
+{
+    if (!gamepad_menu_flick_pending) {
+        return false;
+    }
+
+    gamepad_menu_flick_pending = false;
+    *x = gamepad_menu_flick_x;
+    *y = gamepad_menu_flick_y;
     return true;
 }
 

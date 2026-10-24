@@ -27,6 +27,7 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/realtime.h"
+#include "game/rt_favorites.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/trait.h"
@@ -975,6 +976,10 @@ static std::string pb_item_label(Object* item, int quantity)
     if (quantity > 1) {
         label += " x" + std::to_string(quantity);
     }
+    int favorite = rt_favorites_slot_of(item->pid);
+    if (favorite != -1) {
+        label += std::string("  [") + rt_favorites_slot_name(favorite) + "]";
+    }
     return label;
 }
 
@@ -1285,7 +1290,7 @@ static void pb_render_inventory(int top, int bottom)
         return;
     }
 
-    pb_footer("A Actions   X Drop   Y Inspect   LB/RB Category   B Close");
+    pb_footer("A Actions   X Drop   Y Favorite   LB/RB Category   B Close");
 }
 
 static void pb_inventory_key(int key)
@@ -1346,7 +1351,20 @@ static void pb_inventory_key(int key)
             return;
         }
         if (key == GAMEPAD_KEY_Y || key == KEY_LOWERCASE_Y) {
-            pb_inspect(item);
+            // Favorites: the radial opens over the Pip-Boy; B comes back
+            // to this same item.
+            const char* reason;
+            if (!rt_favorites_is_eligible(item, &reason)) {
+                pb_say("%s", reason);
+                return;
+            }
+            pb_with_engine_ui([&]() {
+                rt_favorites_open_assign(item);
+                return 0;
+            });
+            if (rt_favorites_slot_of(item->pid) != -1) {
+                pb_say("%s", rt_favorites_get_state()->lastMessage);
+            }
             return;
         }
         if (key == GAMEPAD_KEY_X || key == KEY_LOWERCASE_X) {

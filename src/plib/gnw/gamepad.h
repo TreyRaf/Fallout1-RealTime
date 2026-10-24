@@ -97,6 +97,10 @@ void gamepad_get_move_stick(float* x, float* y);
 // flicks; menus, focus loss and disconnects drop pending flicks.
 bool gamepad_consume_flick(float* x, float* y);
 
+// Menu key mode: the same flicks, for a screen that switches targets (the
+// aimed shot screen). The stick must be neutral after the mode starts.
+bool gamepad_consume_menu_flick(float* x, float* y);
+
 // Right stick for camera panning; zero until it returns to neutral after a
 // menu, focus loss or reconnect.
 void gamepad_get_look_stick(float* x, float* y);
