@@ -23,6 +23,9 @@ extern unsigned char* redBlendTable;
 extern unsigned char glassGrayTable[256];
 extern unsigned char commonGrayTable[256];
 extern Object* obj_egg;
+
+// RT: the cutaway around the player (screen rect) and its art size.
+bool obj_egg_get_rect(Rect* rect, int* artWidth, int* artHeight);
 extern Object* obj_dude;
 
 int obj_init(unsigned char* buf, int width, int height, int pitch);

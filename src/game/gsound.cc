@@ -12,6 +12,7 @@
 #include "game/proto.h"
 #include "game/queue.h"
 #include "game/roll.h"
+#include "game/rt_view.h"
 #include "game/sfxcache.h"
 #include "game/stat.h"
 #include "game/worldmap.h"
@@ -1374,6 +1375,8 @@ int gsound_compute_relative_volume(Object* obj)
             }
 
             obj_bound(v7, &v14);
+            // RT: the bounds are in the world buffer; the window shows it scaled.
+            rt_view_world_rect_to_display(&v14, &v14);
 
             win_get_rect(display_win, &iso_win_rect);
 

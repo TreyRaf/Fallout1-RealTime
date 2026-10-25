@@ -17,6 +17,7 @@
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/rt_view.h"
 #include "game/skilldex.h"
 #include "game/tile.h"
 #include "platform_compat.h"
@@ -1594,6 +1595,7 @@ Object* object_under_mouse(int objectType, bool a2, int elevation)
     int mouseX;
     int mouseY;
     mouse_get_position(&mouseX, &mouseY);
+    rt_view_display_to_world(mouseX, mouseY, &mouseX, &mouseY);
 
     bool v13 = false;
     if (objectType == -1) {
@@ -2184,6 +2186,10 @@ static int gmouse_3d_reset_flat_fid(Rect* rect)
 // 0x445A20
 static int gmouse_3d_move_to(int x, int y, int elevation, Rect* a4)
 {
+    // RT: the mouse is over the play area, the map is in the (scaled) world
+    // buffer.
+    rt_view_display_to_world(x, y, &x, &y);
+
     if (gmouse_mapper_mode == 0) {
         if (gmouse_3d_current_mode != GAME_MOUSE_MODE_MOVE) {
             int offsetX = 0;

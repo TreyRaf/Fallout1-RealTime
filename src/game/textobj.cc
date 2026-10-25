@@ -2,8 +2,12 @@
 
 #include <string.h>
 
+#include <algorithm>
+
 #include "game/gconfig.h"
+#include "game/map.h"
 #include "game/object.h"
+#include "game/rt_view.h"
 #include "game/tile.h"
 #include "game/wordwrap.h"
 #include "plib/gnw/debug.h"
@@ -35,10 +39,18 @@ typedef struct TextObject {
     int width;
     int height;
     unsigned char* data;
+    // RT: the speaker's offsets when it spoke, the anchor offset that
+    // follows its walk, and where the text is drawn in the play area.
+    int ownerX;
+    int ownerY;
+    int offsetX;
+    int offsetY;
+    Rect shown;
 } TextObject;
 
 static void text_object_bk();
-static void text_object_get_offset(TextObject* textObject);
+static void text_object_layout(TextObject* textObject, Rect* rect);
+static bool text_object_rect_is_empty(const Rect* rect);
 
 // 0x508324
 static int text_object_index = 0;
@@ -292,18 +304,12 @@ int text_object_create(Object* object, char* string, int font, int color, int a5
 
     if (object != NULL) {
         textObject->tile = object->tile;
+        // RT: the text follows the speaker from here on.
+        textObject->ownerX = object->x;
+        textObject->ownerY = object->y;
     } else {
         textObject->flags |= TEXT_OBJECT_UNBOUNDED;
         textObject->tile = tile_center_tile;
-    }
-
-    text_object_get_offset(textObject);
-
-    if (rect != NULL) {
-        rect->ulx = textObject->x;
-        rect->uly = textObject->y;
-        rect->lrx = textObject->x + textObject->width - 1;
-        rect->lry = textObject->y + textObject->height - 1;
     }
 
     text_object_remove(object);
@@ -311,42 +317,185 @@ int text_object_create(Object* object, char* string, int font, int color, int a5
     textObject->owner = object;
     textObject->time = get_bk_time();
 
+    // RT: placed in the play area, drawn over the map at its normal size.
+    text_object_layout(textObject, &(textObject->shown));
+    textObject->x = textObject->shown.ulx;
+    textObject->y = textObject->shown.uly;
+
+    if (rect != NULL) {
+        // Callers refresh this (world) area; the text itself is shown below.
+        if (text_object_rect_is_empty(&(textObject->shown))) {
+            rect->ulx = 0;
+            rect->uly = 0;
+            rect->lrx = 0;
+            rect->lry = 0;
+        } else {
+            rt_view_display_rect_to_world(&(textObject->shown), rect);
+        }
+    }
+
     text_object_list[text_object_index] = textObject;
     text_object_index++;
+
+    if (!text_object_rect_is_empty(&(textObject->shown))) {
+        rt_view_present_display(&(textObject->shown));
+    }
 
     text_font(oldFont);
 
     return 0;
 }
 
-// 0x49D330
-void text_object_render(Rect* rect)
+// RT: where the text's anchor is in the play area. The anchor follows the
+// speaker (its rendered position, including the offset of a walk in
+// progress); a speaker that left the elevation or was removed leaves the
+// text where it last was.
+static bool text_object_anchor(TextObject* textObject, int* x, int* y)
 {
-    int index;
-    TextObject* textObject;
-    Rect textObjectRect;
+    Object* owner = textObject->owner;
+    if (owner != NULL && (textObject->flags & TEXT_OBJECT_UNBOUNDED) == 0) {
+        if (owner->tile == -1 || owner->elevation != map_elevation) {
+            textObject->owner = NULL;
+        } else {
+            textObject->tile = owner->tile;
+            textObject->offsetX = owner->x - textObject->ownerX;
+            textObject->offsetY = owner->y - textObject->ownerY;
+        }
+    }
 
+    int tileScreenX;
+    int tileScreenY;
+    if (tile_coord(textObject->tile, &tileScreenX, &tileScreenY, map_elevation) != 0) {
+        return false;
+    }
+
+    rt_view_world_to_display(tileScreenX + 16 + textObject->offsetX, tileScreenY + textObject->offsetY, x, y);
+    return true;
+}
+
+// RT: the text's rect in the play area: centered above the speaker's head
+// (60 pixels above its hex at the current zoom), at its normal size, and
+// kept inside the play area while the speaker is on screen.
+static void text_object_layout(TextObject* textObject, Rect* rect)
+{
+    int anchorX;
+    int anchorY;
+    if (!text_object_anchor(textObject, &anchorX, &anchorY)) {
+        rect->ulx = 0;
+        rect->uly = 0;
+        rect->lrx = -1;
+        rect->lry = -1;
+        return;
+    }
+
+    int width = rt_view_display_width();
+    int height = rt_view_display_height();
+
+    int x = anchorX - textObject->width / 2;
+    int y = anchorY;
+    if ((textObject->flags & TEXT_OBJECT_UNBOUNDED) == 0) {
+        y -= textObject->height + (int)(60.0f / rt_view_get_zoom());
+    }
+
+    if (anchorX >= 0 && anchorX < width && anchorY >= 0 && anchorY < height) {
+        x = std::max(0, std::min(x, width - textObject->width));
+        y = std::max(0, std::min(y, height - textObject->height));
+    }
+
+    rect->ulx = x;
+    rect->uly = y;
+    rect->lrx = x + textObject->width - 1;
+    rect->lry = y + textObject->height - 1;
+}
+
+static bool text_object_rect_is_empty(const Rect* rect)
+{
+    return rect->lrx < rect->ulx || rect->lry < rect->uly;
+}
+
+// RT: draws the texts over the play area (display coordinates); called by
+// `rt_view` whenever part of the play area is shown.
+void text_object_render_display(unsigned char* buffer, int pitch, const Rect* rect)
+{
     if (!text_object_initialized) {
         return;
     }
 
-    for (index = 0; index < text_object_index; index++) {
-        textObject = text_object_list[index];
-        tile_coord(textObject->tile, &(textObject->x), &(textObject->y), map_elevation);
-        textObject->x += textObject->sx;
-        textObject->y += textObject->sy;
+    for (int index = 0; index < text_object_index; index++) {
+        TextObject* textObject = text_object_list[index];
+        textObject->x = textObject->shown.ulx;
+        textObject->y = textObject->shown.uly;
+        if (text_object_rect_is_empty(&(textObject->shown))) {
+            continue;
+        }
 
-        textObjectRect.ulx = textObject->x;
-        textObjectRect.uly = textObject->y;
-        textObjectRect.lrx = textObject->width + textObject->x - 1;
-        textObjectRect.lry = textObject->height + textObject->y - 1;
-        if (rect_inside_bound(&textObjectRect, rect, &textObjectRect) == 0) {
+        Rect textObjectRect;
+        if (rect_inside_bound(&(textObject->shown), rect, &textObjectRect) == 0) {
             trans_buf_to_buf(textObject->data + textObject->width * (textObjectRect.uly - textObject->y) + (textObjectRect.ulx - textObject->x),
                 textObjectRect.lrx - textObjectRect.ulx + 1,
                 textObjectRect.lry - textObjectRect.uly + 1,
                 textObject->width,
-                display_buffer + display_width * textObjectRect.uly + textObjectRect.ulx,
-                display_width);
+                buffer + pitch * textObjectRect.uly + textObjectRect.ulx,
+                pitch);
+        }
+    }
+}
+
+// RT: moves each text to where its anchor is now. With `invalidate`, the
+// areas it left and entered are shown again right away; otherwise the
+// caller redraws the whole play area.
+void text_object_relayout(bool invalidate)
+{
+    if (!text_object_initialized) {
+        return;
+    }
+
+    for (int index = 0; index < text_object_index; index++) {
+        TextObject* textObject = text_object_list[index];
+        Rect rect;
+        text_object_layout(textObject, &rect);
+        if (rect.ulx == textObject->shown.ulx
+            && rect.uly == textObject->shown.uly
+            && rect.lrx == textObject->shown.lrx
+            && rect.lry == textObject->shown.lry) {
+            continue;
+        }
+
+        Rect old = textObject->shown;
+        textObject->shown = rect;
+        if (invalidate) {
+            if (!text_object_rect_is_empty(&old)) {
+                rt_view_present_display(&old);
+            }
+            if (!text_object_rect_is_empty(&rect)) {
+                rt_view_present_display(&rect);
+            }
+        }
+    }
+}
+
+// RT: where the newest text of `owner` (NULL: an unbounded one) is drawn in
+// the play area; for the harness.
+bool text_object_get_rect(Object* owner, Rect* rect)
+{
+    for (int index = text_object_index - 1; index >= 0; index--) {
+        TextObject* textObject = text_object_list[index];
+        if (textObject->owner == owner && (textObject->flags & TEXT_OBJECT_MARKED_FOR_REMOVAL) == 0) {
+            *rect = textObject->shown;
+            return true;
+        }
+    }
+    return false;
+}
+
+// RT: the object is going away; its texts stay where they are until they
+// expire.
+void text_object_owner_gone(Object* object)
+{
+    for (int index = 0; index < text_object_index; index++) {
+        TextObject* textObject = text_object_list[index];
+        if (textObject->owner == object) {
+            textObject->owner = NULL;
         }
     }
 }
@@ -372,21 +521,13 @@ static void text_object_bk()
 
         unsigned int delay = text_object_line_delay * textObject->linesCount + text_object_base_delay;
         if ((textObject->flags & TEXT_OBJECT_MARKED_FOR_REMOVAL) != 0 || (elapsed_tocks(get_bk_time(), textObject->time) > delay)) {
-            tile_coord(textObject->tile, &(textObject->x), &(textObject->y), map_elevation);
-            textObject->x += textObject->sx;
-            textObject->y += textObject->sy;
-
-            Rect textObjectRect;
-            textObjectRect.ulx = textObject->x;
-            textObjectRect.uly = textObject->y;
-            textObjectRect.lrx = textObject->width + textObject->x - 1;
-            textObjectRect.lry = textObject->height + textObject->y - 1;
-
-            if (textObjectsRemoved) {
-                rect_min_bound(&dirtyRect, &textObjectRect, &dirtyRect);
-            } else {
-                rectCopy(&dirtyRect, &textObjectRect);
-                textObjectsRemoved = true;
+            if (!text_object_rect_is_empty(&(textObject->shown))) {
+                if (textObjectsRemoved) {
+                    rect_min_bound(&dirtyRect, &(textObject->shown), &dirtyRect);
+                } else {
+                    rectCopy(&dirtyRect, &(textObject->shown));
+                    textObjectsRemoved = true;
+                }
             }
 
             mem_free(textObject->data);
@@ -400,94 +541,11 @@ static void text_object_bk()
     }
 
     if (textObjectsRemoved) {
-        tile_refresh_rect(&dirtyRect, map_elevation);
-    }
-}
-
-// Finds best position for placing text object.
-//
-// 0x49D59C
-static void text_object_get_offset(TextObject* textObject)
-{
-    int tileScreenX;
-    int tileScreenY;
-    tile_coord(textObject->tile, &tileScreenX, &tileScreenY, map_elevation);
-    textObject->x = tileScreenX + 16 - textObject->width / 2;
-    textObject->y = tileScreenY;
-
-    if ((textObject->flags & TEXT_OBJECT_UNBOUNDED) == 0) {
-        textObject->y -= textObject->height + 60;
+        rt_view_present_display(&dirtyRect);
     }
 
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x -= textObject->width / 2;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x += textObject->width;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x = tileScreenX - 16 - textObject->width;
-    textObject->y = tileScreenY - 16 - textObject->height;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x += textObject->width + 64;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x = tileScreenX + 16 - textObject->width / 2;
-    textObject->y = tileScreenY;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x -= textObject->width / 2;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x += textObject->width;
-    if ((textObject->x >= 0 && textObject->x + textObject->width - 1 < display_width)
-        && (textObject->y >= 0 && textObject->y + textObject->height - 1 < display_height)) {
-        textObject->sx = textObject->x - tileScreenX;
-        textObject->sy = textObject->y - tileScreenY;
-        return;
-    }
-
-    textObject->x = tileScreenX + 16 - textObject->width / 2;
-    textObject->y = tileScreenY - (textObject->height + 60);
-    textObject->sx = textObject->x - tileScreenX;
-    textObject->sy = textObject->y - tileScreenY;
+    // RT: texts follow their speakers.
+    text_object_relayout(true);
 }
 
 // Marks text objects attached to `object` for removal.
@@ -498,7 +556,10 @@ void text_object_remove(Object* object)
     int index;
 
     for (index = 0; index < text_object_index; index++) {
-        if (text_object_list[index]->owner == object) {
+        // RT: a NULL owner means the unbounded texts, not texts whose speaker
+        // is gone.
+        if (text_object_list[index]->owner == object
+            && (object != NULL || (text_object_list[index]->flags & TEXT_OBJECT_UNBOUNDED) != 0)) {
             text_object_list[index]->flags |= TEXT_OBJECT_MARKED_FOR_REMOVAL;
         }
     }

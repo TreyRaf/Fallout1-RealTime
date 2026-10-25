@@ -5,7 +5,7 @@
 | Button | Action |
 |---|---|
 | View (Back) | Open the Skilldex |
-| R3 (right-stick click) | Toggle Sneak |
+| R3 (right-stick click) | Wider view on/off (see camera-and-melee.md); Sneak is in the Skilldex |
 | Right-stick flick | Switch the locked target (unchanged) |
 | Y | Cycle the attack mode: single/burst, punch/kick, swing/thrust (moved from View) |
 | A | Contextual action on the highlighted object, within 1 hex |
@@ -34,7 +34,7 @@ These presses only work in gameplay. In menus, dialogue, the Skilldex, the targe
 
 ## Sneak
 
-- **Toggling:** R3, or Sneak in the Skilldex, uses the original Sneak toggle, including its detection checks. Sneaking never guarantees you go unseen.
+- **Toggling:** Sneak in the Skilldex (View, then A on SNEAK, the first row) uses the original Sneak toggle, including its detection checks. Sneaking never guarantees you go unseen. R3 no longer toggles Sneak; it switches the wider view.
 - **Animation:** Fallout 1 has no sneaking animation type (its 65 animation types include none), so the normal walk is kept.
 - **Running:** running ends sneaking unless you have Silent Running, as in the original ("You stop sneaking to run."). Turning Sneak on also turns the run toggle off.
 - **HUD:** the original SNEAK box appears above the interface bar, next to the LEVEL box when a level up is pending; the game draws both side by side. The level-up state is never touched.

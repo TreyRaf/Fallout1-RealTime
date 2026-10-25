@@ -19,6 +19,7 @@ int show_damage_target(Attack* attack);
 int show_damage_extras(Attack* attack);
 void show_damage(Attack* attack, int a2, int a3);
 int action_attack(Attack* attack);
+int action_rt_melee_impact(Attack* attack, int anim);
 int use_an_object(Object* item);
 int a_use_obj(Object* a1, Object* a2, Object* a3);
 int action_use_an_item_on_object(Object* a1, Object* a2, Object* a3);

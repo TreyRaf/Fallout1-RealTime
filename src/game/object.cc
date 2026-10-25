@@ -1,6 +1,7 @@
 #include "game/object.h"
 
 #include <assert.h>
+#include <math.h>
 #include <string.h>
 
 #include <algorithm>
@@ -241,6 +242,118 @@ unsigned char commonGrayTable[256];
 //
 // 0x65F600
 Object* obj_egg;
+
+// RT: the egg is shown at `cutaway_scale_pct` of its art size (twice as wide
+// and tall by default), around the same center. Its mask is the art's,
+// resampled bilinearly so the soft edge keeps its look.
+static unsigned char* obj_egg_mask = NULL;
+static int obj_egg_mask_width = 0;
+static int obj_egg_mask_height = 0;
+static int obj_egg_mask_fid = -1;
+static float obj_egg_scale = 0.0f;
+
+static float obj_egg_get_scale()
+{
+    if (obj_egg_scale <= 0.0f) {
+        int pct = 200;
+        if (config_get_value(&game_config, "realtime", "cutaway_scale_pct", &pct)) {
+            pct = std::max(100, std::min(pct, 400));
+        }
+        obj_egg_scale = pct / 100.0f;
+    }
+    return obj_egg_scale;
+}
+
+// The egg's screen rect and mask; false when it can't be shown.
+static bool obj_egg_geometry(Rect* rect, unsigned char** mask, int* maskWidth)
+{
+    CacheEntry* eggHandle;
+    Art* egg = art_ptr_lock(obj_egg->fid, &eggHandle);
+    if (egg == NULL) {
+        return false;
+    }
+
+    int eggWidth;
+    int eggHeight;
+    art_frame_width_length(egg, 0, 0, &eggWidth, &eggHeight);
+
+    int eggScreenX;
+    int eggScreenY;
+    if (tile_coord(obj_egg->tile, &eggScreenX, &eggScreenY, obj_egg->elevation) != 0) {
+        art_ptr_unlock(eggHandle);
+        return false;
+    }
+    eggScreenX += 16 + egg->xOffsets[0] + obj_egg->x;
+    eggScreenY += 8 + egg->yOffsets[0] + obj_egg->y;
+
+    float scale = obj_egg_get_scale();
+    if (obj_egg_mask == NULL || obj_egg_mask_fid != obj_egg->fid) {
+        int width = (int)(eggWidth * scale + 0.5f);
+        int height = (int)(eggHeight * scale + 0.5f);
+        unsigned char* scaled = (unsigned char*)mem_malloc(width * height);
+        if (scaled == NULL) {
+            art_ptr_unlock(eggHandle);
+            return false;
+        }
+
+        unsigned char* source = art_frame_data(egg, 0, 0);
+        for (int y = 0; y < height; y++) {
+            float v = (y + 0.5f) / scale - 0.5f;
+            int y0 = std::max(0, std::min((int)floorf(v), eggHeight - 1));
+            int y1 = std::min(y0 + 1, eggHeight - 1);
+            float fy = std::max(0.0f, std::min(v - y0, 1.0f));
+            for (int x = 0; x < width; x++) {
+                float u = (x + 0.5f) / scale - 0.5f;
+                int x0 = std::max(0, std::min((int)floorf(u), eggWidth - 1));
+                int x1 = std::min(x0 + 1, eggWidth - 1);
+                float fx = std::max(0.0f, std::min(u - x0, 1.0f));
+                float top = source[eggWidth * y0 + x0] * (1.0f - fx) + source[eggWidth * y0 + x1] * fx;
+                float bottom = source[eggWidth * y1 + x0] * (1.0f - fx) + source[eggWidth * y1 + x1] * fx;
+                scaled[width * y + x] = (unsigned char)(top * (1.0f - fy) + bottom * fy + 0.5f);
+            }
+        }
+
+        if (obj_egg_mask != NULL) {
+            mem_free(obj_egg_mask);
+        }
+        obj_egg_mask = scaled;
+        obj_egg_mask_width = width;
+        obj_egg_mask_height = height;
+        obj_egg_mask_fid = obj_egg->fid;
+    }
+
+    art_ptr_unlock(eggHandle);
+
+    // Same center as the original rect (eggScreenX - w/2 .. , bottom at
+    // eggScreenY).
+    float centerX = eggScreenX - eggWidth / 2 + eggWidth / 2.0f;
+    float centerY = eggScreenY - (eggHeight - 1) + eggHeight / 2.0f;
+    rect->ulx = (int)floorf(centerX - obj_egg_mask_width / 2.0f + 0.5f);
+    rect->uly = (int)floorf(centerY - obj_egg_mask_height / 2.0f + 0.5f);
+    rect->lrx = rect->ulx + obj_egg_mask_width - 1;
+    rect->lry = rect->uly + obj_egg_mask_height - 1;
+
+    if (mask != NULL) {
+        *mask = obj_egg_mask;
+    }
+    if (maskWidth != NULL) {
+        *maskWidth = obj_egg_mask_width;
+    }
+    return true;
+}
+
+// RT: the egg's size, for the harness.
+bool obj_egg_get_rect(Rect* rect, int* artWidth, int* artHeight)
+{
+    CacheEntry* eggHandle;
+    Art* egg = art_ptr_lock(obj_egg->fid, &eggHandle);
+    if (egg == NULL) {
+        return false;
+    }
+    art_frame_width_length(egg, 0, 0, artWidth, artHeight);
+    art_ptr_unlock(eggHandle);
+    return obj_egg_geometry(rect, NULL, NULL);
+}
 
 // 0x65F604
 static int buf_size;
@@ -907,7 +1020,7 @@ void obj_render_post_roof(Rect* rect, int elevation)
         }
     }
 
-    text_object_render(&updatedRect);
+    // RT: floating text is drawn over the scaled view (see rt_view.cc).
 
     ObjectListNode* objectListNode = floatingObjects;
     while (objectListNode != NULL) {
@@ -917,9 +1030,6 @@ void obj_render_post_roof(Rect* rect, int elevation)
         }
         objectListNode = objectListNode->next;
     }
-
-    // RT: lock-on indicator, on top of everything.
-    rt_render_overlay(back_buf, buf_full, &updatedRect);
 }
 
 // 0x47B878
@@ -1970,8 +2080,10 @@ int obj_erase_object(Object* object, Rect* rect)
     }
 
     gmouse_remove_item_outline(object);
-    // RT: the real-time layer forgets the object as well.
+    // RT: the real-time layer forgets the object as well, and its floating
+    // text stops following it.
     rt_object_erased(object);
+    text_object_owner_gone(object);
 
     ObjectListNode* node;
     ObjectListNode* previousNode;
@@ -2059,6 +2171,9 @@ void obj_remove_all()
     ObjectListNode* node;
     ObjectListNode* prev;
     ObjectListNode* next;
+
+    // RT: floating text refers to the objects going away.
+    text_object_reset();
 
     scr_remove_all();
 
@@ -2212,6 +2327,11 @@ void obj_bound(Object* obj, Rect* rect)
     }
 
     if (rect == NULL) {
+        return;
+    }
+
+    // RT: the egg covers more than its art.
+    if (obj == obj_egg && obj_egg_geometry(rect, NULL, NULL)) {
         return;
     }
 
@@ -2654,6 +2774,19 @@ int obj_remove_outline(Object* object, Rect* rect)
 int obj_intersects_with(Object* object, int x, int y)
 {
     int flags = 0;
+
+    // RT: the egg covers more than its art.
+    if (object == obj_egg) {
+        Rect eggRect;
+        unsigned char* mask;
+        int maskWidth;
+        if (obj_egg_geometry(&eggRect, &mask, &maskWidth)
+            && x >= eggRect.ulx && x <= eggRect.lrx && y >= eggRect.uly && y <= eggRect.lry
+            && mask[maskWidth * (y - eggRect.uly) + x - eggRect.ulx] != 0) {
+            return 0x01;
+        }
+        return 0;
+    }
 
     if (object == obj_egg || (object->flags & OBJECT_HIDDEN) == 0) {
         CacheEntry* handle;
@@ -4729,35 +4862,11 @@ static void obj_render_object(Object* object, Rect* rect, int light)
                 }
             }
 
-            if (v17) {
-                CacheEntry* eggHandle;
-                Art* egg = art_ptr_lock(obj_egg->fid, &eggHandle);
-                if (egg == NULL) {
-                    return;
-                }
-
-                int eggWidth;
-                int eggHeight;
-                art_frame_width_length(egg, 0, 0, &eggWidth, &eggHeight);
-
-                int eggScreenX;
-                int eggScreenY;
-                tile_coord(obj_egg->tile, &eggScreenX, &eggScreenY, obj_egg->elevation);
-                eggScreenX += 16;
-                eggScreenY += 8;
-
-                eggScreenX += egg->xOffsets[0];
-                eggScreenY += egg->yOffsets[0];
-
-                eggScreenX += obj_egg->x;
-                eggScreenY += obj_egg->y;
-
-                Rect eggRect;
-                eggRect.ulx = eggScreenX - eggWidth / 2;
-                eggRect.uly = eggScreenY - (eggHeight - 1);
-                eggRect.lrx = eggRect.ulx + eggWidth - 1;
-                eggRect.lry = eggScreenY;
-
+            Rect eggRect;
+            unsigned char* mask;
+            int maskWidth;
+            // RT: the egg is larger than its art (see `obj_egg_geometry`).
+            if (v17 && obj_egg_geometry(&eggRect, &mask, &maskWidth)) {
                 obj_egg->sx = eggRect.ulx;
                 obj_egg->sy = eggRect.uly;
 
@@ -4793,7 +4902,6 @@ static void obj_render_object(Object* object, Rect* rect, int light)
                         }
                     }
 
-                    unsigned char* mask = art_frame_data(egg, 0, 0);
                     intensity_mask_buf_to_buf(
                         src + frameWidth * (updatedEggRect.uly - objectRect.uly) + (updatedEggRect.ulx - objectRect.ulx),
                         updatedEggRect.lrx - updatedEggRect.ulx + 1,
@@ -4801,15 +4909,12 @@ static void obj_render_object(Object* object, Rect* rect, int light)
                         frameWidth,
                         back_buf + buf_full * updatedEggRect.uly + updatedEggRect.ulx,
                         buf_full,
-                        mask + eggWidth * (updatedEggRect.uly - eggRect.uly) + (updatedEggRect.ulx - eggRect.ulx),
-                        eggWidth,
+                        mask + maskWidth * (updatedEggRect.uly - eggRect.uly) + (updatedEggRect.ulx - eggRect.ulx),
+                        maskWidth,
                         light);
-                    art_ptr_unlock(eggHandle);
                     art_ptr_unlock(cacheEntry);
                     return;
                 }
-
-                art_ptr_unlock(eggHandle);
             }
         }
     }

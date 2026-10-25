@@ -663,6 +663,69 @@ static int action_melee(Attack* attack, int anim)
     return 0;
 }
 
+// RT: the second half of a melee attack whose swing was already playing
+// (see `rt_update_swing`): the hit is decided at the swing's impact frame,
+// so only the defender's reaction (hit, dodge, knockdown, death), the
+// contact sound and the damage display are played here. The rest mirrors
+// `action_melee`.
+int action_rt_melee_impact(Attack* attack, int anim)
+{
+    if (register_clear(attack->defender) == -2) {
+        return -1;
+    }
+
+    // A critical miss hurts the attacker, which needs its own animation.
+    bool attackerHurt = (attack->attackerFlags & DAM_HIT) == 0
+        && (attack->attackerFlags & (DAM_CRITICAL | DAM_BACKWASH)) != 0;
+    if (attackerHurt && register_clear(attack->attacker) == -2) {
+        return -1;
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_priority(1);
+
+    const char* sfx_name;
+    char sfx_name_temp[16];
+
+    if ((attack->attackerFlags & 0x0300) != 0) {
+        if (anim != ANIM_THROW_PUNCH && anim != ANIM_KICK_LEG) {
+            sfx_name = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_HIT, attack->weapon, attack->hitMode, attack->defender);
+        } else {
+            sfx_name = gsnd_build_character_sfx_name(attack->attacker, anim, CHARACTER_SOUND_EFFECT_CONTACT);
+        }
+        strcpy(sfx_name_temp, sfx_name);
+        register_object_play_sfx(attack->defender, sfx_name_temp, 0);
+        show_damage(attack, anim, 0);
+    } else if ((attack->defender->data.critter.combat.results & 0x03) == 0) {
+        int fid = art_id(OBJ_TYPE_CRITTER, attack->defender->fid & 0xFFF, ANIM_DODGE_ANIM, (attack->defender->fid & 0xF000) >> 12, attack->defender->rotation + 1);
+        if (art_exists(fid)) {
+            sfx_name = gsnd_build_character_sfx_name(attack->defender, ANIM_DODGE_ANIM, CHARACTER_SOUND_EFFECT_UNUSED);
+            register_object_play_sfx(attack->defender, sfx_name, 0);
+            register_object_animate(attack->defender, ANIM_DODGE_ANIM, 0);
+        }
+        if (attackerHurt) {
+            show_damage(attack, anim, 0);
+        }
+    } else if (attackerHurt) {
+        show_damage(attack, anim, 0);
+    }
+
+    if ((attack->attackerFlags & DAM_HIT) != 0) {
+        if ((attack->defenderFlags & DAM_DEAD) == 0) {
+            combatai_msg(attack->attacker, attack, AI_MESSAGE_TYPE_HIT, -1);
+        }
+    } else {
+        combatai_msg(attack->attacker, attack, AI_MESSAGE_TYPE_MISS, -1);
+    }
+
+    if (register_end() == -1) {
+        return -1;
+    }
+
+    show_damage_extras(attack);
+
+    return 0;
+}
 // 0x4114DC
 static int action_ranged(Attack* attack, int anim)
 {

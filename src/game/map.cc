@@ -28,6 +28,7 @@
 #include "game/queue.h"
 #include "game/realtime.h"
 #include "game/roll.h"
+#include "game/rt_view.h"
 #include "game/scripts.h"
 #include "game/textobj.h"
 #include "game/tile.h"
@@ -268,6 +269,13 @@ TileData* square[ELEVATION_COUNT];
 // 0x6303C8
 int display_win;
 
+// RT: the world renders into a larger buffer that `rt_view` shows in the
+// display window (see rt_view.h).
+static unsigned char* world_buf;
+static int world_width;
+static int world_height;
+static Rect world_rect;
+
 static std::vector<void*> map_global_pointers;
 static std::vector<void*> map_local_pointers;
 
@@ -304,14 +312,27 @@ int iso_init()
 
     debug_printf(">art_init\t\t");
 
-    if (tile_init(square, SQUARE_GRID_WIDTH, SQUARE_GRID_HEIGHT, HEX_GRID_WIDTH, HEX_GRID_HEIGHT, display_buf, scr_size.lrx - scr_size.ulx + 1, scr_size.lry - scr_size.uly - 99, scr_size.lrx - scr_size.ulx + 1, map_display_draw) != 0) {
+    if (!rt_view_init(display_win, display_buf, scr_size.lrx - scr_size.ulx + 1, scr_size.lry - scr_size.uly - 99)) {
+        debug_printf("rt_view_init failed in iso_init\n");
+        return -1;
+    }
+
+    world_buf = rt_view_world_buffer();
+    world_width = rt_view_world_width();
+    world_height = rt_view_world_height();
+    world_rect.ulx = 0;
+    world_rect.uly = 0;
+    world_rect.lrx = world_width - 1;
+    world_rect.lry = world_height - 1;
+
+    if (tile_init(square, SQUARE_GRID_WIDTH, SQUARE_GRID_HEIGHT, HEX_GRID_WIDTH, HEX_GRID_HEIGHT, world_buf, world_width, world_height, world_width, map_display_draw) != 0) {
         debug_printf("tile_init failed in iso_init\n");
         return -1;
     }
 
     debug_printf(">tile_init\t\t");
 
-    if (obj_init(display_buf, scr_size.lrx - scr_size.ulx + 1, scr_size.lry - scr_size.uly - 99, scr_size.lrx - scr_size.ulx + 1) != 0) {
+    if (obj_init(world_buf, world_width, world_height, world_width) != 0) {
         debug_printf("obj_init failed in iso_init\n");
         return -1;
     }
@@ -362,6 +383,7 @@ void iso_exit()
     art_exit();
 
     win_delete(display_win);
+    rt_view_exit();
 
     // NOTE: Uninline.
     map_free_global_vars();
@@ -719,6 +741,34 @@ int map_scroll(int dx, int dy)
 
     map_last_scroll_time = get_time();
 
+    return map_scroll_now(dx, dy);
+}
+
+// RT: whether `map_scroll` would scroll that way, without scrolling.
+bool map_can_scroll(int dx, int dy)
+{
+    if (dx == 0 && dy == 0) {
+        return false;
+    }
+
+    int centerScreenX;
+    int centerScreenY;
+    tile_coord(tile_center_tile, &centerScreenX, &centerScreenY, map_elevation);
+    centerScreenX += dx * 32 + 16;
+    centerScreenY += dy * 24 + 8;
+
+    int newCenterTile = tile_num(centerScreenX, centerScreenY, map_elevation);
+    if (newCenterTile == -1) {
+        return false;
+    }
+
+    return tile_can_set_center(newCenterTile);
+}
+
+// RT: `map_scroll` without its rate limit; the smooth camera paces the
+// steps itself.
+int map_scroll_now(int dx, int dy)
+{
     int screenDx = dx * 32;
     int screenDy = dy * 24;
 
@@ -744,14 +794,14 @@ int map_scroll(int dx, int dy)
     }
 
     Rect r1;
-    rectCopy(&r1, &map_display_rect);
+    rectCopy(&r1, &world_rect);
 
     Rect r2;
     rectCopy(&r2, &r1);
 
-    int width = scr_size.lrx - scr_size.ulx + 1;
+    int width = world_width;
     int pitch = width;
-    int height = scr_size.lry - scr_size.uly - 99;
+    int height = world_height;
 
     if (screenDx != 0) {
         width -= 32;
@@ -772,8 +822,8 @@ int map_scroll(int dx, int dy)
     int step;
     if (screenDy < 0) {
         r1.lry = r1.uly - screenDy;
-        src = display_buf + pitch * (height - 1);
-        dest = display_buf + pitch * (scr_size.lry - scr_size.uly - 100);
+        src = world_buf + pitch * (height - 1);
+        dest = world_buf + pitch * (world_height - 1);
         if (screenDx < 0) {
             dest -= screenDx;
         } else {
@@ -782,8 +832,8 @@ int map_scroll(int dx, int dy)
         step = -pitch;
     } else {
         r1.uly = r1.lry - screenDy;
-        dest = display_buf;
-        src = display_buf + pitch * screenDy;
+        dest = world_buf;
+        src = world_buf + pitch * screenDy;
 
         if (screenDx < 0) {
             dest -= screenDx;
@@ -807,7 +857,7 @@ int map_scroll(int dx, int dy)
         map_scroll_refresh(&r1);
     }
 
-    win_draw(display_win);
+    rt_view_present_all();
 
     return 0;
 }
@@ -1595,23 +1645,23 @@ static void map_match_map_number()
 // 0x475C3C
 static void map_display_draw(Rect* rect)
 {
-    win_draw_rect(display_win, rect);
+    rt_view_blit(rect);
 }
 
 // 0x475C50
 static void map_scroll_refresh_game(Rect* rect)
 {
     Rect rectToUpdate;
-    if (rect_inside_bound(rect, &map_display_rect, &rectToUpdate) == -1) {
+    if (rect_inside_bound(rect, &world_rect, &rectToUpdate) == -1) {
         return;
     }
 
     // CE: Clear dirty rect to prevent most of the visual artifacts near map
     // edges.
-    buf_fill(display_buf + rectToUpdate.uly * rectGetWidth(&map_display_rect) + rectToUpdate.ulx,
+    buf_fill(world_buf + rectToUpdate.uly * world_width + rectToUpdate.ulx,
         rectGetWidth(&rectToUpdate),
         rectGetHeight(&rectToUpdate),
-        rectGetWidth(&map_display_rect),
+        world_width,
         0);
 
     square_render_floor(&rectToUpdate, map_elevation);
@@ -1626,14 +1676,14 @@ static void map_scroll_refresh_game(Rect* rect)
 static void map_scroll_refresh_mapper(Rect* rect)
 {
     Rect rectToUpdate;
-    if (rect_inside_bound(rect, &map_display_rect, &rectToUpdate) == -1) {
+    if (rect_inside_bound(rect, &world_rect, &rectToUpdate) == -1) {
         return;
     }
 
-    buf_fill(display_buf + rectToUpdate.uly * rectGetWidth(&map_display_rect) + rectToUpdate.ulx,
+    buf_fill(world_buf + rectToUpdate.uly * world_width + rectToUpdate.ulx,
         rectGetWidth(&rectToUpdate),
         rectGetHeight(&rectToUpdate),
-        rectGetWidth(&map_display_rect),
+        world_width,
         0);
 
     square_render_floor(&rectToUpdate, map_elevation);

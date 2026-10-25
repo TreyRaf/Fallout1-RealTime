@@ -24,7 +24,7 @@ namespace fallout {
 
 static void gamepad_open_first();
 static void gamepad_read_physical(GamepadState* state);
-static void gamepad_apply_deadzone(float* x, float* y);
+static void gamepad_apply_deadzone(float* x, float* y, float deadzone);
 static void gamepad_interrupt_gameplay_input();
 static void gamepad_handle_menu_press(int button);
 static void gamepad_handle_menu_repeat(unsigned int now);
@@ -42,6 +42,9 @@ static unsigned int gamepad_last_update = 0;
 
 static bool gamepad_gameplay_mode = false;
 static bool gamepad_focused = true;
+// Right stick deadzone (the camera pan setting); the left stick keeps the
+// default.
+static float gamepad_look_deadzone = GAMEPAD_STICK_DEADZONE;
 static bool gamepad_suppress_held = false;
 static GamepadHook* gamepad_hook = NULL;
 static bool gamepad_override_active = false;
@@ -138,16 +141,16 @@ static void gamepad_open_first()
     }
 }
 
-static void gamepad_apply_deadzone(float* x, float* y)
+static void gamepad_apply_deadzone(float* x, float* y, float deadzone)
 {
     float magnitude = sqrtf(*x * *x + *y * *y);
-    if (magnitude < GAMEPAD_STICK_DEADZONE) {
+    if (magnitude < deadzone) {
         *x = 0.0f;
         *y = 0.0f;
         return;
     }
 
-    float scaled = (magnitude - GAMEPAD_STICK_DEADZONE) / (1.0f - GAMEPAD_STICK_DEADZONE);
+    float scaled = (magnitude - deadzone) / (1.0f - deadzone);
     if (scaled > 1.0f) {
         scaled = 1.0f;
     }
@@ -173,8 +176,8 @@ static void gamepad_read_physical(GamepadState* state)
     state->leftY = SDL_GameControllerGetAxis(gamepad_controller, SDL_CONTROLLER_AXIS_LEFTY) / 32767.0f;
     state->rightX = SDL_GameControllerGetAxis(gamepad_controller, SDL_CONTROLLER_AXIS_RIGHTX) / 32767.0f;
     state->rightY = SDL_GameControllerGetAxis(gamepad_controller, SDL_CONTROLLER_AXIS_RIGHTY) / 32767.0f;
-    gamepad_apply_deadzone(&(state->leftX), &(state->leftY));
-    gamepad_apply_deadzone(&(state->rightX), &(state->rightY));
+    gamepad_apply_deadzone(&(state->leftX), &(state->leftY), GAMEPAD_STICK_DEADZONE);
+    gamepad_apply_deadzone(&(state->rightX), &(state->rightY), gamepad_look_deadzone);
 
     state->leftTrigger = SDL_GameControllerGetAxis(gamepad_controller, SDL_CONTROLLER_AXIS_TRIGGERLEFT) / 32767.0f;
     state->rightTrigger = SDL_GameControllerGetAxis(gamepad_controller, SDL_CONTROLLER_AXIS_TRIGGERRIGHT) / 32767.0f;
@@ -251,6 +254,8 @@ void gamepad_update()
         if (!gamepad_state.connected) {
             memset(&gamepad_state, 0, sizeof(gamepad_state));
         }
+        // The injected right stick is raw, like a physical one.
+        gamepad_apply_deadzone(&(gamepad_state.rightX), &(gamepad_state.rightY), gamepad_look_deadzone);
     } else {
         SDL_GameControllerUpdate();
         gamepad_read_physical(&gamepad_state);
@@ -668,6 +673,11 @@ static void gamepad_update_flick()
     } else {
         gamepad_detect_flick(&gamepad_menu_flick_armed, &gamepad_menu_flick_pending, &gamepad_menu_flick_x, &gamepad_menu_flick_y);
     }
+}
+
+void gamepad_set_look_deadzone(float deadzone)
+{
+    gamepad_look_deadzone = deadzone < 0.05f ? 0.05f : (deadzone > 0.6f ? 0.6f : deadzone);
 }
 
 void gamepad_get_look_stick(float* x, float* y)

@@ -37,6 +37,7 @@
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/rt_rules.h"
+#include "game/rt_view.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -58,6 +59,9 @@ namespace fallout {
 #define RT_ATTACK_BUSY 1
 
 #define RT_PENDING_ATTACK_TIMEOUT 6000
+
+// How long a swing's impact waits for a target busy with another attack.
+#define RT_SWING_IMPACT_WAIT_MS 400
 #define RT_TARGET_MAX_DISTANCE 25
 #define RT_ATTACK_BUFFER_MS 1200
 #define RT_PLAYER_RECOVERY_MS 700
@@ -75,7 +79,7 @@ namespace fallout {
 // Reload without put-away/draw art: the weapon is busy this long instead.
 #define RT_RELOAD_FALLBACK_MS 1000
 // Right stick panning: time between scroll steps at full deflection.
-#define RT_CAMERA_PAN_STEP_MS 40
+
 // An RT press with a chem waits this long for an attack involving the player.
 #define RT_CHEM_BUFFER_MS 1500
 // A walk that hasn't moved a critter for this long is stalled.
@@ -129,6 +133,21 @@ typedef struct RtPendingAttack {
     bool slowLogged;
 } RtPendingAttack;
 
+// A melee or unarmed swing started without a target in reach (see
+// `rt_player_swing`); its hit is decided at the impact frame.
+typedef struct RtSwing {
+    bool active;
+    int hitMode;
+    int anim;
+    // The target in reach when the swing started, if any.
+    Object* aim;
+    bool impactDue;
+    bool resolved;
+    bool hit;
+    unsigned int startedAt;
+    unsigned int impactAt;
+} RtSwing;
+
 static void rt_init();
 static void rt_open_log();
 static void rt_rebuild_critter_list();
@@ -137,6 +156,9 @@ static bool rt_is_alive(Object* critter);
 static bool rt_is_player_team(Object* critter);
 static bool rt_obj_in_attack(Object* obj);
 static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation = HIT_LOCATION_UNCALLED);
+static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toHit);
+static int rt_player_swing(int hitMode);
+static void rt_update_swing();
 static void rt_note_critical_deaths(RtPendingAttack* pending);
 static void rt_stop_for_attack(Object* obj);
 static void rt_refresh_death_flags(RtPendingAttack* pending);
@@ -195,6 +217,7 @@ static int rt_reload();
 static void rt_set_interact_highlight(Object* obj);
 static void rt_set_outline(Object** slot, Object* obj, int outlineType);
 static void rt_update_camera();
+static void rt_toggle_zoom();
 static void rt_print(const char* format, ...);
 static char* rt_name(Object* obj);
 static int rt_hits(Object* obj);
@@ -235,23 +258,28 @@ static int rt_move_progress_tile = -1;
 static unsigned int rt_move_progress_at = 0;
 static unsigned int rt_dude_next_attack_at = 0;
 static Object* rt_lock = NULL;
+static RtSwing rt_swing;
 
-// Something drawn over the map by `rt_render_overlay`. Map scrolling shifts
-// the drawn screen (overlay included), so the camera position at the time
-// it was drawn is kept to erase the old image where it moved to.
+// Something drawn over the map by `rt_render_overlay`, at its normal size
+// wherever the object it belongs to appears in the play area (whatever the
+// camera pan and zoom).
 typedef struct RtOverlay {
-    bool drawn;
-    Rect rect;
-    int refTile;
-    int refX;
-    int refY;
+    bool visible;
+    // The object's bounds in world buffer coordinates (`obj_bound`).
+    Rect world;
+    // Where it is drawn in the play area; empty when hidden.
+    Rect shown;
+    int kind;
 } RtOverlay;
 
-static void rt_overlay_place(RtOverlay* overlay, bool visible, const Rect* rect, bool contentChanged);
+#define RT_OVERLAY_INDICATOR 0
+#define RT_OVERLAY_LABEL 1
+
+static void rt_overlay_set(RtOverlay* overlay, bool visible, const Rect* world, bool contentChanged);
 
 // Lock-on indicator: crosshair art plus hit chance, drawn over the map.
 static RtIndicator rt_indicator;
-static RtOverlay rt_indicator_overlay = { false, { 0, 0, -1, -1 }, -1, 0, 0 };
+static RtOverlay rt_indicator_overlay = { false, { 0, 0, -1, -1 }, { 0, 0, -1, -1 }, RT_OVERLAY_INDICATOR };
 static unsigned char* rt_indicator_buf = NULL;
 static int rt_indicator_width = 0;
 static int rt_indicator_height = 0;
@@ -271,7 +299,24 @@ static int rt_last_camera_elevation = -1;
 static bool rt_camera_scrolling = false;
 // The right stick moved the view away from the player.
 static bool rt_camera_free = false;
-static unsigned int rt_camera_next_pan_at = 0;
+// Smooth camera: pan velocity (play area pixels per second), who owns the
+// right stick for the current push (camera or target switching), the wider
+// view toggle and the tick length.
+static float rt_pan_vx = 0.0f;
+static float rt_pan_vy = 0.0f;
+static int rt_rstick_owner = 0;
+// Fastest edge-follow glide, play area pixels per second.
+#define RT_CAMERA_FOLLOW_MAX_SPEED 1100.0f
+#define RT_RSTICK_NONE 0
+#define RT_RSTICK_PAN 1
+#define RT_RSTICK_SWITCH 2
+static bool rt_camera_limit_logged = false;
+static float rt_camera_dt = 0.0f;
+static int rt_cam_deadzone_pct = 20;
+static int rt_cam_pan_speed = 1100;
+static int rt_cam_pan_smoothing_ms = 60;
+static int rt_cam_follow_ms = 110;
+static int rt_cam_zoom_ms = 200;
 
 // Player attack slot: one committed enemy attack on the player at a time,
 // granted first come, first served.
@@ -326,7 +371,7 @@ static std::unordered_map<Object*, RtReach> rt_reach_cache;
 
 // Interaction label: the highlighted object's name, what A does and, with
 // several objects in reach, the D-pad prompts.
-static RtOverlay rt_label = { false, { 0, 0, -1, -1 }, -1, 0, 0 };
+static RtOverlay rt_label = { false, { 0, 0, -1, -1 }, { 0, 0, -1, -1 }, RT_OVERLAY_LABEL };
 static char rt_label_text[200] = "";
 static unsigned char* rt_label_buf = NULL;
 static int rt_label_capacity = 0;
@@ -367,12 +412,30 @@ static void rt_init()
     if (config_get_value(&game_config, RT_CONFIG_SECTION, "holster_hold_ms", &value) && value >= 100 && value <= 2000) {
         rt_holster_hold_ms = value;
     }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_pan_deadzone_pct", &value) && value >= 5 && value <= 60) {
+        rt_cam_deadzone_pct = value;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_pan_speed", &value) && value >= 100 && value <= 5000) {
+        rt_cam_pan_speed = value;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_pan_smoothing_ms", &value) && value >= 0 && value <= 500) {
+        rt_cam_pan_smoothing_ms = value;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_follow_ms", &value) && value >= 0 && value <= 1000) {
+        rt_cam_follow_ms = value;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_zoom_transition_ms", &value) && value >= 0 && value <= 1000) {
+        rt_cam_zoom_ms = value;
+    }
+    gamepad_set_look_deadzone(rt_cam_deadzone_pct / 100.0f);
 
     rt_open_log();
 
     rt_log("Fallout1-RealTime: real-time layer %s", rt_is_enabled ? "ENABLED" : "disabled");
     rt_log("config: camera_edge_scroll=%d camera_margin_pct=%d run_drain_ms_per_ap=%d ap_regen_ms_per_ap=%d attack_cooldown_ms_per_ap=%d",
         rt_camera_edge_scroll, rt_camera_margin_pct, rt_run_drain_ms, rt_ap_regen_ms, rt_ms_per_ap);
+    rt_log("config: camera_pan_deadzone_pct=%d camera_pan_speed=%d camera_pan_smoothing_ms=%d camera_follow_ms=%d camera_zoom_transition_ms=%d camera_zoom_out=%.2f",
+        rt_cam_deadzone_pct, rt_cam_pan_speed, rt_cam_pan_smoothing_ms, rt_cam_follow_ms, rt_cam_zoom_ms, rt_view_get_max_zoom());
     rt_log("controllers detected at startup: %d%s%s",
         gamepad_get_detected_count(),
         gamepad_get_detected_count() > 0 ? ", using: " : "",
@@ -492,7 +555,8 @@ void rt_reset()
     rt_move_dest = -1;
     rt_lock = NULL;
     rt_indicator.visible = false;
-    rt_indicator_overlay.drawn = false;
+    rt_indicator_overlay.visible = false;
+    rt_indicator_overlay.shown = { 0, 0, -1, -1 };
     rt_attack_buffered_until = 0;
     rt_fire_hold = false;
     rt_fire_press_done = false;
@@ -501,6 +565,11 @@ void rt_reset()
     rt_last_camera_elevation = -1;
     rt_camera_free = false;
     rt_camera_scrolling = false;
+    rt_camera_limit_logged = false;
+    rt_pan_vx = 0.0f;
+    rt_pan_vy = 0.0f;
+    rt_rstick_owner = RT_RSTICK_NONE;
+    rt_view_reset_pan();
     rt_slot_holder = NULL;
     rt_slot_queue.clear();
     rt_slot_wait_start.clear();
@@ -524,7 +593,9 @@ void rt_reset()
     rt_interact_candidates.clear();
     rt_reach_cache.clear();
     rt_label_text[0] = '\0';
-    rt_label.drawn = false;
+    rt_label.visible = false;
+    rt_label.shown = { 0, 0, -1, -1 };
+    memset(&rt_swing, 0, sizeof(rt_swing));
     rt_aimed_reset("map load");
 
     gamepad_reset_gameplay_input();
@@ -552,6 +623,9 @@ void rt_object_erased(Object* obj)
     if (rt_chem_request_item == obj) {
         rt_chem_request_item = NULL;
         rt_chem_requested_until = 0;
+    }
+    if (rt_swing.aim == obj) {
+        rt_swing.aim = NULL;
     }
     rt_aimed_object_erased(obj);
     if (rt_lock == obj) {
@@ -660,6 +734,15 @@ bool rt_is_hostile(Object* critter)
     return rt_is_hostile_to_player(critter);
 }
 
+// Harness: the camera follows the player again (as when the player moves
+// after a manual pan).
+void rt_debug_camera_follow()
+{
+    rt_camera_free = false;
+    rt_pan_vx = 0.0f;
+    rt_pan_vy = 0.0f;
+}
+
 void rt_debug_set_lock(Object* target)
 {
     rt_set_lock(target);
@@ -687,7 +770,7 @@ bool rt_is_engaged(Object* critter)
     return it != rt_states.end() && it->second.engaged;
 }
 
-// R3 (or Sneak in the Skilldex): the original Sneak toggle (the detection
+// Sneak in the Skilldex: the original Sneak toggle (the detection
 // rules and the HUD's SNEAK box are the original game's). Fallout 1 has no
 // sneaking animation: the player walks normally. A run in progress is
 // turned off, since running ends sneaking (unless Silent Running).
@@ -752,11 +835,13 @@ void rt_tick()
 
     rt_rebuild_critter_list();
     rt_resolve_attacks();
+    rt_update_swing();
     rt_update_player_slot();
     rt_update_engagements();
     rt_update_knockdowns();
     rt_update_dude((float)realDelta);
     rt_update_ai();
+    rt_camera_dt = (float)realDelta;
     rt_update_camera();
     rt_update_indicator();
 }
@@ -819,6 +904,11 @@ static bool rt_is_player_team(Object* critter)
 
 static bool rt_obj_in_attack(Object* obj)
 {
+    // A swing in progress keeps the player busy like an attack.
+    if (obj == obj_dude && rt_swing.active) {
+        return true;
+    }
+
     for (RtPendingAttack* pending : rt_pending) {
         Attack* attack = &(pending->attack);
         if (attack->attacker == obj || attack->defender == obj) {
@@ -901,6 +991,18 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
         delete pending;
         return RT_ATTACK_BUSY;
     }
+
+    rt_attack_started(pending, hitLocation, toHit);
+    return 0;
+}
+
+// Bookkeeping for an attack whose animations were registered: it lands when
+// they are over (see `rt_resolve_attacks`).
+static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toHit)
+{
+    Attack* attack = &(pending->attack);
+    Object* attacker = attack->attacker;
+    Object* defender = attack->defender;
 
     if (defender == obj_dude) {
         for (RtPendingAttack* other : rt_pending) {
@@ -992,8 +1094,269 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
         (attack->attackerFlags & DAM_CRITICAL) != 0 ? " CRITICAL" : "",
         attack->defenderDamage,
         attack->defenderFlags);
+}
 
+// -----------------------------------------------------------------------------
+// Melee and unarmed swings without a target in reach
+// -----------------------------------------------------------------------------
+
+// Whether the hex rotation from the player to `obj` is within `maxSteps` of
+// the way the player faces (0: straight ahead, 1: the front arc).
+static bool rt_swing_in_front(Object* obj, int maxSteps)
+{
+    if (obj->tile == obj_dude->tile) {
+        return false;
+    }
+    int diff = abs(tile_dir(obj_dude->tile, obj->tile) - obj_dude->rotation);
+    diff = std::min(diff, 6 - diff);
+    return diff <= maxSteps;
+}
+
+// Who a swing can hit: a living critter (not the player's team) within the
+// attack's reach (Bonus HtH Attacks included, not through walls) and in
+// front of the player: an enemy anywhere in the front arc, anyone else only
+// straight ahead. The lock comes first, then the closest, then the best
+// aligned.
+static Object* rt_find_swing_target(int hitMode)
+{
+    if (rt_lock != NULL
+        && rt_is_known_critter(rt_lock)
+        && rt_lock->elevation == obj_dude->elevation
+        && rt_check_shot(obj_dude, rt_lock, hitMode) == COMBAT_BAD_SHOT_OK
+        && rt_swing_in_front(rt_lock, 1)) {
+        return rt_lock;
+    }
+
+    Object* best = NULL;
+    int bestScore = 0;
+    for (Object* critter : rt_critters) {
+        if (critter == obj_dude
+            || critter->elevation != obj_dude->elevation
+            || (critter->flags & OBJECT_HIDDEN) != 0
+            || rt_is_player_team(critter)
+            || !rt_is_alive(critter)) {
+            continue;
+        }
+
+        bool hostile = rt_is_hostile_to_player(critter);
+        if (!rt_swing_in_front(critter, hostile ? 1 : 0)) {
+            continue;
+        }
+
+        if (rt_check_shot(obj_dude, critter, hitMode) != COMBAT_BAD_SHOT_OK) {
+            continue;
+        }
+
+        int score = obj_dist(obj_dude, critter) * 10 + (rt_swing_in_front(critter, 0) ? 0 : 1);
+        if (best == NULL || score < bestScore) {
+            best = critter;
+            bestScore = score;
+        }
+    }
+    return best;
+}
+
+static int rt_swing_impact(void* a1, void* a2)
+{
+    rt_swing.impactDue = true;
+    rt_swing.impactAt = rt_now;
     return 0;
+}
+
+// RT with a melee weapon or unarmed and no locked target in reach: one swing
+// toward the way the player faces (turning to an enemy in the front arc).
+// Whether it hits anyone is decided at its impact frame.
+static int rt_player_swing(int hitMode)
+{
+    if (rt_swing.active || rt_obj_in_attack(obj_dude) || rt_now < rt_dude_next_attack_at) {
+        return RT_PLAYER_ATTACK_WAIT;
+    }
+
+    Object* weapon = item_hit_with(obj_dude, hitMode);
+    if (weapon != NULL) {
+        int results = obj_dude->data.critter.combat.results;
+        if ((results & DAM_CRIP_ARM_LEFT) != 0 && (results & DAM_CRIP_ARM_RIGHT) != 0) {
+            rt_print("You can't use that weapon with crippled arms.");
+            return RT_PLAYER_ATTACK_FAILED;
+        }
+        if ((results & DAM_CRIP_ARM_ANY) != 0 && item_w_is_2handed(weapon)) {
+            rt_print("You can't use that weapon with crippled arms.");
+            return RT_PLAYER_ATTACK_FAILED;
+        }
+    }
+
+    // The sprite must show the weapon in hand first (right after a swap it
+    // may still hold the previous one).
+    int code = weapon != NULL ? item_w_anim_code(weapon) : 0;
+    if (((obj_dude->fid & 0xF000) >> 12) != code) {
+        rt_sync_weapon_sprite();
+        if (((obj_dude->fid & 0xF000) >> 12) != code) {
+            return RT_PLAYER_ATTACK_WAIT;
+        }
+    }
+
+    // Same as `rt_attack`: unarmed attacks are sometimes kicks.
+    if (hitMode == HIT_MODE_PUNCH && roll_random(1, 4) == 1) {
+        int kickFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_KICK_LEG, (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+        if (art_exists(kickFid)) {
+            hitMode = HIT_MODE_KICK;
+        }
+    }
+
+    int anim = item_w_anim(obj_dude, hitMode);
+    int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, anim, (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art == NULL) {
+        rt_log("swing: no attack art (anim %d, weapon code %d)", anim, (obj_dude->fid & 0xF000) >> 12);
+        return RT_PLAYER_ATTACK_FAILED;
+    }
+    int actionFrame = art_frame_action_frame(art);
+    art_ptr_unlock(handle);
+
+    // Turn to the enemy the swing aims at (only enemies in the front arc:
+    // the player never turns toward a bystander).
+    Object* aim = rt_find_swing_target(hitMode);
+    int turnTile = -1;
+    if (aim != NULL && rt_is_hostile_to_player(aim) && !rt_swing_in_front(aim, 0)) {
+        turnTile = aim->tile;
+    } else if (aim == NULL && rt_lock != NULL && rt_is_hostile_to_player(rt_lock)
+        && rt_lock->elevation == obj_dude->elevation && rt_swing_in_front(rt_lock, 1)) {
+        turnTile = rt_lock->tile;
+    }
+
+    rt_stop_for_attack(obj_dude);
+    rt_move_active = false;
+
+    const char* sfx;
+    if (anim != ANIM_THROW_PUNCH && anim != ANIM_KICK_LEG) {
+        sfx = gsnd_build_weapon_sfx_name(WEAPON_SOUND_EFFECT_ATTACK, weapon, hitMode, NULL);
+    } else {
+        sfx = gsnd_build_character_sfx_name(obj_dude, anim, CHARACTER_SOUND_EFFECT_UNUSED);
+    }
+    char sfxName[16];
+    SDL_strlcpy(sfxName, sfx != NULL ? sfx : "", sizeof(sfxName));
+
+    if (register_clear(obj_dude) == -2) {
+        return RT_PLAYER_ATTACK_WAIT;
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_priority(1);
+    if (turnTile != -1) {
+        register_object_turn_towards(obj_dude, turnTile);
+    }
+    register_object_play_sfx(obj_dude, sfxName, -1);
+    register_object_animate(obj_dude, anim, 0);
+    register_object_call(obj_dude, NULL, rt_swing_impact, actionFrame);
+    if (register_end() == -1) {
+        return RT_PLAYER_ATTACK_WAIT;
+    }
+
+    rt_swing.active = true;
+    rt_swing.hitMode = hitMode;
+    rt_swing.anim = anim;
+    rt_swing.aim = aim;
+    rt_swing.impactDue = false;
+    rt_swing.resolved = false;
+    rt_swing.hit = false;
+    rt_swing.startedAt = rt_now;
+    rt_swing.impactAt = 0;
+
+    rt_stats.freeSwings++;
+    rt_stats.lastSwingAnim = anim;
+    rt_log("swing: %s (anim %d) toward rotation %d, aiming at %s",
+        hitMode == HIT_MODE_KICK ? "kick" : "attack", anim, obj_dude->rotation, aim != NULL ? rt_name(aim) : "nobody");
+    return RT_PLAYER_ATTACK_STARTED;
+}
+
+// The swing's hit at its impact frame: an ordinary attack attempt (vanilla
+// to-hit roll, damage, armor and criticals), landing when the reactions are
+// over. Returns 0, RT_ATTACK_BUSY or -1.
+static int rt_swing_hit(Object* defender)
+{
+    if (rt_obj_in_attack(defender)) {
+        return RT_ATTACK_BUSY;
+    }
+
+    RtPendingAttack* pending = new RtPendingAttack();
+    Attack* attack = &(pending->attack);
+    combat_ctd_init(attack, obj_dude, defender, rt_swing.hitMode, HIT_LOCATION_UNCALLED);
+    int toHit = determine_to_hit(obj_dude, defender, HIT_LOCATION_UNCALLED, rt_swing.hitMode);
+
+    if (combat_rt_compute_attack(attack) == -1) {
+        rt_log("swing: compute_attack failed on %s", rt_name(defender));
+        delete pending;
+        return -1;
+    }
+
+    rt_stop_for_attack(defender);
+    if (action_rt_melee_impact(attack, rt_swing.anim) == -1) {
+        delete pending;
+        return RT_ATTACK_BUSY;
+    }
+
+    rt_stats.lastSwingToHit = toHit;
+    rt_stats.lastSwingDefender = defender;
+    rt_attack_started(pending, HIT_LOCATION_UNCALLED, toHit);
+    return 0;
+}
+
+// Resolves the swing at its impact frame (the target is checked again
+// there: still alive, in reach and in front) and ends it with the
+// animation.
+static void rt_update_swing()
+{
+    if (!rt_swing.active) {
+        return;
+    }
+
+    if (rt_swing.impactDue && !rt_swing.resolved) {
+        Object* target = NULL;
+        Object* aim = rt_swing.aim;
+        if (aim != NULL
+            && rt_is_known_critter(aim)
+            && aim->elevation == obj_dude->elevation
+            && rt_check_shot(obj_dude, aim, rt_swing.hitMode) == COMBAT_BAD_SHOT_OK
+            && rt_swing_in_front(aim, 1)) {
+            target = aim;
+        } else {
+            target = rt_find_swing_target(rt_swing.hitMode);
+        }
+
+        if (target == NULL) {
+            rt_swing.resolved = true;
+            rt_stats.freeSwingWhiffs++;
+            rt_log("swing: nobody in reach at the impact%s", aim != NULL ? " (the target moved away)" : "");
+        } else {
+            int rc = rt_swing_hit(target);
+            if (rc == 0) {
+                rt_swing.resolved = true;
+                rt_swing.hit = true;
+                rt_stats.freeSwingAttempts++;
+            } else if (rc == -1 || rt_now - rt_swing.impactAt > RT_SWING_IMPACT_WAIT_MS) {
+                // The target stayed busy with another attack: the swing
+                // passes without contact.
+                rt_swing.resolved = true;
+                rt_stats.freeSwingWhiffs++;
+                rt_log("swing: %s busy at the impact, no contact", rt_name(target));
+            }
+        }
+    }
+
+    bool animDone = !anim_busy(obj_dude);
+    bool timedOut = rt_now - rt_swing.startedAt > RT_PENDING_ATTACK_TIMEOUT;
+    if ((animDone && (rt_swing.resolved || !rt_swing.impactDue)) || timedOut) {
+        if (!rt_swing.impactDue) {
+            rt_log("swing: interrupted before the impact");
+        }
+        rt_swing.active = false;
+        rt_swing.aim = NULL;
+        if (!rt_swing.hit) {
+            // A hit sets the cooldown when it lands (see `rt_resolve_attacks`).
+            rt_dude_next_attack_at = rt_now + item_w_mp_cost(obj_dude, rt_swing.hitMode, false) * rt_ms_per_ap;
+        }
+    }
 }
 
 static void rt_stop_for_attack(Object* obj)
@@ -1851,13 +2214,32 @@ static void rt_update_dude(float dtMs)
     bool pressDown = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_DOWN);
     bool pressLeft = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_LEFT);
     bool pressRight = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_RIGHT);
-    // R3 toggles Sneak, View (Back) opens the Skilldex, Y cycles the attack
-    // mode.
+    // R3 toggles the wider view, View (Back) opens the Skilldex (Sneak is
+    // there), Y cycles the attack mode.
     bool pressR3 = gamepad_consume_press(GAMEPAD_BUTTON_RIGHT_STICK);
     bool pressY = gamepad_consume_press(GAMEPAD_BUTTON_Y);
     float flickX;
     float flickY;
     bool flick = gamepad_consume_flick(&flickX, &flickY);
+
+    // A right stick push belongs to the camera or to target switching,
+    // whichever applied when it left the center, until it returns there; one
+    // push never pans and switches targets.
+    float lookX;
+    float lookY;
+    gamepad_get_look_stick(&lookX, &lookY);
+    if (lookX == 0.0f && lookY == 0.0f) {
+        rt_rstick_owner = RT_RSTICK_NONE;
+    } else if (rt_rstick_owner == RT_RSTICK_NONE) {
+        rt_rstick_owner = rt_lock != NULL ? RT_RSTICK_SWITCH : RT_RSTICK_PAN;
+    }
+    if (flick && rt_rstick_owner != RT_RSTICK_SWITCH) {
+        flick = false;
+    }
+
+    if (pressR3) {
+        rt_toggle_zoom();
+    }
 
     // The lock follows its target and drops it when it becomes invalid.
     if (rt_lock != NULL && !rt_lock_is_valid(rt_lock)) {
@@ -1899,7 +2281,7 @@ static void rt_update_dude(float dtMs)
     // reloads, interactions or equipment changes until the queue is done.
     // The lock can still be moved (it doesn't change any queued target).
     if (rt_aimed_is_executing()) {
-        if (pressAttack || pressX || pressA || pressRB || pressBack || pressLB || pressR3 || pressY
+        if (pressAttack || pressX || pressA || pressRB || pressBack || pressLB || pressY
             || pressUp || pressDown || pressLeft || pressRight || pressRun) {
             rt_print("Aimed attacks in progress. B cancels the rest.");
         }
@@ -1937,9 +2319,6 @@ static void rt_update_dude(float dtMs)
     }
     if (pressBack) {
         GNW_add_input_buffer(KEY_LOWERCASE_S);
-    }
-    if (pressR3) {
-        rt_toggle_sneak();
     }
 
     if (pressLB) {
@@ -2424,12 +2803,9 @@ static bool rt_get_play_area(int* width, int* height)
 // the gameplay area.
 static bool rt_screen_pos(Object* obj, int* x, int* y)
 {
-    if (tile_coord(obj->tile, x, y, obj->elevation) != 0) {
+    if (!rt_view_tile_center(obj->tile, obj->elevation, x, y)) {
         return false;
     }
-
-    *x += 16;
-    *y += 8;
 
     int width;
     int height;
@@ -2692,75 +3068,122 @@ static void rt_update_indicator()
         }
     }
 
-    Rect rect = { 0, 0, -1, -1 };
+    Rect bounds = { 0, 0, -1, -1 };
     if (next.visible) {
         if (!rt_indicator_build(next.text, color)) {
             next.visible = false;
         } else {
-            rect.ulx = next.x - rt_indicator_cross_width / 2;
-            rect.uly = next.y - rt_indicator_height / 2;
-            rect.lrx = rect.ulx + rt_indicator_width - 1;
-            rect.lry = rect.uly + rt_indicator_height - 1;
+            obj_bound(rt_lock, &bounds);
         }
     }
 
     bool textChanged = strcmp(next.text, rt_indicator.text) != 0;
     rt_indicator = next;
-    rt_overlay_place(&rt_indicator_overlay, next.visible, &rect, textChanged);
+    rt_overlay_set(&rt_indicator_overlay, next.visible, &bounds, textChanged);
+    if (rt_indicator.visible) {
+        rt_indicator.x = rt_indicator_overlay.shown.ulx + rt_indicator_cross_width / 2;
+        rt_indicator.y = rt_indicator_overlay.shown.uly + rt_indicator_height / 2;
+    }
 }
 
-// Shows `overlay` at `rect` (or hides it), erasing the previous image, also
-// where map scrolling moved it to.
-static void rt_overlay_place(RtOverlay* overlay, bool visible, const Rect* rect, bool contentChanged)
+// Where `overlay` goes in the play area: the crosshair on the center of its
+// object, the label centered above it (below when there is no room), kept
+// inside the play area.
+static void rt_overlay_layout(const RtOverlay* overlay, Rect* rect)
 {
-    bool scrolled = overlay->drawn && overlay->refTile != tile_center_tile;
-    bool moved = rect->ulx != overlay->rect.ulx
-        || rect->uly != overlay->rect.uly
-        || rect->lrx != overlay->rect.lrx
-        || rect->lry != overlay->rect.lry;
-    bool changed = scrolled
-        || visible != overlay->drawn
-        || (visible && (moved || contentChanged));
-    if (!changed) {
+    rect->ulx = 0;
+    rect->uly = 0;
+    rect->lrx = -1;
+    rect->lry = -1;
+    if (!overlay->visible) {
         return;
     }
 
-    if (overlay->drawn) {
-        // Erase: the overlay must not be drawn while its old area redraws.
-        overlay->drawn = false;
-        tile_refresh_rect(&(overlay->rect), map_elevation);
+    Rect bounds;
+    rt_view_world_rect_to_display(&(overlay->world), &bounds);
 
-        int x;
-        int y;
-        if (scrolled && tile_coord(overlay->refTile, &x, &y, map_elevation) == 0) {
-            Rect shifted = overlay->rect;
-            rectOffset(&shifted, x - overlay->refX, y - overlay->refY);
-            tile_refresh_rect(&shifted, map_elevation);
+    if (overlay->kind == RT_OVERLAY_INDICATOR) {
+        int x = (bounds.ulx + bounds.lrx) / 2;
+        int y = (bounds.uly + bounds.lry) / 2;
+        rect->ulx = x - rt_indicator_cross_width / 2;
+        rect->uly = y - rt_indicator_height / 2;
+        rect->lrx = rect->ulx + rt_indicator_width - 1;
+        rect->lry = rect->uly + rt_indicator_height - 1;
+        return;
+    }
+
+    int width;
+    int height;
+    rt_get_play_area(&width, &height);
+    int x = (bounds.ulx + bounds.lrx) / 2 - rt_label_width / 2;
+    int y = bounds.uly - rt_label_height - 2;
+    if (y < 2) {
+        y = bounds.lry + 4;
+    }
+    x = std::max(2, std::min(x, width - rt_label_width - 2));
+    y = std::max(2, std::min(y, height - rt_label_height - 2));
+    rect->ulx = x;
+    rect->uly = y;
+    rect->lrx = x + rt_label_width - 1;
+    rect->lry = y + rt_label_height - 1;
+}
+
+// Moves the overlay to where its object is now. With `invalidate` the areas
+// it left and entered are shown again right away; `force` redraws it in
+// place (new content).
+static void rt_overlay_sync(RtOverlay* overlay, bool invalidate, bool force)
+{
+    Rect rect;
+    rt_overlay_layout(overlay, &rect);
+    bool same = rect.ulx == overlay->shown.ulx
+        && rect.uly == overlay->shown.uly
+        && rect.lrx == overlay->shown.lrx
+        && rect.lry == overlay->shown.lry;
+    if (same && !force) {
+        return;
+    }
+
+    Rect old = overlay->shown;
+    overlay->shown = rect;
+    if (invalidate) {
+        if (old.ulx <= old.lrx && old.uly <= old.lry) {
+            rt_view_present_display(&old);
+        }
+        if (!same && rect.ulx <= rect.lrx && rect.uly <= rect.lry) {
+            rt_view_present_display(&rect);
         }
     }
+}
 
-    overlay->drawn = visible;
+// Shows `overlay` over the object with bounds `world` (or hides it).
+static void rt_overlay_set(RtOverlay* overlay, bool visible, const Rect* world, bool contentChanged)
+{
+    overlay->visible = visible;
     if (visible) {
-        overlay->rect = *rect;
-        overlay->refTile = tile_center_tile;
-        tile_coord(overlay->refTile, &(overlay->refX), &(overlay->refY), map_elevation);
-        tile_refresh_rect(&(overlay->rect), map_elevation);
+        overlay->world = *world;
     }
+    rt_overlay_sync(overlay, true, contentChanged);
+}
+
+void rt_overlays_relayout(bool invalidate)
+{
+    rt_overlay_sync(&rt_indicator_overlay, invalidate, false);
+    rt_overlay_sync(&rt_label, invalidate, false);
 }
 
 static void rt_overlay_draw(const RtOverlay* overlay, unsigned char* src, int srcPitch, unsigned char* buffer, int pitch, Rect* rect)
 {
-    if (!overlay->drawn || src == NULL) {
+    if (src == NULL || overlay->shown.lrx < overlay->shown.ulx) {
         return;
     }
 
     Rect clipped;
-    if (rect_inside_bound(&(overlay->rect), rect, &clipped) != 0) {
+    if (rect_inside_bound(&(overlay->shown), rect, &clipped) != 0) {
         return;
     }
 
-    int srcX = clipped.ulx - overlay->rect.ulx;
-    int srcY = clipped.uly - overlay->rect.uly;
+    int srcX = clipped.ulx - overlay->shown.ulx;
+    int srcY = clipped.uly - overlay->shown.uly;
     trans_buf_to_buf(src + srcPitch * srcY + srcX,
         clipped.lrx - clipped.ulx + 1,
         clipped.lry - clipped.uly + 1,
@@ -2797,7 +3220,6 @@ static void rt_update_label(Object* target)
         SDL_strlcpy(rt_label_text, text, sizeof(rt_label_text));
     }
 
-    Rect rect = { 0, 0, -1, -1 };
     if (visible) {
         int oldFont = text_curr();
         text_font(101);
@@ -2839,27 +3261,14 @@ static void rt_update_label(Object* target)
             buf_outline(rt_label_buf, rt_label_width, rt_label_height, rt_label_width, colorTable[0]);
         }
         text_font(oldFont);
-
-        // Centered above the object, kept inside the play area.
-        Rect bounds;
-        obj_bound(target, &bounds);
-        int width;
-        int height;
-        rt_get_play_area(&width, &height);
-        int x = (bounds.ulx + bounds.lrx) / 2 - rt_label_width / 2;
-        int y = bounds.uly - rt_label_height - 2;
-        if (y < 2) {
-            y = bounds.lry + 4;
-        }
-        x = std::max(2, std::min(x, width - rt_label_width - 2));
-        y = std::max(2, std::min(y, height - rt_label_height - 2));
-        rect.ulx = x;
-        rect.uly = y;
-        rect.lrx = x + rt_label_width - 1;
-        rect.lry = y + rt_label_height - 1;
     }
 
-    rt_overlay_place(&rt_label, visible, &rect, textChanged);
+    // Centered above the object, kept inside the play area.
+    Rect bounds = { 0, 0, -1, -1 };
+    if (visible) {
+        obj_bound(target, &bounds);
+    }
+    rt_overlay_set(&rt_label, visible, &bounds, textChanged);
 }
 
 // -----------------------------------------------------------------------------
@@ -3016,7 +3425,20 @@ static int rt_player_attack(bool explicitPress)
         return RT_PLAYER_ATTACK_FAILED;
     }
 
-    // No lock, no attack: RT never picks a target by itself.
+    // Melee and unarmed: the lock is optional. A locked target in reach is
+    // attacked as before; otherwise the press swings anyway, and the swing
+    // hits whoever is in reach in front of the player at its impact.
+    int attackType = item_w_subtype(item_hit_with(obj_dude, hitMode), hitMode);
+    if (attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) {
+        if (rt_reload_active || rt_holster_active) {
+            return RT_PLAYER_ATTACK_WAIT;
+        }
+        if (rt_lock == NULL || rt_check_shot(obj_dude, rt_lock, hitMode) != COMBAT_BAD_SHOT_OK) {
+            return rt_player_swing(hitMode);
+        }
+    }
+
+    // No lock, no ranged attack: RT never picks a target by itself.
     Object* target = rt_lock;
     if (target == NULL) {
         rt_print("No target locked. Press LT to lock on.");
@@ -3398,7 +3820,7 @@ static void rt_cycle_interaction(int delta)
 
 const char* rt_get_interact_label()
 {
-    return rt_label.drawn ? rt_label_text : "";
+    return rt_label.visible ? rt_label_text : "";
 }
 
 int rt_get_interact_candidate_count()
@@ -3796,39 +4218,44 @@ void rt_play_draw(Object* weapon)
     }
 }
 
-// One engine scroll step (32x24 px), which respects the map's scroll limits;
-// a blocked diagonal step falls back to either axis. Returns `map_scroll`'s
-// result.
-static int rt_camera_step(int dx, int dy)
+// R3: toggles between the default view and the wider one, keeping the
+// player where it is on screen (as far as the map's scroll limits allow).
+static void rt_toggle_zoom()
 {
-    int rc = map_scroll(dx, dy);
-    if (rc == -1 && dx != 0 && dy != 0) {
-        rc = map_scroll(dx, 0);
-        if (rc == -1) {
-            rc = map_scroll(0, dy);
-        }
-    }
-    return rc;
+    float target = rt_view_get_target_zoom() > 1.0f ? 1.0f : rt_view_get_max_zoom();
+    rt_view_set_zoom(target, rt_cam_zoom_ms, obj_dude->tile);
+    rt_stats.zoomToggles++;
+    rt_log("camera: %s view (zoom %.2f)", target > 1.0f ? "wider" : "default", target);
 }
 
 // Right stick camera panning while nothing is locked (with a lock the right
-// stick switches targets instead). The view may leave the player behind; it
-// stays where it was put until the player moves again. Returns true while
-// the stick pans.
-static bool rt_update_camera_pan()
+// stick switches targets instead; a push belongs to whichever it started
+// with). The pan is analog and continuous: it starts as soon as the stick
+// leaves its deadzone, its speed follows the deflection, a short smoothing
+// keeps it fluid, and it stops as soon as the stick is back in the center.
+// The view may leave the player behind; it stays where it was put until the
+// player moves again. Returns true while the camera pans.
+static bool rt_update_camera_pan(float dtMs)
 {
     float sx;
     float sy;
     gamepad_get_look_stick(&sx, &sy);
-    float magnitude = sqrtf(sx * sx + sy * sy);
-    if (rt_lock != NULL || magnitude <= 0.0f) {
-        return false;
+    bool pushed = rt_rstick_owner == RT_RSTICK_PAN && (sx != 0.0f || sy != 0.0f);
+
+    float targetX = pushed ? sx * rt_cam_pan_speed : 0.0f;
+    float targetY = pushed ? sy * rt_cam_pan_speed : 0.0f;
+    // Releasing settles faster than pushing, so the view stops promptly.
+    float smoothing = pushed ? (float)rt_cam_pan_smoothing_ms : rt_cam_pan_smoothing_ms * 0.4f;
+    float blend = smoothing > 0.0f ? 1.0f - expf(-dtMs / smoothing) : 1.0f;
+    rt_pan_vx += (targetX - rt_pan_vx) * blend;
+    rt_pan_vy += (targetY - rt_pan_vy) * blend;
+
+    if (!pushed && fabsf(rt_pan_vx) < 60.0f && fabsf(rt_pan_vy) < 60.0f) {
+        rt_pan_vx = 0.0f;
+        rt_pan_vy = 0.0f;
     }
 
-    // Eight directions; a fuller push scrolls faster.
-    int dx = sx > 0.38f * magnitude ? 1 : (sx < -0.38f * magnitude ? -1 : 0);
-    int dy = sy > 0.38f * magnitude ? 1 : (sy < -0.38f * magnitude ? -1 : 0);
-    if (dx == 0 && dy == 0) {
+    if (rt_pan_vx == 0.0f && rt_pan_vy == 0.0f) {
         return false;
     }
 
@@ -3837,38 +4264,38 @@ static bool rt_update_camera_pan()
         rt_log("camera: panning with the right stick");
     }
 
-    if (rt_now < rt_camera_next_pan_at) {
-        return true;
-    }
-
-    int rc = rt_camera_step(dx, dy);
-    if (rc == 0) {
-        rt_stats.cameraPans++;
-        rt_camera_next_pan_at = rt_now + (unsigned int)(RT_CAMERA_PAN_STEP_MS / magnitude);
-    }
+    // Play area pixels per second, converted to world pixels at this zoom.
+    float zoom = rt_view_get_zoom();
+    rt_view_move(rt_pan_vx * dtMs / 1000.0f * zoom, rt_pan_vy * dtMs / 1000.0f * zoom);
+    rt_stats.cameraPans++;
     return true;
 }
 
 // Edge scrolling. The camera stays still while the player is inside an
 // inner box of the gameplay area (the map above the interface bar). Near an
-// edge it scrolls toward that edge in the engine's own scroll steps, which
-// respect the map's scroll limits, until the player is back inside the box.
-// The right stick can pan the view away (see `rt_update_camera_pan`); once
-// the player moves again, the same scrolling brings the view back.
+// edge it glides toward that edge, by the amount the player is past the box,
+// until the player is back inside; the map's scroll limits stop it. The
+// right stick can pan the view away (see `rt_update_camera_pan`); once the
+// player moves again, the same scrolling brings the view back.
 static void rt_update_camera()
 {
-    if (!rt_camera_edge_scroll || obj_dude->elevation != map_elevation) {
-        return;
-    }
+    float dtMs = rt_camera_dt;
 
     int width;
     int height;
-    if (!rt_get_play_area(&width, &height)) {
+    if (!rt_get_play_area(&width, &height) || obj_dude->elevation != map_elevation) {
+        rt_view_update(dtMs);
         return;
     }
 
-    if (rt_update_camera_pan()) {
+    if (rt_update_camera_pan(dtMs)) {
         rt_camera_scrolling = false;
+        rt_view_update(dtMs);
+        return;
+    }
+
+    if (!rt_camera_edge_scroll) {
+        rt_view_update(dtMs);
         return;
     }
 
@@ -3877,17 +4304,20 @@ static void rt_update_camera()
         float my;
         gamepad_get_move_stick(&mx, &my);
         if (mx == 0.0f && my == 0.0f) {
+            rt_view_update(dtMs);
             return;
         }
         rt_camera_free = false;
         rt_log("camera: player moves, following again");
     }
 
+    // The player as drawn (a walk in progress included).
+    int wx;
+    int wy;
+    bool known = tile_coord(obj_dude->tile, &wx, &wy, obj_dude->elevation) == 0;
     int x;
     int y;
-    bool known = tile_coord(obj_dude->tile, &x, &y, obj_dude->elevation) == 0;
-    x += 16;
-    y += 8;
+    rt_view_world_to_display(wx + 16 + obj_dude->x, wy + 8 + obj_dude->y, &x, &y);
 
     // A new map or elevation (or a player far away after a scripted move)
     // gets the camera centered on the player; otherwise it scrolls.
@@ -3896,10 +4326,12 @@ static void rt_update_camera()
         bool onScreen = known && x >= 0 && x < width && y >= 0 && y < height;
         rt_last_camera_elevation = map_elevation;
         if (!onScreen && tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW) != -1) {
+            rt_view_reset_pan();
             rt_stats.cameraRecenters++;
             rt_log("camera: player off screen, centered");
         }
         rt_camera_scrolling = false;
+        rt_view_update(dtMs);
         return;
     }
 
@@ -3911,38 +4343,63 @@ static void rt_update_camera()
     int insetX = rt_camera_scrolling ? 16 : 0;
     int insetY = rt_camera_scrolling ? 12 : 0;
 
-    int dx = 0;
+    float overX = 0.0f;
     if (x < marginX + insetX) {
-        dx = -1;
+        overX = (float)(x - (marginX + (rt_camera_scrolling ? insetX : 0)));
     } else if (x > width - marginX - insetX) {
-        dx = 1;
+        overX = (float)(x - (width - marginX - (rt_camera_scrolling ? insetX : 0)));
     }
 
-    int dy = 0;
+    float overY = 0.0f;
     if (y < marginY + insetY) {
-        dy = -1;
+        overY = (float)(y - (marginY + (rt_camera_scrolling ? insetY : 0)));
     } else if (y > height - marginY - insetY) {
-        dy = 1;
+        overY = (float)(y - (height - marginY - (rt_camera_scrolling ? insetY : 0)));
     }
 
-    if (dx == 0 && dy == 0) {
+    if (fabsf(overX) < 0.5f && fabsf(overY) < 0.5f) {
         rt_camera_scrolling = false;
+        rt_camera_limit_logged = false;
+        rt_view_update(dtMs);
         return;
     }
 
-    int rc = rt_camera_step(dx, dy);
+    float blend = rt_cam_follow_ms > 0 ? 1.0f - expf(-dtMs / rt_cam_follow_ms) : 1.0f;
+    float zoom = rt_view_get_zoom();
 
-    if (rc == 0) {
+    float panX1;
+    float panY1;
+    rt_view_get_pan(&panX1, &panY1);
+    int center = tile_center_tile;
+
+    // A far-away player (after a pan) comes back fast but without jumps.
+    float stepX = overX * blend;
+    float stepY = overY * blend;
+    float maxStep = RT_CAMERA_FOLLOW_MAX_SPEED * dtMs / 1000.0f;
+    float length = sqrtf(stepX * stepX + stepY * stepY);
+    if (length > maxStep && length > 0.0f) {
+        stepX *= maxStep / length;
+        stepY *= maxStep / length;
+    }
+    rt_view_move(stepX * zoom, stepY * zoom);
+
+    float panX2;
+    float panY2;
+    rt_view_get_pan(&panX2, &panY2);
+    if (center != tile_center_tile || panX1 != panX2 || panY1 != panY2) {
         rt_stats.cameraScrolls++;
         rt_camera_scrolling = true;
-    } else if (rc == -1) {
+    } else if (dtMs > 0.0f) {
         // At the map's scroll limit: stay put.
-        if (rt_camera_scrolling) {
+        if (!rt_camera_limit_logged) {
+            rt_camera_limit_logged = true;
             rt_stats.cameraLimitStops++;
             rt_log("camera: stopped at the map scroll limit");
         }
         rt_camera_scrolling = false;
     }
+
+    rt_view_update(dtMs);
 }
 
 } // namespace fallout

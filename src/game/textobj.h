@@ -17,7 +17,10 @@ unsigned int text_object_get_base_delay();
 void text_object_set_line_delay(double value);
 unsigned int text_object_get_line_delay();
 int text_object_create(Object* object, char* string, int font, int color, int a5, Rect* rect);
-void text_object_render(Rect* rect);
+void text_object_render_display(unsigned char* buffer, int pitch, const Rect* rect);
+void text_object_relayout(bool invalidate);
+void text_object_owner_gone(Object* object);
+bool text_object_get_rect(Object* owner, Rect* rect);
 int text_object_count();
 void text_object_remove(Object* object);
 

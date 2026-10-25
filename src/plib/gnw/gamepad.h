@@ -104,6 +104,9 @@ bool gamepad_consume_menu_flick(float* x, float* y);
 // Right stick for camera panning; zero until it returns to neutral after a
 // menu, focus loss or reconnect.
 void gamepad_get_look_stick(float* x, float* y);
+// Radial deadzone of the right stick (0..1); the stick reads 0 inside it and
+// is rescaled to 0..1 outside.
+void gamepad_set_look_deadzone(float deadzone);
 
 // Drops pending presses and holds and gates the stick (e.g. on map load).
 void gamepad_reset_gameplay_input();

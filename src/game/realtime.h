@@ -93,8 +93,19 @@ typedef struct RtStats {
     float sprintCalmAp;
     // AP regenerated while sprinting outside combat.
     float sprintCalmRegen;
-    // R3 / Skilldex Sneak toggles.
+    // Skilldex Sneak toggles.
     int sneakToggles;
+    // Melee/unarmed swings without a target in reach: started, those that
+    // reached someone at the impact (an ordinary attack attempt), those that
+    // met nobody, the last swing animation, hit chance and defender.
+    int freeSwings;
+    int freeSwingAttempts;
+    int freeSwingWhiffs;
+    int lastSwingAnim;
+    int lastSwingToHit;
+    Object* lastSwingDefender;
+    // R3 wider view toggles.
+    int zoomToggles;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -123,8 +134,12 @@ void rt_log(const char* format, ...);
 const RtStats* rt_get_stats();
 Object* rt_get_lock();
 const RtIndicator* rt_get_indicator();
-// Draws the lock-on indicator on top of the map (called by the renderer).
+// Draws the label and the lock-on indicator over the play area, in display
+// coordinates (called by rt_view).
 void rt_render_overlay(unsigned char* buffer, int pitch, Rect* rect);
+// Moves the label and the indicator to where their objects appear (after a
+// camera move).
+void rt_overlays_relayout(bool invalidate);
 bool rt_is_reloading();
 Object* rt_get_player_slot_holder();
 int rt_get_player_slot_queue_length();
@@ -134,6 +149,7 @@ Object* rt_get_interact_target();
 int rt_get_camera_margin_pct();
 bool rt_is_hostile(Object* critter);
 void rt_debug_set_lock(Object* target);
+void rt_debug_camera_follow();
 // Test fixture: sets the player's current AP.
 void rt_debug_set_ap(float ap);
 float rt_get_dude_ap();

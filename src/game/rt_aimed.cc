@@ -20,6 +20,7 @@
 #include "game/object.h"
 #include "game/proto.h"
 #include "game/realtime.h"
+#include "game/rt_view.h"
 #include "game/stat.h"
 #include "game/tile.h"
 #include "game/trait.h"
@@ -560,8 +561,8 @@ void rt_aimed_open()
     int x = (screenWidth - AIM_WIDTH) / 2;
     int tx;
     int ty;
-    if (tile_coord(target->tile, &tx, &ty, target->elevation) == 0 && screenWidth >= AIM_WIDTH + 160) {
-        x = tx + 16 < screenWidth / 2 ? screenWidth - AIM_WIDTH - 8 : 8;
+    if (rt_view_tile_center(target->tile, target->elevation, &tx, &ty) && screenWidth >= AIM_WIDTH + 160) {
+        x = tx < screenWidth / 2 ? screenWidth - AIM_WIDTH - 8 : 8;
     }
     int y = (screenHeight - AIM_HEIGHT) / 2;
     if (y < 0) {

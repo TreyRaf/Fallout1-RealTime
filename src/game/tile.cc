@@ -569,6 +569,52 @@ int tile_set_center(int tile, int flags)
     return 0;
 }
 
+// RT: the checks `tile_set_center` makes (scroll limiting, scroll blockers,
+// map border), without moving the view.
+bool tile_can_set_center(int tile)
+{
+    if (!TILE_IS_VALID(tile)) {
+        return false;
+    }
+
+    if (scroll_limiting_on) {
+        int tileScreenX;
+        int tileScreenY;
+        tile_coord(tile, &tileScreenX, &tileScreenY, map_elevation);
+
+        int dudeScreenX;
+        int dudeScreenY;
+        tile_coord(obj_dude->tile, &dudeScreenX, &dudeScreenY, map_elevation);
+
+        int dx = abs(dudeScreenX - tileScreenX);
+        int dy = abs(dudeScreenY - tileScreenY);
+
+        if (dx > abs(dudeScreenX - tile_offx)
+            || dy > abs(dudeScreenY - tile_offy)) {
+            if (dx >= 480 || dy >= 400) {
+                return false;
+            }
+        }
+    }
+
+    if (scroll_blocking_on) {
+        if (obj_scroll_blocking_at(tile, map_elevation) == 0) {
+            return false;
+        }
+    }
+
+    int new_tile_x = grid_width - 1 - tile % grid_width;
+    int new_tile_y = tile / grid_width;
+
+    if (borderInitialized) {
+        if (new_tile_x <= tile_border.ulx || new_tile_x >= tile_border.lrx || new_tile_y <= tile_border.uly || new_tile_y >= tile_border.lry) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 // 0x49E138
 static void refresh_mapper(Rect* rect, int elevation)
 {

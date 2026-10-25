@@ -37,6 +37,7 @@
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/rt_rules.h"
+#include "game/rt_view.h"
 #include "game/queue.h"
 #include "game/skilldex.h"
 #include "game/worldmap.h"
@@ -45,9 +46,11 @@
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
+#include "game/textobj.h"
 #include "game/tile.h"
 #include "game/trait.h"
 #include "platform_compat.h"
+#include "plib/color/color.h"
 #include "plib/gnw/gamepad.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
@@ -232,6 +235,25 @@ typedef enum AutotestCheck {
     C_TRAP_CONTEXT,
     C_TRAP_ARM,
     C_REPAIR_CONTEXT,
+    C_TEXT_FOLLOW,
+    C_TEXT_MULTI,
+    C_CUTAWAY,
+    C_SWING_EMPTY,
+    C_SWING_BEHIND,
+    C_SWING_NEUTRAL,
+    C_SWING_HIT,
+    C_SWING_REACH,
+    C_SWING_HOLD,
+    C_SWING_LOCK,
+    C_PAN_IMMEDIATE,
+    C_PAN_ANALOG,
+    C_PAN_STOPS,
+    C_PAN_DEADZONE,
+    C_PAN_OWNER,
+    C_PAN_FOCUS,
+    C_ZOOM_TOGGLE,
+    C_ZOOM_ALIGN,
+    C_ZOOM_INPUT,
     C_COUNT,
 } AutotestCheck;
 
@@ -266,7 +288,7 @@ static const char* at_check_names[C_COUNT] = {
     "Target switching doesn't move the camera",
     "With no enemy nearby, LT locks the nearest neutral NPC",
     "Locking a neutral NPC causes no attack or aggression",
-    "RT without a lock attacks nothing (hostile adjacent, after unlock)",
+    "RT with a ranged weapon and no lock attacks nothing (hostile adjacent, after unlock)",
     "Indicator = vanilla hit chance: unarmed",
     "Indicator = vanilla hit chance: melee",
     "Indicator = vanilla hit chance: guns (single and burst)",
@@ -286,7 +308,7 @@ static const char* at_check_names[C_COUNT] = {
     "Reload transfers ammunition exactly once",
     "No firing until the reload completes",
     "Interrupted reload loses or duplicates no ammunition",
-    "Melee reach not bypassed; no auto-walk",
+    "Melee reach not bypassed (a locked target out of reach: the swing hits nothing); no auto-walk",
     "Blocked line of fire is not bypassed",
     "At most one committed enemy attack on the player at a time",
     "Several enemies take turns attacking the player (no starvation)",
@@ -302,9 +324,9 @@ static const char* at_check_names[C_COUNT] = {
     "A: several applicable actions give a controller menu (A picks, B cancels)",
     "Camera stays still while the player moves inside the frame",
     "Camera scrolls toward each edge (left, right, up, down)",
-    "Camera scrolls in small steps (no jumps or recentering)",
+    "Camera glides toward the edge (no jumps or recentering)",
     "No lock: right stick pans the camera, even past the player",
-    "After panning the view stays; walking brings it back in steps",
+    "After panning the view stays; walking brings it back smoothly",
     "A never offers First Aid or Doctor",
     "RT with a chem in the active slot uses one on the player (hold doesn't repeat)",
     "Controller disconnect stops input; no phantom actions on reconnect",
@@ -396,15 +418,34 @@ static const char* at_check_names[C_COUNT] = {
     "Skilldex: First Aid used on yourself through the picker (original healing, daily uses)",
     "Skilldex: Doctor opens its picker with its chance per check",
     "Skilldex: Y on the Pip-Boy Skills page closes the Pip-Boy and opens the Skilldex",
-    "Sneak: R3 toggles it; walking keeps it; running ends it (unless Silent Running)",
+    "Sneak: toggled from the Skilldex; walking keeps it; running ends it (unless Silent Running)",
     "Sneak: SNEAK box in the HUD; next to LEVEL when a level up is pending; level-up state untouched",
-    "Sneak: R3 does nothing in the Skilldex or the Pip-Boy",
+    "R3 does nothing in the Skilldex or the Pip-Boy (neither Sneak nor the wider view)",
     "Sneak: state and SNEAK box restored after loading",
     "Steal: A is Steal only while sneaking; approaching or highlighting takes nothing",
     "Steal: A opens the original steal screen with the item's chance unnoticed; the original check decides",
     "Traps: a detected trap offers 'Disarm trap' and A runs its script; hidden (undetected) traps aren't offered",
     "Traps: explosives arm through the timer window (controller) with the original Traps roll",
     "Repair: a repairable object offers Repair and A runs its script; an unmet requirement blocks the attempt",
+    "Ambient dialogue follows its speaker (walking, and while the camera pans)",
+    "Ambient dialogue: several speakers at once, a removed speaker, expiration",
+    "Cutaway around the player: twice the size (linear), same center, at both zoom levels",
+    "Melee/unarmed without a lock: RT swings (animation) even with nobody in reach",
+    "Swings never hit behind the player, nor a bystander beside the front arc, and don't turn toward bystanders",
+    "Swing at a bystander straight ahead: an attack attempt with the original hostility",
+    "Swing at an enemy in the front arc: turns to it, ordinary attack attempt, damage once",
+    "Swing reach: 1 hex unarmed, 2 with Bonus HtH Attacks, never through walls",
+    "Held RT swings once; a target that left reach before the impact isn't hit",
+    "A locked melee target in reach is attacked through the lock",
+    "Right stick pans as soon as it leaves the deadzone",
+    "Pan speed follows the stick deflection, continuously and smoothly",
+    "Pan stops promptly when the stick is released",
+    "Right stick inside the deadzone doesn't pan",
+    "One push never pans and switches targets",
+    "Focus loss stops the pan; held input doesn't resume it",
+    "R3: wider view and back to the exact default zoom, player kept in place",
+    "Wider view: lock indicator and floating text stay aligned",
+    "R3: one toggle per press, never Sneak; edge scrolling works zoomed out",
 };
 
 static int at_results[C_COUNT];
@@ -868,9 +909,39 @@ static bool at_filter_enemy_team(Object* critter)
     return critter->data.critter.combat.team != obj_dude->data.critter.combat.team;
 }
 
+// `tile_coord` in play area coordinates: the hex's top left corner as the
+// player sees it (the hex center is 16, 8 from it at the default zoom).
+static int at_tile_coord(int tile, int* x, int* y, int elevation)
+{
+    int cx;
+    int cy;
+    if (!rt_view_tile_center(tile, elevation, &cx, &cy)) {
+        return -1;
+    }
+    *x = cx - 16;
+    *y = cy - 8;
+    return 0;
+}
+
+// The camera as a whole: the engine's center hex and the sub-step pan.
+static float at_cam_pan_x = 0.0f;
+static float at_cam_pan_y = 0.0f;
+
+static void at_camera_remember()
+{
+    rt_view_get_pan(&at_cam_pan_x, &at_cam_pan_y);
+}
+
+static bool at_camera_same(int center)
+{
+    float x;
+    float y;
+    rt_view_get_pan(&x, &y);
+    return center == tile_center_tile && fabsf(x - at_cam_pan_x) < 0.5f && fabsf(y - at_cam_pan_y) < 0.5f;
+}
 static bool at_screen_pos(Object* obj, int* x, int* y)
 {
-    if (tile_coord(obj->tile, x, y, obj->elevation) != 0) {
+    if (at_tile_coord(obj->tile, x, y, obj->elevation) != 0) {
         return false;
     }
     *x += 16;
@@ -1053,6 +1124,51 @@ static Object* at_create_weapon(int primaryMode, int secondaryMode, bool normalD
     return NULL;
 }
 
+// A gun for the tests that need a ranged weapon, created for them and
+// removed afterwards with its ammunition (see `at_release_test_pistol`), so
+// later inventory tests see the inventory they expect.
+static Object* at_pistol = NULL;
+static int at_pistol_ammo_pid = -1;
+static int at_pistol_ammo_before = 0;
+
+static Object* at_test_pistol()
+{
+    if (at_pistol == NULL || obj_top_environment(at_pistol) != obj_dude) {
+        // The ammunition the gun comes with (see `at_create_weapon`).
+        Proto* proto;
+        at_pistol_ammo_pid = -1;
+        for (int index = 1; index < 600 && at_pistol_ammo_pid == -1; index++) {
+            int pid = (OBJ_TYPE_ITEM << 24) | index;
+            if (proto_ptr(pid, &proto) != -1 && proto->item.type == ITEM_TYPE_WEAPON
+                && (proto->item.extendedFlags & 0xF) == 6) {
+                at_pistol_ammo_pid = proto->item.data.weapon.ammoTypePid;
+            }
+        }
+        at_pistol_ammo_before = at_pistol_ammo_pid > 0 ? inven_pid_quantity_carried(obj_dude, at_pistol_ammo_pid) : 0;
+        at_pistol = at_create_weapon(6, -1, false, 1);
+    }
+    return at_pistol;
+}
+
+static void at_release_test_pistol()
+{
+    if (at_pistol != NULL && obj_top_environment(at_pistol) == obj_dude) {
+        at_unarmed();
+        item_remove_mult(obj_dude, at_pistol, 1);
+        Rect rect;
+        obj_erase_object(at_pistol, &rect);
+        if (at_pistol_ammo_pid > 0) {
+            int extra = inven_pid_quantity_carried(obj_dude, at_pistol_ammo_pid) - at_pistol_ammo_before;
+            Object* ammo = extra > 0 ? inven_pid_is_carried_ptr(obj_dude, at_pistol_ammo_pid) : NULL;
+            if (ammo != NULL) {
+                item_remove_mult(obj_dude, ammo, extra);
+            }
+        }
+        at_log("harness: test gun and its ammunition removed");
+    }
+    at_pistol = NULL;
+}
+
 // 6 = single fire, 7 = burst, 5 = throw (see `attack_anim` in item.cc).
 static Object* at_create_burst_weapon()
 {
@@ -1101,7 +1217,7 @@ static int at_free_tile(int minDistance, int maxDistance)
             }
             int x;
             int y;
-            if (tile_coord(tile, &x, &y, obj_dude->elevation) != 0) {
+            if (at_tile_coord(tile, &x, &y, obj_dude->elevation) != 0) {
                 continue;
             }
             int width = scr_size.lrx - scr_size.ulx + 1;
@@ -1170,7 +1286,7 @@ static int at_covered_tile(int maxDistance)
                 int x;
                 int y;
                 if (tile == -1 || obj_blocking_at(NULL, tile, obj_dude->elevation) != NULL
-                    || tile_coord(tile, &x, &y, obj_dude->elevation) != 0
+                    || at_tile_coord(tile, &x, &y, obj_dude->elevation) != 0
                     || x < 20 || x > width - 40 || y < 20 || y > height - 30) {
                     continue;
                 }
@@ -1194,6 +1310,7 @@ static bool at_indicator_matches(Object* target, char* note, size_t size)
 
     Rect bounds;
     obj_bound(target, &bounds);
+    rt_view_world_rect_to_display(&bounds, &bounds);
     bool onTarget = indicator->x >= bounds.ulx && indicator->x <= bounds.lrx
         && indicator->y >= bounds.uly && indicator->y <= bounds.lry;
 
@@ -1256,12 +1373,21 @@ static int at_lock_candidates(Object** out, int capacity)
 // Steps: movement
 // -----------------------------------------------------------------------------
 
+// Where the player starts on the opening map: an open spot the camera
+// can scroll around (see `at_vw_home`).
+static int at_home_tile = -1;
+static int at_home_elevation = 0;
+static char at_home_map[16] = "";
+
 static bool step_wait_load(unsigned int elapsed, bool first, bool timedOut)
 {
     if (elapsed < 3000) {
         return false;
     }
 
+    at_home_tile = obj_dude->tile;
+    at_home_elevation = obj_dude->elevation;
+    SDL_strlcpy(at_home_map, map_data.name, sizeof(at_home_map));
     at_log("map: %s elevation=%d player tile=%d hp=%d/%d maxAP=%d",
         map_data.name,
         obj_dude->elevation,
@@ -2014,8 +2140,9 @@ static bool step_unlock(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
-// RT without a lock never attacks, even with a hostile right next to the
-// player (and so also right after unlocking).
+// RT with a ranged weapon and no lock never attacks, even with a hostile
+// right next to the player (and so also right after unlocking). Melee and
+// unarmed swing without a lock (see `step_swing`).
 static bool step_no_lock_rt(unsigned int elapsed, bool first, bool timedOut)
 {
     unsigned int now = SDL_GetTicks();
@@ -2038,6 +2165,9 @@ static bool step_no_lock_rt(unsigned int elapsed, bool first, bool timedOut)
                 break;
             }
         }
+        if (!at_wield(at_test_pistol())) {
+            break;
+        }
         at_obj_a = hostile;
         at_count_a = rt_get_stats()->playerAttacks;
         at_count_b = rt_get_stats()->playerRejected;
@@ -2052,11 +2182,12 @@ static bool step_no_lock_rt(unsigned int elapsed, bool first, bool timedOut)
         }
         at_check(C_NO_LOCK_RT,
             rt_get_stats()->playerAttacks == at_count_a && rt_get_stats()->playerRejected > at_count_b && rt_get_lock() == NULL,
-            "hostile at %d tiles, no lock: attacks=%d, rejected=%d, lock acquired=%d",
+            "pistol, hostile at %d tiles, no lock: attacks=%d, rejected=%d, lock acquired=%d",
             at_obj_a != NULL ? obj_dist(obj_dude, at_obj_a) : -1,
             rt_get_stats()->playerAttacks - at_count_a,
             rt_get_stats()->playerRejected - at_count_b,
             rt_get_lock() != NULL);
+        at_release_test_pistol();
         return true;
     }
     return false;
@@ -2135,6 +2266,7 @@ static bool step_switch(unsigned int elapsed, bool first, bool timedOut)
         at_switch_dx = dx / length;
         at_switch_dy = dy / length;
         at_switch_center = tile_center_tile;
+        at_camera_remember();
         at_obj_a = lock;
         at_count_a = rt_get_stats()->lockSwitches;
         at_count_b = rt_get_stats()->playerAttacks;
@@ -2172,7 +2304,7 @@ static bool step_switch(unsigned int elapsed, bool first, bool timedOut)
             at_check(C_SWITCH, switches == 1 && lock != NULL && lock != at_obj_a && inDirection && rt_get_stats()->playerAttacks == at_count_b,
                 "switches while held 1 s=%d, new lock=%s, in flick direction=%d, attacks=%d",
                 switches, lock != NULL ? critter_name(lock) : "(none)", inDirection, rt_get_stats()->playerAttacks - at_count_b);
-            at_check(C_SWITCH_NO_CAMERA, tile_center_tile == at_switch_center, "camera center %d -> %d", at_switch_center, tile_center_tile);
+            at_check(C_SWITCH_NO_CAMERA, at_camera_same(at_switch_center), "camera center %d -> %d, pan unchanged=%d", at_switch_center, tile_center_tile, at_camera_same(at_switch_center));
         }
         at_screenshot("21_switch");
         at_phase = 3;
@@ -2240,6 +2372,7 @@ static bool step_switch(unsigned int elapsed, bool first, bool timedOut)
         at_obj_a = lock;
         at_count_a = rt_get_stats()->lockSwitchMisses;
         at_switch_center = tile_center_tile;
+        at_camera_remember();
         at_pad.rightX = at_switch_dx;
         at_pad.rightY = at_switch_dy;
         at_phase = 4;
@@ -2258,7 +2391,7 @@ static bool step_switch(unsigned int elapsed, bool first, bool timedOut)
         }
         at_check(C_SWITCH_KEEP, rt_get_lock() == at_obj_a && rt_get_stats()->lockSwitchMisses == at_count_a + 1,
             "lock kept=%d, misses=%d", rt_get_lock() == at_obj_a, rt_get_stats()->lockSwitchMisses - at_count_a);
-        at_check(C_SWITCH_NO_CAMERA, tile_center_tile == at_switch_center, "camera center %d -> %d", at_switch_center, tile_center_tile);
+        at_check(C_SWITCH_NO_CAMERA, at_camera_same(at_switch_center), "camera center %d -> %d, pan unchanged=%d", at_switch_center, tile_center_tile, at_camera_same(at_switch_center));
         return true;
     }
 
@@ -3206,6 +3339,7 @@ static bool step_range(unsigned int elapsed, bool first, bool timedOut)
             "knife, target at %d tiles: indicator '%s'", obj_dist(obj_dude, at_target), rt_get_indicator()->text);
         at_tile_a = obj_dude->tile;
         at_count_a = rt_get_stats()->playerAttacks;
+        at_count_b = rt_get_stats()->freeSwingWhiffs;
         at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
         at_phase = 2;
         at_time_a = now;
@@ -3216,12 +3350,12 @@ static bool step_range(unsigned int elapsed, bool first, bool timedOut)
         }
         at_check(C_RANGE,
             rt_get_stats()->playerAttacks == at_count_a
-                && rt_get_stats()->lastRejectReason == COMBAT_BAD_SHOT_OUT_OF_RANGE
+                && rt_get_stats()->freeSwingWhiffs == at_count_b + 1
                 && obj_dude->tile == at_tile_a,
-            "target at %d tiles: attacks=%d reason=%d moved=%d",
+            "knife, locked target at %d tiles: attacks=%d, swings that met nobody=%d, moved=%d",
             obj_dist(obj_dude, at_target),
             rt_get_stats()->playerAttacks - at_count_a,
-            rt_get_stats()->lastRejectReason,
+            rt_get_stats()->freeSwingWhiffs - at_count_b,
             obj_dude->tile != at_tile_a);
         rt_debug_set_lock(NULL);
         return true;
@@ -4537,6 +4671,10 @@ static bool step_neutral(unsigned int elapsed, bool first, bool timedOut)
         break;
     case 24:
         // Unlock, then RT: no attack on anyone.
+        // (With a ranged weapon: melee would swing at whoever is in front.)
+        if (!at_wield(at_test_pistol())) {
+            break;
+        }
         if (rt_get_lock() != NULL) {
             at_press(GAMEPAD_BUTTON_LEFT_TRIGGER);
         }
@@ -4559,6 +4697,7 @@ static bool step_neutral(unsigned int elapsed, bool first, bool timedOut)
         at_check(C_NO_LOCK_RT, rt_get_lock() == NULL && rt_get_stats()->playerAttacks == at_count_b,
             "after unlocking the NPC, RT: attacks=%d, lock=%s",
             rt_get_stats()->playerAttacks - at_count_b, rt_get_lock() != NULL ? critter_name(rt_get_lock()) : "(none)");
+        at_release_test_pistol();
         return true;
     }
 
@@ -4589,18 +4728,21 @@ static int at_cam_limits;
 // position; false at a map scroll limit.
 static bool at_camera_place(int px, int py)
 {
+    // The player's offset from the wanted spot, in the play area, moves the
+    // view center by as many world pixels (times the zoom).
     int dx;
     int dy;
     int cx;
     int cy;
-    tile_coord(obj_dude->tile, &dx, &dy, obj_dude->elevation);
+    rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &dx, &dy);
     tile_coord(tile_center_tile, &cx, &cy, obj_dude->elevation);
-    dx += 16;
-    dy += 8;
-    int tile = tile_num(cx + 16 + (dx - px), cy + 8 + (dy - py), obj_dude->elevation);
+    float zoom = rt_view_get_zoom();
+    int tile = tile_num(cx + 16 + (int)((dx - px) * zoom), cy + 8 + (int)((dy - py) * zoom), obj_dude->elevation);
     if (tile == -1) {
         return false;
     }
+    rt_view_reset_pan();
+    rt_debug_camera_follow();
     return tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW) != -1;
 }
 
@@ -4647,6 +4789,7 @@ static bool step_camera(unsigned int elapsed, bool first, bool timedOut)
         tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
         at_tile_a = tile_center_tile;
         at_cam_center_before = tile_center_tile;
+        at_camera_remember();
         at_screen_pos(obj_dude, &at_cam_last_x, &at_cam_last_y);
         at_tile_b = obj_dude->tile;
         at_flag_a = true;
@@ -4657,11 +4800,13 @@ static bool step_camera(unsigned int elapsed, bool first, bool timedOut)
         at_stick_open_direction();
         // A scroll is fine only if the player had reached the inner box edge
         // just before it (the scroll brings them back inside).
-        if (tile_center_tile != at_cam_center_before) {
-            if (at_cam_last_x >= marginX && at_cam_last_x <= width - marginX && at_cam_last_y >= marginY && at_cam_last_y <= height - marginY) {
+        if (!at_camera_same(at_cam_center_before)) {
+            // (The camera follows the player as drawn, a walk step included.)
+            if (at_cam_last_x >= marginX + 16 && at_cam_last_x <= width - marginX - 16 && at_cam_last_y >= marginY + 12 && at_cam_last_y <= height - marginY - 12) {
                 at_flag_a = false;
             }
             at_cam_center_before = tile_center_tile;
+            at_camera_remember();
         }
         at_cam_last_x = x;
         at_cam_last_y = y;
@@ -4770,8 +4915,8 @@ static bool step_camera(unsigned int elapsed, bool first, bool timedOut)
         } else {
             at_cam_bad++;
         }
-        at_check(C_CAMERA_STEPS, at_cam_max_jump <= 40 && rt_get_stats()->cameraRecenters == at_cam_recenters,
-            "largest per-frame shift %d px (one scroll step is 32x24), recenters %d",
+        at_check(C_CAMERA_STEPS, at_cam_max_jump <= 24 && rt_get_stats()->cameraRecenters == at_cam_recenters,
+            "largest per-frame shift %d px (an engine scroll step is 32x24; the glide moves less), recenters %d",
             at_cam_max_jump, rt_get_stats()->cameraRecenters - at_cam_recenters);
         at_cam_dir++;
         at_phase = 2;
@@ -4821,7 +4966,7 @@ static bool step_camera_pan(unsigned int elapsed, bool first, bool timedOut)
 
     int x;
     int y;
-    tile_coord(obj_dude->tile, &x, &y, obj_dude->elevation);
+    at_tile_coord(obj_dude->tile, &x, &y, obj_dude->elevation);
     x += 16;
     y += 8;
 
@@ -4855,16 +5000,21 @@ static bool step_camera_pan(unsigned int elapsed, bool first, bool timedOut)
             rt_get_stats()->cameraPans - at_count_a, at_cam_start_x, x, x < 0 || x >= width,
             obj_dude->tile != at_tile_b, rt_get_stats()->cameraRecenters - at_count_b);
         at_screenshot("28_camera_pan");
-        at_tile_a = tile_center_tile;
+        at_tile_a = -1;
         at_phase = 2;
         at_time_a = now;
         break;
     case 2:
-        // Released: the view stays where it was put.
+        // Released: the view stays where it was put (once the short
+        // smoothing has run out).
+        if (now - at_time_a >= 300 && at_tile_a == -1) {
+            at_tile_a = tile_center_tile;
+            at_camera_remember();
+        }
         if (now - at_time_a < 1200) {
             break;
         }
-        at_flag_a = tile_center_tile == at_tile_a;
+        at_flag_a = at_camera_same(at_tile_a);
         at_pan_last_x = x;
         at_pan_last_y = y;
         at_pan_max_jump = 0;
@@ -6093,7 +6243,7 @@ static int at_aim_open_tile(int minDistance, int maxDistance, Object* avoid)
                 int x;
                 int y;
                 if (tile == -1 || obj_blocking_at(NULL, tile, obj_dude->elevation) != NULL
-                    || tile_coord(tile, &x, &y, obj_dude->elevation) != 0
+                    || at_tile_coord(tile, &x, &y, obj_dude->elevation) != 0
                     || x < 40 || x > width - 60 || y < 40 || y > height - 40) {
                     continue;
                 }
@@ -11996,6 +12146,45 @@ static bool step_skilldex_pipboy(unsigned int elapsed, bool first, bool timedOut
 }
 
 // Sneak: R3 on, HUD boxes (with LEVEL), running ends it, R3 off.
+// Sneak through the Skilldex (Sneak is its first row); R3 is the wider view.
+static int at_sd_ups = -1;
+static unsigned int at_sd_time = 0;
+
+static bool at_menu_skilldex_sneak(unsigned int elapsed)
+{
+    if (!skilldex_rt_is_open()) {
+        return false;
+    }
+    if (at_sd_ups < 0) {
+        at_sd_ups = skilldex_rt_get_selected();
+        at_sd_time = elapsed;
+    }
+    if (elapsed - at_sd_time < 250 || !at_aim_released()) {
+        return false;
+    }
+    if (at_sd_ups > 0) {
+        at_press(GAMEPAD_BUTTON_DPAD_UP);
+        at_sd_ups--;
+        at_sd_time = elapsed;
+        return false;
+    }
+    at_press(GAMEPAD_BUTTON_A);
+    at_sd_ups = -1;
+    return true;
+}
+
+static void at_toggle_sneak_skilldex()
+{
+    at_sd_ups = -1;
+    at_expect_menu(NULL, at_menu_skilldex_sneak);
+    at_press(GAMEPAD_BUTTON_BACK);
+}
+
+static bool at_skilldex_closed()
+{
+    return at_menu_done && !skilldex_rt_is_open() && at_aim_released();
+}
+
 static bool step_sneak(unsigned int elapsed, bool first, bool timedOut)
 {
     if (first) {
@@ -12016,13 +12205,13 @@ static bool step_sneak(unsigned int elapsed, bool first, bool timedOut)
     switch (at_sk_phase) {
     case 0:
         if (elapsed - at_sk_time > 500 && at_aim_released()) {
-            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+            at_toggle_sneak_skilldex();
             at_sk_time = elapsed;
             at_sk_phase = 1;
         }
         break;
     case 1:
-        if (elapsed - at_sk_time > 500) {
+        if (elapsed - at_sk_time > 500 && at_skilldex_closed()) {
             at_sk_flags[0] = is_pc_flag(PC_FLAG_SNEAKING);
             at_sk_flags[1] = (intface_rt_shown_indicators() & 1) != 0;
             // With a level up pending too: both boxes, side by side.
@@ -12069,27 +12258,27 @@ static bool step_sneak(unsigned int elapsed, bool first, bool timedOut)
         }
         break;
     case 4:
-        // R3 on, then off.
-        if (elapsed - at_sk_time > 600 && at_aim_released()) {
-            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+        // Skilldex Sneak on, then off.
+        if (elapsed - at_sk_time > 600 && at_skilldex_closed()) {
+            at_toggle_sneak_skilldex();
             at_sk_time = elapsed;
             at_sk_phase = 5;
         }
         break;
     case 5:
-        if (elapsed - at_sk_time > 600 && at_aim_released()) {
+        if (elapsed - at_sk_time > 600 && at_skilldex_closed()) {
             at_sk_flags[6] = is_pc_flag(PC_FLAG_SNEAKING);
-            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+            at_toggle_sneak_skilldex();
             at_sk_time = elapsed;
             at_sk_phase = 6;
         }
         break;
     case 6:
-        if (elapsed - at_sk_time > 600) {
+        if (elapsed - at_sk_time > 600 && at_skilldex_closed()) {
             at_sk_flags[7] = !is_pc_flag(PC_FLAG_SNEAKING) && (intface_rt_shown_indicators() & 1) == 0;
             int toggles = rt_get_stats()->sneakToggles - at_sk_values[0];
             at_check(C_SNEAK_TOGGLE, at_sk_flags[0] && at_sk_flags[3] && at_sk_flags[4] && at_sk_flags[6] && at_sk_flags[7] && toggles == 3,
-                "R3: on=%d; walking keeps it=%d; running ends it=%d; R3 on again=%d, off=%d (toggles %d)",
+                "Skilldex Sneak: on=%d; walking keeps it=%d; running ends it=%d; Skilldex Sneak on again=%d, off=%d (toggles %d)",
                 at_sk_flags[0], at_sk_flags[3], at_sk_flags[4], at_sk_flags[6], at_sk_flags[7], toggles);
             at_check(C_SNEAK_HUD, at_sk_flags[1] && at_sk_values[2] == 3 && at_sk_flags[2] && at_sk_flags[5] && at_sk_flags[7],
                 "SNEAK box shown=%d; with a level up pending both boxes (mask %d, 3 = SNEAK+LEVEL); level-up state untouched=%d; gone when sneaking ended=%d/%d",
@@ -12119,6 +12308,8 @@ static bool step_sneak_menus(unsigned int elapsed, bool first, bool timedOut)
 {
     if (first) {
         at_sk_values[0] = rt_get_stats()->sneakToggles;
+        at_sk_values[2] = rt_get_stats()->zoomToggles;
+        at_sk_values[3] = (int)(rt_view_get_target_zoom() * 100.0f);
         at_sk_values[1] = 0;
         at_sk_phase = 0;
         at_expect_menu(NULL, at_menu_r3_then_b);
@@ -12137,8 +12328,10 @@ static bool step_sneak_menus(unsigned int elapsed, bool first, bool timedOut)
     if ((at_sk_values[1] == 1 && at_menu_done && elapsed > 1600 && !rt_pipboy_is_open()) || timedOut) {
         at_menu_expected = false;
         int toggles = rt_get_stats()->sneakToggles - at_sk_values[0];
-        at_check(C_SNEAK_INPUT, toggles == 0 && !is_pc_flag(PC_FLAG_SNEAKING),
-            "R3 in the Skilldex and the Pip-Boy: sneak toggles %d, sneaking=%d", toggles, is_pc_flag(PC_FLAG_SNEAKING));
+        int zooms = rt_get_stats()->zoomToggles - at_sk_values[2];
+        bool sameZoom = (int)(rt_view_get_target_zoom() * 100.0f) == at_sk_values[3];
+        at_check(C_SNEAK_INPUT, toggles == 0 && !is_pc_flag(PC_FLAG_SNEAKING) && zooms == 0 && sameZoom,
+            "R3 in the Skilldex and the Pip-Boy: sneak toggles %d, sneaking=%d; zoom toggles %d, zoom unchanged=%d", toggles, is_pc_flag(PC_FLAG_SNEAKING), zooms, sameZoom);
         return true;
     }
     return false;
@@ -12452,6 +12645,1201 @@ static bool step_repair(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Ambient dialogue, cutaway, swings, camera and wider view
+// -----------------------------------------------------------------------------
+
+static int at_vw_phase;
+static unsigned int at_vw_time;
+static int at_vw_values[16];
+static float at_vw_floats[8];
+static bool at_vw_flags[16];
+static Object* at_vw_objs[6];
+
+static void at_vw_begin(unsigned int elapsed)
+{
+    at_vw_phase = 0;
+    at_vw_time = elapsed;
+    memset(at_vw_values, 0, sizeof(at_vw_values));
+    memset(at_vw_floats, 0, sizeof(at_vw_floats));
+    memset(at_vw_flags, 0, sizeof(at_vw_flags));
+    memset(at_vw_objs, 0, sizeof(at_vw_objs));
+}
+
+static void at_vw_next(unsigned int elapsed)
+{
+    at_vw_phase++;
+    at_vw_time = elapsed;
+}
+
+// Back to the start position (when on that map), the camera on the player:
+// earlier fixtures may leave the player where scroll blockers hold the view.
+static void at_vw_home()
+{
+    if (at_home_tile != -1 && obj_dude->elevation == at_home_elevation && strcmp(map_data.name, at_home_map) == 0
+        && at_tile_free(at_home_tile) && obj_dude->tile != at_home_tile) {
+        Rect rect;
+        obj_move_to_tile(obj_dude, at_home_tile, obj_dude->elevation, &rect);
+        at_log("harness: player back at the start position");
+    }
+    tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+    rt_view_reset_pan();
+    rt_debug_camera_follow();
+}
+
+static void at_vw_cleanup()
+{
+    for (Object*& obj : at_vw_objs) {
+        if (obj != NULL) {
+            at_erase(obj);
+            obj = NULL;
+        }
+    }
+}
+
+// Where the speaker's text anchor is in the play area (hex center x, hex
+// top y, walk offset included), as `text_object_layout` computes it.
+static void at_vw_anchor(Object* obj, int* x, int* y)
+{
+    int wx;
+    int wy;
+    tile_coord(obj->tile, &wx, &wy, obj->elevation);
+    rt_view_world_to_display(wx + 16 + obj->x, wy + obj->y, x, y);
+}
+
+static void at_vw_face(int rotation)
+{
+    Rect rect;
+    obj_set_rotation(obj_dude, rotation, &rect);
+    tile_refresh_rect(&rect, obj_dude->elevation);
+}
+
+// A rotation with free hexes ahead (1 and 2 steps), behind and to both
+// sides of the front arc.
+static int at_vw_open_rotation()
+{
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tiles[] = {
+            tile_num_in_direction(obj_dude->tile, rotation, 1),
+            tile_num_in_direction(obj_dude->tile, rotation, 2),
+            tile_num_in_direction(obj_dude->tile, rotation, 4),
+            tile_num_in_direction(obj_dude->tile, (rotation + 3) % ROTATION_COUNT, 1),
+            tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 1),
+            tile_num_in_direction(obj_dude->tile, (rotation + 2) % ROTATION_COUNT, 1),
+        };
+        bool usable = true;
+        for (int tile : tiles) {
+            if (!at_tile_free(tile) || combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                usable = false;
+            }
+        }
+        if (usable) {
+            return rotation;
+        }
+    }
+    return -1;
+}
+
+// Ambient (floating) dialogue follows its speaker while it walks and while
+// the camera pans; texts of several speakers are independent; they expire
+// as before and outlive a removed speaker safely.
+static bool step_text_follow(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_vw_home();
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_check(C_TEXT_FOLLOW, false, "timed out in phase %d", at_vw_phase);
+        at_vw_cleanup();
+        return true;
+    }
+
+    Object* walker = at_vw_objs[0];
+    Object* still = at_vw_objs[1];
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (elapsed - at_vw_time < 500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_move_to_clear_spot();
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        at_vw_objs[0] = at_spawn_rat(2, 3, false);
+        at_vw_objs[1] = at_spawn_rat(4, 5, false);
+        walker = at_vw_objs[0];
+        still = at_vw_objs[1];
+        if (walker == NULL || still == NULL) {
+            at_check(C_TEXT_FOLLOW, false, "no speakers could be placed");
+            at_vw_cleanup();
+            return true;
+        }
+        at_vw_values[0] = text_object_count();
+        char line1[] = "Ambient line one";
+        char line2[] = "Ambient line two";
+        Rect rect;
+        at_vw_flags[0] = text_object_create(walker, line1, 101, colorTable[32747], colorTable[0], &rect) == 0;
+        at_vw_flags[1] = text_object_create(still, line2, 101, colorTable[992], colorTable[0], &rect) == 0;
+        Rect stillRect;
+        text_object_get_rect(still, &stillRect);
+        at_vw_values[1] = stillRect.ulx;
+        at_vw_values[2] = stillRect.uly;
+
+        // Walk the speaker a few hexes away.
+        int dest = -1;
+        for (int steps = 4; steps >= 2 && dest == -1; steps--) {
+            for (int r = 0; r < ROTATION_COUNT && dest == -1; r++) {
+                int tile = tile_num_in_direction(walker->tile, r, steps);
+                if (at_tile_free(tile) && tile_dist(tile, still->tile) > 2 && tile_dist(tile, obj_dude->tile) > 1
+                    && make_path(walker, walker->tile, tile, NULL, 0) > 0) {
+                    dest = tile;
+                }
+            }
+        }
+        at_vw_values[3] = walker->tile;
+        if (dest != -1) {
+            register_begin(ANIMATION_REQUEST_RESERVED);
+            register_object_move_to_tile(walker, dest, walker->elevation, -1, 0);
+            int rc = register_end();
+            at_log("text: walk registered rc=%d, busy=%d", rc, anim_busy(walker));
+        }
+        Rect walkRect;
+        text_object_get_rect(walker, &walkRect);
+        at_vw_values[9] = walkRect.ulx;
+        at_vw_values[10] = walkRect.uly;
+        at_log("text: two speakers, %d texts before, created %d/%d; walker heads %d hexes away",
+            at_vw_values[0], at_vw_flags[0], at_vw_flags[1], dest != -1 ? tile_dist(walker->tile, dest) : 0);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1:
+    case 2: {
+        // Phase 1: walking; phase 2: walking while the camera pans.
+        if (at_vw_phase == 2) {
+            at_pad.rightX = elapsed - at_vw_time < 500 ? 0.8f : 0.0f;
+        }
+        Rect rect;
+        if (text_object_get_rect(walker, &rect)) {
+            int ax;
+            int ay;
+            at_vw_anchor(walker, &ax, &ay);
+            int width = rt_view_display_width();
+            int height = rt_view_display_height();
+            bool clamped = rect.ulx <= 0 || rect.uly <= 0 || rect.lrx >= width - 1 || rect.lry >= height - 1;
+            if (!clamped) {
+                int centerX = rect.ulx + (rect.lrx - rect.ulx + 1) / 2;
+                int expectedBottom = ay - (int)(60.0f / rt_view_get_zoom()) - 1;
+                int deviation = abs(centerX - ax) + abs(rect.lry - expectedBottom);
+                at_vw_values[4] = std::max(at_vw_values[4], deviation);
+                at_vw_values[5]++;
+            }
+            at_vw_values[8] = std::max(at_vw_values[8], abs(rect.ulx - at_vw_values[9]) + abs(rect.uly - at_vw_values[10]));
+        }
+        Rect stillRect;
+        if (at_vw_phase == 1 && text_object_get_rect(still, &stillRect)) {
+            at_vw_values[11] = std::max(at_vw_values[11], abs(stillRect.ulx - at_vw_values[1]) + abs(stillRect.uly - at_vw_values[2]));
+        }
+        if (at_vw_phase == 1 && at_vw_values[14] == 0 && elapsed - at_vw_time > 400) {
+            at_vw_values[14] = 1;
+            at_screenshot("60_text_follow");
+        }
+        if (elapsed - at_vw_time < (at_vw_phase == 1 ? 1100u : 900u)) {
+            break;
+        }
+        at_pad.rightX = 0.0f;
+        if (at_vw_phase == 2) {
+            at_check(C_TEXT_FOLLOW,
+                at_vw_flags[0] && at_vw_values[5] > 20 && at_vw_values[4] <= 2 && at_vw_values[8] >= 20 && walker->tile != at_vw_values[3],
+                "text kept above its walking speaker in %d frames (walking, then walking while the camera panned): largest offset from the speaker's head %d px, text moved %d px, speaker moved %d hexes",
+                at_vw_values[5], at_vw_values[4], at_vw_values[8], tile_dist(walker->tile, at_vw_values[3]));
+            at_vw_values[12] = text_object_count();
+            // The speaker goes away: its text stays where it was, safely.
+            at_erase(walker);
+            at_vw_objs[0] = NULL;
+            at_vw_values[13] = text_object_count();
+        }
+        at_vw_next(elapsed);
+        break;
+    }
+    case 3: {
+        // Expiration: 3.5 s plus 1.4 s per line by default.
+        if (text_object_count() > at_vw_values[0] && elapsed - at_vw_time < 6500) {
+            break;
+        }
+        bool expired = text_object_count() == at_vw_values[0];
+        at_check(C_TEXT_MULTI,
+            at_vw_flags[1] && at_vw_values[12] == at_vw_values[0] + 2 && at_vw_values[11] <= 1
+                && at_vw_values[13] == at_vw_values[0] + 2 && expired,
+            "two speakers' texts at once (%d -> %d); the still speaker's text stayed put (drift %d px) while the other moved; removing a speaker kept its text (%d texts) until it expired; all expired=%d after %u ms",
+            at_vw_values[0], at_vw_values[12], at_vw_values[11], at_vw_values[13], expired, elapsed - at_vw_time);
+        at_vw_cleanup();
+        return true;
+    }
+    }
+    return false;
+}
+
+// The cutaway around the player is twice as wide and tall as its art, around
+// the same center, at both zoom levels.
+static bool step_cutaway(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_vw_home();
+        at_release_all();
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_CUTAWAY, false, "timed out in phase %d", at_vw_phase);
+        rt_view_set_zoom(1.0f, 0, -1);
+        at_vw_cleanup();
+        return true;
+    }
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (elapsed - at_vw_time < 400 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_move_to_clear_spot();
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        rt_debug_camera_follow();
+        // A wall in front of the player (toward the camera), so the cutaway
+        // shows.
+        int wallTiles[3] = {
+            tile_num_in_direction(obj_dude->tile, 2, 2),
+            at_hex_walk(obj_dude->tile, 2, 1, 3, 1),
+            tile_num_in_direction(obj_dude->tile, 3, 2),
+        };
+        for (int slot = 0; slot < 3; slot++) {
+            if (!at_tile_free(wallTiles[slot])) {
+                continue;
+            }
+            for (int index = 1; index < 300 && at_vw_objs[slot] == NULL; index++) {
+                Object* wall;
+                if (obj_pid_new(&wall, (OBJ_TYPE_WALL << 24) | index) != -1) {
+                    Rect rect;
+                    obj_move_to_tile(wall, wallTiles[slot], obj_dude->elevation, &rect);
+                    at_vw_objs[slot] = wall;
+                }
+            }
+        }
+        tile_refresh_display();
+
+        Rect rect;
+        int artWidth = 0;
+        int artHeight = 0;
+        bool ok = obj_egg_get_rect(&rect, &artWidth, &artHeight);
+        int width = rect.lrx - rect.ulx + 1;
+        int height = rect.lry - rect.uly + 1;
+
+        // The art's own rect, as the original drew it.
+        CacheEntry* handle;
+        Art* egg = art_ptr_lock(obj_egg->fid, &handle);
+        float originalX = 0.0f;
+        float originalY = 0.0f;
+        if (egg != NULL) {
+            int x;
+            int y;
+            tile_coord(obj_egg->tile, &x, &y, obj_egg->elevation);
+            x += 16 + egg->xOffsets[0] + obj_egg->x;
+            y += 8 + egg->yOffsets[0] + obj_egg->y;
+            originalX = (x - artWidth / 2) + artWidth / 2.0f;
+            originalY = (y - (artHeight - 1)) + artHeight / 2.0f;
+            art_ptr_unlock(handle);
+        }
+        float centerX = rect.ulx + width / 2.0f;
+        float centerY = rect.uly + height / 2.0f;
+        Rect bound;
+        obj_bound(obj_egg, &bound);
+        bool bounds = bound.ulx == rect.ulx && bound.lry == rect.lry;
+        at_vw_flags[0] = ok && abs(width - 2 * artWidth) <= 1 && abs(height - 2 * artHeight) <= 1
+            && fabsf(centerX - originalX) <= 1.0f && fabsf(centerY - originalY) <= 1.0f && bounds;
+        at_vw_values[0] = artWidth;
+        at_vw_values[1] = artHeight;
+        at_vw_values[2] = width;
+        at_vw_values[3] = height;
+        at_vw_floats[0] = centerX - originalX;
+        at_vw_floats[1] = centerY - originalY;
+        at_vw_flags[2] = at_vw_objs[0] != NULL;
+        at_screenshot("61_cutaway_default");
+        rt_view_set_zoom(rt_view_get_max_zoom(), 0, obj_dude->tile);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1: {
+        if (elapsed - at_vw_time < 300) {
+            break;
+        }
+        // Zoomed out: the cutaway scales with the world, still centered on
+        // the player as seen.
+        Rect rect;
+        int artWidth;
+        int artHeight;
+        obj_egg_get_rect(&rect, &artWidth, &artHeight);
+        Rect shown;
+        rt_view_world_rect_to_display(&rect, &shown);
+        Rect playerBounds;
+        obj_bound(obj_dude, &playerBounds);
+        Rect playerShown;
+        rt_view_world_rect_to_display(&playerBounds, &playerShown);
+        int centerX = (shown.ulx + shown.lrx) / 2;
+        int playerX = (playerShown.ulx + playerShown.lrx) / 2;
+        bool centered = abs(centerX - playerX) <= 4;
+        float zoom = rt_view_get_zoom();
+        at_vw_flags[1] = centered && abs((shown.lrx - shown.ulx + 1) - (int)(2 * artWidth / zoom)) <= 4;
+        at_screenshot("61_cutaway_wide");
+        at_check(C_CUTAWAY, at_vw_flags[0] && at_vw_flags[1],
+            "art %dx%d, cutaway %dx%d (2x linear), center offset from the original (%.1f, %.1f) px; zoomed out (%.2f): %d px wide on screen, centered on the player=%d; test wall in front=%d",
+            at_vw_values[0], at_vw_values[1], at_vw_values[2], at_vw_values[3], at_vw_floats[0], at_vw_floats[1],
+            zoom, shown.lrx - shown.ulx + 1, centered, at_vw_flags[2]);
+        rt_view_set_zoom(1.0f, 0, obj_dude->tile);
+        at_vw_cleanup();
+        tile_refresh_display();
+        return true;
+    }
+    }
+    return false;
+}
+
+// RT with a melee weapon or unarmed, without a lock: the swing always plays;
+// whoever is in reach in front of the player at the impact gets an ordinary
+// attack attempt.
+static bool step_swing(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_vw_home();
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_check(C_SWING_EMPTY, false, "timed out in phase %d", at_vw_phase);
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        at_unarmed();
+        return true;
+    }
+
+    // The player's attack animations seen during the current phase.
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    if (anim == ANIM_THROW_PUNCH || anim == ANIM_KICK_LEG || anim == ANIM_SWING_ANIM || anim == ANIM_THRUST_ANIM) {
+        at_vw_values[15] = anim;
+    }
+
+    int rotation = at_vw_values[0];
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(6);
+        at_vw_values[0] = at_vw_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_check(C_SWING_EMPTY, false, "no open hexes around the player");
+            return true;
+        }
+        at_vw_face(at_vw_values[0]);
+        at_vw_values[1] = stats->freeSwings;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_values[3] = stats->playerAttacks;
+        at_vw_values[15] = -1;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // Unarmed, nobody around.
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[0] = stats->freeSwings == at_vw_values[1] + 1 && stats->freeSwingWhiffs == at_vw_values[2] + 1
+            && stats->playerAttacks == at_vw_values[3] && (at_vw_values[15] == ANIM_THROW_PUNCH || at_vw_values[15] == ANIM_KICK_LEG);
+        at_vw_values[4] = at_vw_values[15];
+        {
+            int spearPid = at_item_pid_by_name("Spear");
+            Object* spear = NULL;
+            if (spearPid != -1 && obj_pid_new(&spear, spearPid) != -1) {
+                Rect rect;
+                if (item_add_force(obj_dude, spear, 1) == 0) {
+                    obj_disconnect(spear, &rect);
+                }
+            }
+            at_vw_flags[1] = spear != NULL && at_wield(spear);
+        }
+        at_vw_values[1] = stats->freeSwings;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_vw_values[15] = -1;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 3: {
+        // A melee weapon, nobody around.
+        if (at_vw_values[14] == 0 && since > 150) {
+            at_vw_values[14] = 1;
+            at_screenshot("62_swing_empty");
+        }
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        bool melee = at_vw_flags[1] && stats->freeSwings == at_vw_values[1] + 1 && stats->freeSwingWhiffs == at_vw_values[2] + 1
+            && (at_vw_values[15] == ANIM_THRUST_ANIM || at_vw_values[15] == ANIM_SWING_ANIM);
+        at_check(C_SWING_EMPTY, at_vw_flags[0] && melee,
+            "no lock, nobody near: unarmed swing played (anim %d) and met nobody=%d; spear (equipped=%d) swing played (anim %d)=%d; no attack started",
+            at_vw_values[4], at_vw_flags[0], at_vw_flags[1], at_vw_values[15], melee);
+        at_unarmed();
+
+        // A bystander behind and one beside the front arc: never hit, no
+        // turning toward them.
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 3) % ROTATION_COUNT, 1), false);
+        at_vw_objs[1] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 1), false);
+        at_vw_values[5] = at_vw_objs[0] != NULL ? critter_get_hits(at_vw_objs[0]) : -1;
+        at_vw_values[6] = at_vw_objs[1] != NULL ? critter_get_hits(at_vw_objs[1]) : -1;
+        at_vw_values[1] = stats->freeSwings;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_values[3] = stats->playerAttacks;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 4:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 5: {
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        bool untouched = at_vw_objs[0] != NULL && at_vw_objs[1] != NULL
+            && critter_get_hits(at_vw_objs[0]) == at_vw_values[5] && critter_get_hits(at_vw_objs[1]) == at_vw_values[6]
+            && !rt_is_hostile(at_vw_objs[0]) && !rt_is_hostile(at_vw_objs[1]);
+        bool ok = untouched && stats->freeSwings == at_vw_values[1] + 1 && stats->freeSwingWhiffs == at_vw_values[2] + 1
+            && stats->playerAttacks == at_vw_values[3] && obj_dude->rotation == rotation;
+        at_check(C_SWING_BEHIND, ok,
+            "bystanders behind and beside the front arc: untouched and still calm=%d, swing met nobody=%d, attacks started %d, player kept facing %d (now %d)",
+            untouched, stats->freeSwingWhiffs - at_vw_values[2], stats->playerAttacks - at_vw_values[3], rotation, obj_dude->rotation);
+        at_vw_cleanup();
+
+        // A bystander straight ahead: a deliberate attack, with the original
+        // consequence (hostility).
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), false);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_values[3] = stats->playerAttacks;
+        at_vw_values[7] = stats->damageMismatches;
+        at_vw_values[8] = stats->attacksResolved;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 7: {
+        // Until the hit lands (a killing blow lands after the death
+        // animation).
+        if (since < 1500 || (stats->attacksResolved == at_vw_values[8] && since < 6000)) {
+            break;
+        }
+        at_log("swing: the hit on the bystander landed after %u ms", since);
+        Object* rat = at_vw_objs[0];
+        bool attempted = rat != NULL && stats->freeSwingAttempts == at_vw_values[1] + 1 && stats->lastSwingDefender == rat
+            && stats->playerAttacks == at_vw_values[3] + 1;
+        bool hostile = rat != NULL && (critter_is_dead(rat) || rt_is_hostile(rat));
+        bool once = stats->damageMismatches == at_vw_values[7] && stats->attacksResolved > at_vw_values[8];
+        at_check(C_SWING_NEUTRAL, attempted && hostile && once,
+            "bystander straight ahead: one attack attempt=%d (to-hit %d%%, the vanilla roll decides), now hostile=%d, damage applied once=%d",
+            attempted, stats->lastSwingToHit, hostile, once);
+        at_vw_cleanup();
+        at_clear_hostiles();
+
+        // An enemy in the front arc (one hex off the facing): the player
+        // turns to it and attacks.
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 1), true);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_values[7] = stats->damageMismatches;
+        at_vw_values[9] = at_vw_objs[0] != NULL ? critter_get_hits(at_vw_objs[0]) : 0;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 8:
+        if (since < 300) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 9: {
+        Object* rat = at_vw_objs[0];
+        // The turn shows once the swing has started.
+        if (rat != NULL && at_vw_flags[4] == false && stats->freeSwings > 0 && FID_ANIM_TYPE(obj_dude->fid) != ANIM_STAND) {
+            at_vw_flags[5] = obj_dude->rotation == tile_dir(obj_dude->tile, rat->tile);
+            at_vw_flags[4] = at_vw_flags[5] || at_vw_flags[4];
+        }
+        if (since < 2200) {
+            break;
+        }
+        bool attempted = rat != NULL && stats->freeSwingAttempts >= at_vw_values[1] + 1 && stats->lastSwingDefender == rat;
+        bool turned = rat != NULL && (at_vw_flags[5] || obj_dude->rotation == tile_dir(obj_dude->tile, rat->tile));
+        bool once = stats->damageMismatches == at_vw_values[7];
+        at_check(C_SWING_HIT, attempted && turned && once,
+            "enemy in the front arc, no lock: attack attempt=%d (to-hit %d%%), player turned to it=%d, enemy hp %d -> %d, damage applied once=%d",
+            attempted, stats->lastSwingToHit, turned, at_vw_values[9], rat != NULL ? critter_get_hits(rat) : -1, once);
+        at_vw_cleanup();
+        at_clear_hostiles();
+
+        // Reach: a calm critter 2 hexes ahead; out of reach unarmed, in reach
+        // with Bonus HtH Attacks.
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 2), false);
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 10:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 11:
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[2] = stats->freeSwingAttempts == at_vw_values[1] && stats->freeSwingWhiffs == at_vw_values[2] + 1;
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 1);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 12: {
+        if (since < 2200) {
+            break;
+        }
+        Object* rat = at_vw_objs[0];
+        at_vw_flags[3] = rat != NULL && stats->freeSwingAttempts == at_vw_values[1] + 1 && stats->lastSwingDefender == rat;
+        at_vw_cleanup();
+        at_clear_hostiles();
+
+        // A wall between the player and a critter 2 hexes ahead: the longer
+        // reach doesn't go through it.
+        at_vw_face(rotation);
+        int middle = tile_num_in_direction(obj_dude->tile, rotation, 1);
+        int end = tile_num_in_direction(obj_dude->tile, rotation, 2);
+        for (int index = 1; index < 300 && at_vw_objs[1] == NULL && at_tile_free(middle); index++) {
+            Object* wall;
+            if (obj_pid_new(&wall, (OBJ_TYPE_WALL << 24) | index) != -1) {
+                Rect rect;
+                obj_move_to_tile(wall, middle, obj_dude->elevation, &rect);
+                if (combat_is_shot_blocked(obj_dude, obj_dude->tile, end, NULL, NULL)) {
+                    at_vw_objs[1] = wall;
+                } else {
+                    obj_erase_object(wall, &rect);
+                }
+            }
+        }
+        at_vw_objs[0] = at_spawn_rat_at(end, false);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 13:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 14: {
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        bool walled = at_vw_objs[1] != NULL && at_vw_objs[0] != NULL;
+        bool blocked = walled && stats->freeSwingAttempts == at_vw_values[1] && stats->freeSwingWhiffs == at_vw_values[2] + 1;
+        at_check(C_SWING_REACH, at_vw_flags[2] && at_vw_flags[3] && blocked,
+            "critter 2 hexes ahead: unarmed without the perk met nobody=%d; with Bonus HtH Attacks attacked it=%d; behind a wall (test wall placed=%d) met nobody=%d",
+            at_vw_flags[2], at_vw_flags[3], walled, blocked);
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        at_vw_cleanup();
+
+        // Held RT: one swing only.
+        at_vw_values[1] = stats->freeSwings;
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 15:
+        if (since < 2500) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        at_vw_values[10] = stats->freeSwings - at_vw_values[1];
+        at_vw_next(elapsed);
+        break;
+    case 16:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        // The target steps out of reach before the impact.
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), false);
+        at_vw_values[1] = stats->freeSwingAttempts;
+        at_vw_values[2] = stats->freeSwingWhiffs;
+        at_vw_values[4] = stats->freeSwings;
+        at_vw_values[11] = at_vw_objs[0] != NULL ? critter_get_hits(at_vw_objs[0]) : -1;
+        at_vw_values[12] = 0;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 17: {
+        Object* rat = at_vw_objs[0];
+        if (at_vw_values[12] == 0 && rat != NULL && stats->freeSwings > at_vw_values[4]) {
+            // Moved away as soon as the swing started.
+            at_vw_values[12] = 1;
+            int away = tile_num_in_direction(obj_dude->tile, rotation, 4);
+            if (at_tile_free(away)) {
+                Rect rect;
+                obj_move_to_tile(rat, away, obj_dude->elevation, &rect);
+                tile_refresh_rect(&rect, obj_dude->elevation);
+            }
+        }
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        bool missed = rat != NULL && at_vw_values[12] == 1 && stats->freeSwingAttempts == at_vw_values[1]
+            && stats->freeSwingWhiffs == at_vw_values[2] + 1 && critter_get_hits(rat) == at_vw_values[11];
+        at_check(C_SWING_HOLD, at_vw_values[10] == 1 && missed,
+            "RT held 2.5 s: %d swing(s); a target that stepped out of reach before the impact was checked again and not hit=%d",
+            at_vw_values[10], missed);
+        at_vw_cleanup();
+
+        // A locked target in reach is attacked as before.
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 2) % ROTATION_COUNT, 1), false);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_values[1] = stats->freeSwings;
+        at_vw_values[3] = stats->playerAttacks;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 18:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 19: {
+        if (since < 2000) {
+            break;
+        }
+        bool locked = at_vw_objs[0] != NULL && stats->freeSwings == at_vw_values[1] && stats->playerAttacks == at_vw_values[3] + 1;
+        at_check(C_SWING_LOCK, locked,
+            "locked target in reach (beside the player): attacked through the lock (attacks +%d, swings +%d)",
+            stats->playerAttacks - at_vw_values[3], stats->freeSwings - at_vw_values[1]);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        at_clear_hostiles();
+        return true;
+    }
+    }
+    return false;
+}
+
+// How far the camera can move by (dx, dy) world pixels from here (map
+// limits stop it); the camera is put back afterwards.
+static int at_vw_room(float dx, float dy)
+{
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x1, &y1);
+    rt_view_move(dx, dy);
+    rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x2, &y2);
+    rt_view_move((float)(x2 - x1), (float)(y2 - y1));
+    return abs(x2 - x1) + abs(y2 - y1);
+}
+
+// The right stick pans at once, at a speed that follows the deflection,
+// smoothly, and stops when released; the deadzone holds still; a push that
+// started as a pan never switches targets; focus loss stops it.
+static bool step_camera_smooth(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_vw_home();
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        gamepad_set_focus(true);
+        at_check(C_PAN_IMMEDIATE, false, "timed out in phase %d", at_vw_phase);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        return true;
+    }
+
+    int x;
+    int y;
+    rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x, &y);
+    int moved = abs(x - at_vw_values[0]) + abs(y - at_vw_values[1]);
+    // The pan axis chosen in phase 1 (0: x, 1: y).
+    int axisPos = at_vw_values[15] == 1 ? y : x;
+    float* stick = at_vw_values[15] == 1 ? &(at_pad.rightY) : &(at_pad.rightX);
+    unsigned int since = elapsed - at_vw_time;
+
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_move_to_clear_spot();
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        if (since < 400) {
+            break;
+        }
+        // A direction with room both ways (map edges stop the camera).
+        at_vw_values[15] = 0;
+        at_vw_floats[2] = 1.0f;
+        for (int option = 0; option < 4; option++) {
+            int axis = option / 2;
+            float sign = option % 2 == 0 ? 1.0f : -1.0f;
+            float dx = axis == 0 ? 360.0f * sign : 0.0f;
+            float dy = axis == 1 ? 360.0f * sign : 0.0f;
+            if (at_vw_room(dx, dy) >= 340 && at_vw_room(-dx, -dy) >= 340) {
+                at_vw_values[15] = axis;
+                at_vw_floats[2] = sign;
+                break;
+            }
+        }
+        rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x, &y);
+        axisPos = at_vw_values[15] == 1 ? y : x;
+        stick = at_vw_values[15] == 1 ? &(at_pad.rightY) : &(at_pad.rightX);
+        at_log("camera: pan test along %s, direction %+.0f", at_vw_values[15] == 1 ? "y" : "x", at_vw_floats[2]);
+        at_vw_values[0] = x;
+        at_vw_values[1] = y;
+        at_vw_values[2] = -1; // ms to the first movement
+        at_vw_values[4] = 0;  // largest per-frame shift
+        at_vw_values[5] = 0;  // frames without movement while held
+        at_vw_values[6] = axisPos; // last position
+        at_vw_values[7] = 0;  // speed sample start (ms)
+        at_vw_values[3] = axisPos; // speed sample start
+        // A light push past the deadzone (20%): 0.6 raw reads 0.5.
+        *stick = 0.6f * at_vw_floats[2];
+        at_vw_next(elapsed);
+        break;
+    case 2:
+    case 3: {
+        // Phase 2: half deflection; phase 3: full.
+        int step = abs(axisPos - at_vw_values[6]);
+        at_vw_values[6] = axisPos;
+        if (at_vw_phase == 2 && at_vw_values[2] == -1 && moved > 0) {
+            at_vw_values[2] = (int)since;
+        }
+        if (since > 150) {
+            at_vw_values[4] = std::max(at_vw_values[4], step);
+            if (step == 0) {
+                at_vw_values[5]++;
+            }
+        }
+        // Speed is measured from 250 ms on, once the smoothing settled.
+        if (since >= 250 && at_vw_values[7] == 0) {
+            at_vw_values[7] = (int)since;
+            at_vw_values[3] = axisPos;
+        }
+        if (since < 750) {
+            break;
+        }
+        float speed = (float)abs(axisPos - at_vw_values[3]) * 1000.0f / (float)std::max(1, (int)since - at_vw_values[7]);
+        at_vw_floats[at_vw_phase - 2] = speed;
+        at_vw_values[7] = 0;
+        if (at_vw_phase == 2) {
+            // The other way, so a map edge doesn't stop it.
+            *stick = -1.0f * at_vw_floats[2];
+            at_vw_next(elapsed);
+        } else {
+            *stick = 0.0f;
+            at_vw_values[0] = x;
+            at_vw_values[1] = y;
+            at_vw_values[12] = -1; // ms until it stopped
+            at_vw_values[13] = axisPos;
+            at_vw_values[14] = 0;  // still frames in a row
+            at_vw_next(elapsed);
+        }
+        break;
+    }
+    case 4: {
+        // Released: stops promptly.
+        if (axisPos == at_vw_values[13]) {
+            at_vw_values[14]++;
+            if (at_vw_values[14] == 3 && at_vw_values[12] == -1) {
+                at_vw_values[12] = (int)since;
+            }
+        } else {
+            at_vw_values[14] = 0;
+            at_vw_values[12] = -1;
+        }
+        at_vw_values[13] = axisPos;
+        if (since < 600) {
+            break;
+        }
+        float ratio = at_vw_floats[0] > 0.0f ? at_vw_floats[1] / at_vw_floats[0] : 0.0f;
+        at_check(C_PAN_IMMEDIATE, at_vw_values[2] >= 0 && at_vw_values[2] <= 60,
+            "a push just past the deadzone moved the view after %d ms (no hold time or repeat delay)", at_vw_values[2]);
+        at_check(C_PAN_ANALOG, ratio >= 1.6f && ratio <= 2.4f && at_vw_values[4] <= 40 && at_vw_values[5] <= 2,
+            "speed at half deflection %.0f px/s, at full %.0f px/s (ratio %.2f; full speed setting 1100 px/s); largest per-frame shift %d px, still frames while held %d",
+            at_vw_floats[0], at_vw_floats[1], ratio, at_vw_values[4], at_vw_values[5]);
+        at_check(C_PAN_STOPS, at_vw_values[12] >= 0 && at_vw_values[12] <= 250 && moved <= 40,
+            "released: stopped %d ms later (3 still frames counted), drifted %d px", at_vw_values[12], moved);
+        at_vw_values[0] = x;
+        at_vw_values[1] = y;
+        // Inside the deadzone: nothing.
+        at_pad.rightX = 0.15f;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 5:
+        if (since < 600) {
+            break;
+        }
+        at_pad.rightX = 0.0f;
+        at_check(C_PAN_DEADZONE, moved == 0, "stick at 15%% (deadzone 20%%) for 600 ms: view moved %d px", moved);
+        at_vw_objs[0] = at_spawn_rat(2, 4, false);
+        at_vw_objs[1] = at_spawn_rat(3, 5, false);
+        at_vw_next(elapsed);
+        break;
+    case 6:
+        if (since < 400) {
+            break;
+        }
+        // A pan in progress: locking meanwhile doesn't make the same push
+        // switch targets, and the pan goes on.
+        at_vw_values[2] = rt_get_stats()->lockSwitches;
+        at_vw_values[3] = 0;
+        *stick = at_vw_floats[2];
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        if (since >= 150 && at_vw_values[3] == 0) {
+            rt_debug_set_lock(at_vw_objs[0]);
+            at_vw_values[3] = 1;
+            at_vw_values[6] = axisPos;
+        }
+        if (since < 500) {
+            break;
+        }
+        *stick = 0.0f;
+        at_vw_flags[0] = rt_get_stats()->lockSwitches == at_vw_values[2] && rt_get_lock() == at_vw_objs[0]
+            && abs(axisPos - at_vw_values[6]) > 20;
+        at_vw_values[4] = abs(axisPos - at_vw_values[6]);
+        at_vw_next(elapsed);
+        break;
+    case 8:
+        if (since < 400) {
+            break;
+        }
+        // With a lock: a push switches targets and leaves the camera.
+        // (The camera back on the player, so the locked critter is on screen.)
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        rt_debug_camera_follow();
+        rt_debug_set_lock(at_vw_objs[0]);
+        rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x, &y);
+        at_vw_values[0] = x;
+        at_vw_values[1] = y;
+        at_vw_values[5] = tile_center_tile;
+        *stick = at_vw_floats[2];
+        at_vw_next(elapsed);
+        break;
+    case 9:
+        if (since >= 150) {
+            *stick = 0.0f;
+        }
+        if (since < 500) {
+            break;
+        }
+        at_check(C_PAN_OWNER, at_vw_flags[0] && moved == 0 && tile_center_tile == at_vw_values[5],
+            "push started as a pan: locking meanwhile switched nothing and the pan went on %d px; a push with a lock moved the camera %d px",
+            at_vw_values[4], moved);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        // Focus loss while panning.
+        *stick = at_vw_floats[2];
+        at_vw_next(elapsed);
+        break;
+    case 10:
+        if (since < 200) {
+            break;
+        }
+        gamepad_set_focus(false);
+        at_vw_values[6] = 0;
+        at_vw_next(elapsed);
+        break;
+    case 11:
+        if (since >= 200 && at_vw_values[6] == 0) {
+            at_vw_values[6] = 1;
+            at_vw_values[7] = axisPos;
+        }
+        if (since < 500) {
+            break;
+        }
+        at_vw_values[8] = abs(axisPos - at_vw_values[7]);
+        gamepad_set_focus(true);
+        at_vw_values[9] = axisPos;
+        at_vw_next(elapsed);
+        break;
+    case 12:
+        // Focus back, the stick still pushed: held input from before doesn't
+        // move the camera until the stick is released.
+        if (since < 400) {
+            break;
+        }
+        at_vw_values[10] = abs(axisPos - at_vw_values[9]);
+        *stick = 0.0f;
+        at_check(C_PAN_FOCUS, at_vw_values[8] == 0 && at_vw_values[10] == 0,
+            "focus lost while panning: view moved %d px after 200 ms unfocused; after focus returned with the stick still pushed: %d px",
+            at_vw_values[8], at_vw_values[10]);
+        at_release_all();
+        return true;
+    }
+    return false;
+}
+
+// R3: the wider view, back to the exact default, the player kept in place,
+// labels and indicators aligned, no repeat while held, no Sneak.
+static bool step_zoom(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_vw_home();
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        return false;
+    }
+
+    if (timedOut) {
+        at_release_all();
+        at_check(C_ZOOM_TOGGLE, false, "timed out in phase %d", at_vw_phase);
+        rt_view_set_zoom(1.0f, 0, -1);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        return true;
+    }
+
+    int width = rt_view_display_width();
+    int height = rt_view_display_height();
+    int x;
+    int y;
+    rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x, &y);
+    unsigned int since = elapsed - at_vw_time;
+
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_move_to_clear_spot();
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        if (is_pc_flag(PC_FLAG_SNEAKING)) {
+            pc_flag_off(PC_FLAG_SNEAKING);
+        }
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        if (since < 400) {
+            break;
+        }
+        // The player a bit off center, so keeping its screen spot matters.
+        at_camera_place(width / 2 - 64, height / 2 + 24);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (since < 300) {
+            break;
+        }
+        at_vw_values[0] = x;
+        at_vw_values[1] = y;
+        at_vw_values[2] = stats->zoomToggles;
+        at_vw_values[3] = stats->sneakToggles;
+        at_screenshot("63_zoom_default");
+        at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+        at_vw_next(elapsed);
+        break;
+    case 3: {
+        if (since < 500) {
+            break;
+        }
+        Rect display = { 0, 0, width - 1, height - 1 };
+        Rect world;
+        rt_view_display_rect_to_world(&display, &world);
+        at_vw_floats[0] = rt_view_get_zoom();
+        at_vw_values[4] = world.lrx - world.ulx + 1;
+        at_vw_values[5] = world.lry - world.uly + 1;
+        at_vw_values[6] = abs(x - at_vw_values[0]) + abs(y - at_vw_values[1]);
+        at_screenshot("63_zoom_wide");
+        // Labels and indicators at this zoom: a locked critter and a text.
+        at_vw_objs[0] = at_spawn_rat(1, 1, false);
+        if (at_vw_objs[0] != NULL) {
+            rt_debug_set_lock(at_vw_objs[0]);
+            char line[] = "Wider view";
+            Rect rect;
+            text_object_create(at_vw_objs[0], line, 101, colorTable[32747], colorTable[0], &rect);
+        }
+        at_vw_next(elapsed);
+        break;
+    }
+    case 4: {
+        if (since < 500) {
+            break;
+        }
+        char note[240] = "no critter";
+        bool indicator = at_vw_objs[0] != NULL && at_indicator_matches(at_vw_objs[0], note, sizeof(note));
+        bool text = false;
+        Rect rect;
+        if (at_vw_objs[0] != NULL && text_object_get_rect(at_vw_objs[0], &rect)) {
+            int ax;
+            int ay;
+            at_vw_anchor(at_vw_objs[0], &ax, &ay);
+            text = abs(rect.ulx + (rect.lrx - rect.ulx + 1) / 2 - ax) <= 1 && rect.lry < ay;
+        }
+        at_screenshot("63_zoom_labels");
+        at_check(C_ZOOM_ALIGN, indicator && text,
+            "zoomed out: lock indicator on its target=%d (%s); floating text above its speaker=%d", indicator, note, text);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+
+        // Edge scrolling still works zoomed out: the player put near an edge
+        // (one the map's limits allow) is brought back inside the box.
+        int marginX = width * rt_get_camera_margin_pct() / 100;
+        int marginY = height * rt_get_camera_margin_pct() / 100;
+        at_vw_values[9] = -1;
+        for (int dir = 0; dir < 4 && at_vw_values[9] == -1; dir++) {
+            int px = dir == 0 ? marginX / 3 : (dir == 1 ? width - marginX / 3 : width / 2);
+            int py = dir == 2 ? marginY / 3 : (dir == 3 ? height - marginY / 3 : height / 2);
+            at_camera_place(px, py);
+            rt_view_tile_center(obj_dude->tile, obj_dude->elevation, &x, &y);
+            bool outside = (dir == 0 && x < marginX) || (dir == 1 && x > width - marginX)
+                || (dir == 2 && y < marginY) || (dir == 3 && y > height - marginY);
+            if (outside) {
+                at_vw_values[9] = dir;
+                at_vw_values[7] = x;
+                at_vw_values[10] = y;
+            }
+        }
+        at_vw_values[11] = rt_get_stats()->cameraLimitStops;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 5: {
+        if (since < 1800) {
+            break;
+        }
+        int marginX = width * rt_get_camera_margin_pct() / 100;
+        int marginY = height * rt_get_camera_margin_pct() / 100;
+        int dir = at_vw_values[9];
+        bool inside = x >= marginX - 16 && x <= width - marginX + 16 && y >= marginY - 12 && y <= height - marginY + 12;
+        bool towards = (dir == 0 && x > at_vw_values[7]) || (dir == 1 && x < at_vw_values[7])
+            || (dir == 2 && y > at_vw_values[10]) || (dir == 3 && y < at_vw_values[10]);
+        bool atLimit = rt_get_stats()->cameraLimitStops > at_vw_values[11];
+        at_vw_flags[0] = dir != -1 && towards && (inside || atLimit);
+        at_vw_values[8] = dir == 0 || dir == 1 ? x : y;
+        at_vw_values[7] = dir == 0 || dir == 1 ? at_vw_values[7] : at_vw_values[10];
+        at_camera_place(width / 2 - 64, height / 2 + 24);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        if (since < 300) {
+            break;
+        }
+        at_vw_values[0] = x;
+        at_vw_values[1] = y;
+        // R3 held: one toggle only (back to the default).
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_STICK] = true;
+        at_vw_next(elapsed);
+        break;
+    case 7: {
+        if (since < 800) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_STICK] = false;
+        if (since < 1100) {
+            break;
+        }
+        int toggles = stats->zoomToggles - at_vw_values[2];
+        int shift = abs(x - at_vw_values[0]) + abs(y - at_vw_values[1]);
+        float zoom = rt_view_get_zoom();
+        bool wide = at_vw_floats[0] == rt_view_get_max_zoom() && abs(at_vw_values[4] - (int)(width * at_vw_floats[0])) <= 4
+            && abs(at_vw_values[5] - (int)(height * at_vw_floats[0])) <= 4;
+        at_screenshot("63_zoom_back");
+        at_check(C_ZOOM_TOGGLE, wide && zoom == 1.0f && toggles == 2 && at_vw_values[6] <= 3 && shift <= 3,
+            "R3: wider view zoom %.2f shows %dx%d world px in the %dx%d play area (player moved %d px on screen); R3 again: zoom %.3f (exact default=%d), player moved %d px; toggles %d",
+            at_vw_floats[0], at_vw_values[4], at_vw_values[5], width, height, at_vw_values[6], zoom, zoom == 1.0f, shift, toggles);
+        at_check(C_ZOOM_INPUT, toggles == 2 && stats->sneakToggles == at_vw_values[3] && !is_pc_flag(PC_FLAG_SNEAKING) && at_vw_flags[0],
+            "R3 held 800 ms counted once (toggles %d for 2 presses); R3 never toggled Sneak (sneak toggles %d, sneaking=%d); zoomed out, edge scrolling brought the player from %d back toward the inside (now %d)=%d",
+            toggles, stats->sneakToggles - at_vw_values[3], is_pc_flag(PC_FLAG_SNEAKING), at_vw_values[7], at_vw_values[8], at_vw_flags[0]);
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        return true;
+    }
+    }
+    return false;
+}
+
 // Sneak across save/load.
 static bool at_sneak_saved = false;
 static bool step_sneak_before_save(unsigned int elapsed, bool first, bool timedOut)
@@ -12550,6 +13938,11 @@ static const AtStep at_steps[] = {
     { "contextual traps", step_traps, 20000 },
     { "arming explosives", step_traps_arm, 15000 },
     { "contextual repair", step_repair, 20000 },
+    { "ambient dialogue follows its speaker", step_text_follow, 20000 },
+    { "cutaway size", step_cutaway, 10000 },
+    { "melee and unarmed swings without a lock", step_swing, 60000 },
+    { "smooth right stick camera", step_camera_smooth, 25000 },
+    { "R3 wider view", step_zoom, 20000 },
     { "sneak on for the save", step_sneak_before_save, 2000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
