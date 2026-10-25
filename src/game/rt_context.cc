@@ -12,6 +12,7 @@
 #include <SDL.h>
 
 #include "game/actions.h"
+#include "game/combat.h"
 #include "game/critter.h"
 #include "game/display.h"
 #include "game/item.h"
@@ -19,7 +20,10 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/game.h"
+#include "game/map.h"
 #include "game/realtime.h"
+#include "game/skilldex.h"
+#include "game/tile.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -27,6 +31,7 @@
 #include "plib/color/color.h"
 #include "plib/db/db.h"
 #include "plib/gnw/button.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -436,6 +441,22 @@ static bool rt_context_default_label(Object* obj, char* label, size_t size)
     return false;
 }
 
+// What A does with the skill, as shown before pressing it. Fallout 1's
+// trap scripts (vault traps, trapped lockers, boxes and doors) all disarm;
+// arming exists only for explosives, from the inventory.
+static const char* rt_skill_verb(int skill)
+{
+    switch (skill) {
+    case SKILL_TRAPS:
+        return "Disarm trap";
+    case SKILL_STEAL:
+        return "Steal";
+    case SKILL_REPAIR:
+        return "Repair";
+    }
+    return skill_name(skill);
+}
+
 static void rt_context_add_skill(RtAction* actions, int* count, int skill)
 {
     for (int index = 0; index < *count; index++) {
@@ -451,15 +472,30 @@ static void rt_context_add_skill(RtAction* actions, int* count, int skill)
     RtAction* action = &(actions[*count]);
     action->kind = RT_ACTION_SKILL;
     action->skill = skill;
-    snprintf(action->label, sizeof(action->label), "%s (%d%%)", skill_name(skill), skill_level(obj_dude, skill));
+    snprintf(action->label, sizeof(action->label), "%s (%s %d%%)", rt_skill_verb(skill), skill_name(skill), skill_level(obj_dude, skill));
     (*count)++;
+}
+
+// Whether A steals from `obj`: only while sneaking, from a living critter
+// that isn't fighting the player's team.
+static bool rt_context_can_steal_from(Object* obj)
+{
+    return is_pc_flag(PC_FLAG_SNEAKING)
+        && FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER
+        && obj != obj_dude
+        && !critter_is_dead(obj)
+        && !rt_is_engaged(obj)
+        && !rt_is_hostile(obj);
 }
 
 static int rt_context_collect(Object* obj, RtAction* actions, RtScriptSkills* scriptSkills)
 {
     int count = 0;
 
-    if (rt_context_default_label(obj, actions[0].label, sizeof(actions[0].label))) {
+    if (rt_context_can_steal_from(obj)) {
+        // Sneaking: A steals instead of talking.
+        rt_context_add_skill(actions, &count, SKILL_STEAL);
+    } else if (rt_context_default_label(obj, actions[0].label, sizeof(actions[0].label))) {
         actions[0].kind = RT_ACTION_DEFAULT;
         actions[0].skill = -1;
         count = 1;
@@ -522,7 +558,7 @@ void rt_context_describe(Object* obj, char* buffer, size_t size)
         if (index > 0) {
             SDL_strlcat(buffer, " | ", size);
         }
-        SDL_strlcat(buffer, actions[index].kind == RT_ACTION_SKILL ? skill_name(actions[index].skill) : actions[index].label, size);
+        SDL_strlcat(buffer, actions[index].kind == RT_ACTION_SKILL ? rt_skill_verb(actions[index].skill) : actions[index].label, size);
     }
 }
 
@@ -561,7 +597,11 @@ static void rt_context_use_skill(Object* obj, int skill, const RtScriptSkills* s
         ? &(scriptSkills->skills[skill])
         : NULL;
 
-    if (info != NULL && info->requirement > 0 && !info->roll) {
+    if (skill == SKILL_STEAL) {
+        // The original steal flow (the steal screen, with the original
+        // checks per item, detection and the owner's reaction).
+        rt_context_print("Steal %d%%: the chance per item is shown in the steal screen.", level);
+    } else if (info != NULL && info->requirement > 0 && !info->roll) {
         if (level < info->requirement) {
             // A fixed threshold the script checks: below it the attempt
             // can't succeed, so it isn't made.
@@ -750,6 +790,328 @@ static int rt_context_menu(const char* title, const RtAction* actions, int count
 
     rt_log("menu: choice %d", choice);
     return choice;
+}
+
+// -----------------------------------------------------------------------------
+// Skilldex (manual skill use with a controller-picked target)
+// -----------------------------------------------------------------------------
+
+#define RT_SKILL_TARGET_RANGE 8
+
+static RtSkilldexState rt_skilldex_state;
+
+const RtSkilldexState* rt_skilldex_get_state()
+{
+    return &rt_skilldex_state;
+}
+
+static int rt_skilldex_skill(int rc)
+{
+    switch (rc) {
+    case SKILLDEX_RC_SNEAK:
+        return SKILL_SNEAK;
+    case SKILLDEX_RC_LOCKPICK:
+        return SKILL_LOCKPICK;
+    case SKILLDEX_RC_STEAL:
+        return SKILL_STEAL;
+    case SKILLDEX_RC_TRAPS:
+        return SKILL_TRAPS;
+    case SKILLDEX_RC_FIRST_AID:
+        return SKILL_FIRST_AID;
+    case SKILLDEX_RC_DOCTOR:
+        return SKILL_DOCTOR;
+    case SKILLDEX_RC_SCIENCE:
+        return SKILL_SCIENCE;
+    case SKILLDEX_RC_REPAIR:
+        return SKILL_REPAIR;
+    }
+    return -1;
+}
+
+static const char* rt_context_name(Object* obj)
+{
+    if (obj == obj_dude) {
+        return "Yourself";
+    }
+    return FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER ? critter_name(obj) : object_name(obj);
+}
+
+// Whether `obj` is something the skill can be used on from the Skilldex: what
+// the original crosshair accepted and something would react to.
+static bool rt_skill_accepts(int skill, Object* obj)
+{
+    int type = FID_TYPE(obj->fid);
+    bool critter = type == OBJ_TYPE_CRITTER;
+    bool alive = critter && !critter_is_dead(obj);
+
+    switch (skill) {
+    case SKILL_FIRST_AID:
+    case SKILL_DOCTOR:
+        return alive;
+    case SKILL_STEAL:
+        return obj != obj_dude && alive && !rt_is_engaged(obj) && !rt_is_hostile(obj);
+    case SKILL_LOCKPICK:
+    case SKILL_TRAPS:
+    case SKILL_SCIENCE:
+    case SKILL_REPAIR: {
+        if (obj == obj_dude || (critter && rt_is_engaged(obj))) {
+            return false;
+        }
+        // Fallout 1 implements these only in object scripts.
+        RtScriptSkills scriptSkills;
+        return rt_context_get_script_skills(obj, &scriptSkills) && scriptSkills.hasProc && scriptSkills.skills[skill].handled;
+    }
+    }
+    return false;
+}
+
+void rt_skill_odds_text(int skill, Object* target, char* out, size_t size)
+{
+    int level = skill_level(obj_dude, skill);
+    const char* name = skill_name(skill);
+
+    switch (skill) {
+    case SKILL_FIRST_AID:
+    case SKILL_DOCTOR: {
+        // `skill_use` rolls d100 against skill + critical chance.
+        int uses = skill_rt_uses_left(skill);
+        if (critter_body_type(target) == BODY_TYPE_ROBOTIC) {
+            snprintf(out, size, "%s %d%%. It can't help a robot.", name, level);
+        } else if (skill == SKILL_FIRST_AID && critter_get_hits(target) >= stat_level(target, STAT_MAXIMUM_HIT_POINTS)) {
+            snprintf(out, size, "%s %d%%. Not injured.", name, level);
+        } else {
+            int crit = stat_level(obj_dude, STAT_CRITICAL_CHANCE);
+            int chance = std::clamp(level + crit, 0, 100);
+            snprintf(out, size, "%s %d%%. Chance here %d%% (skill + %d%% critical chance)%s. Uses left today: %d.",
+                name, level, chance, crit, skill == SKILL_DOCTOR ? " per check" : "", uses);
+        }
+        return;
+    }
+    case SKILL_STEAL:
+        snprintf(out, size, "%s %d%%. The chance per item is shown in the steal screen.", name, level);
+        return;
+    }
+
+    RtScriptSkills scriptSkills;
+    const RtSkillInfo* info = rt_context_get_script_skills(target, &scriptSkills) && scriptSkills.hasProc && scriptSkills.skills[skill].handled
+        ? &(scriptSkills.skills[skill])
+        : NULL;
+    if (info != NULL && info->requirement > 0 && !info->roll) {
+        snprintf(out, size, "%s %d%%. Needs %d%%: %s.", name, level, info->requirement, level >= info->requirement ? "you meet it" : "too low");
+    } else if (info != NULL && info->roll) {
+        snprintf(out, size, "%s %d%%. Its script rolls against your skill (its modifiers aren't known).", name, level);
+    } else {
+        snprintf(out, size, "%s %d%%. Its script decides the outcome.", name, level);
+    }
+}
+
+static void rt_skilldex_collect(int skill, std::vector<Object*>* targets)
+{
+    targets->clear();
+    if (skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR) {
+        targets->push_back(obj_dude);
+    }
+
+    for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL; obj = obj_find_next_at()) {
+        if (obj == obj_dude || (obj->flags & OBJECT_HIDDEN) != 0) {
+            continue;
+        }
+        int type = FID_TYPE(obj->fid);
+        if (type != OBJ_TYPE_ITEM && type != OBJ_TYPE_CRITTER && type != OBJ_TYPE_SCENERY) {
+            continue;
+        }
+        if (tile_dist(obj_dude->tile, obj->tile) > RT_SKILL_TARGET_RANGE || !rt_skill_accepts(skill, obj)) {
+            continue;
+        }
+        // Not through walls (critters in between don't block).
+        if (combat_is_shot_blocked(obj_dude, obj_dude->tile, obj->tile, obj, NULL)) {
+            continue;
+        }
+        targets->push_back(obj);
+    }
+
+    std::stable_sort(targets->begin(), targets->end(), [](Object* a, Object* b) {
+        return (a == obj_dude ? -1 : tile_dist(obj_dude->tile, a->tile)) < (b == obj_dude ? -1 : tile_dist(obj_dude->tile, b->tile));
+    });
+}
+
+static void rt_skilldex_outline(Object* obj, bool on, int* savedOutline)
+{
+    Rect rect;
+    if (on) {
+        *savedOutline = obj->outline;
+        obj_remove_outline(obj, NULL);
+        obj_outline_object(obj, OUTLINE_TYPE_ITEM, NULL);
+        obj_turn_on_outline(obj, &rect);
+    } else {
+        obj_remove_outline(obj, &rect);
+        if (*savedOutline != 0) {
+            obj->outline = *savedOutline;
+        }
+    }
+    obj_bound(obj, &rect);
+    tile_refresh_rect(&rect, obj->elevation);
+}
+
+static void rt_skilldex_draw(int win, int width, int height, int skill, Object* target, int index, int count)
+{
+    unsigned char* buffer = win_get_buf(win);
+    buf_fill(buffer, width, height, width, colorTable[0]);
+    draw_box(buffer, width, 0, 0, width - 1, height - 1, colorTable[992]);
+
+    int line = text_height() + 3;
+    char text[200];
+    snprintf(text, sizeof(text), "%s: %s (%d of %d)", skill_name(skill), rt_context_name(target), index + 1, count);
+    text_to_buf(buffer + width * 5 + 8, text, width - 16, width, colorTable[32747]);
+
+    // Your skill on one line, what it means on this target on the next.
+    char skillPart[200];
+    SDL_strlcpy(skillPart, rt_skilldex_state.odds, sizeof(skillPart));
+    const char* rest = "";
+    char* split = strstr(skillPart, ". ");
+    if (split != NULL) {
+        split[1] = '\0';
+        rest = rt_skilldex_state.odds + (split - skillPart) + 2;
+    }
+    text_to_buf(buffer + width * (5 + line) + 8, skillPart, width - 16, width, colorTable[992]);
+    text_to_buf(buffer + width * (5 + line * 2) + 8, rest, width - 16, width, colorTable[992]);
+
+    const char* hint = "D-pad/RS Next target   A Use   B Back";
+    text_to_buf(buffer + width * (5 + line * 3) + (width - text_width(hint)) / 2, hint, width - 16, width, colorTable[992]);
+    win_draw(win);
+}
+
+// Controller target selection: the candidates are outlined one at a time;
+// D-pad or a right-stick flick moves to the next, A uses the skill, B goes
+// back to the Skilldex. Gameplay is paused meanwhile.
+static Object* rt_skilldex_pick(int skill)
+{
+    std::vector<Object*> targets;
+    rt_skilldex_collect(skill, &targets);
+    if (targets.empty()) {
+        rt_context_print("Nothing nearby to use %s on.", skill_name(skill));
+        return NULL;
+    }
+
+    bool wasEnabled = map_disable_bk_processes();
+    int centerWas = tile_center_tile;
+    int oldFont = text_curr();
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    gamepad_set_menu_key_mode(true);
+    text_font(101);
+
+    int width = 600;
+    int height = (text_height() + 3) * 4 + 10;
+    int screenWidth = scr_size.lrx - scr_size.ulx + 1;
+    int win = win_add((screenWidth - width) / 2, 8, width, height, colorTable[0], WINDOW_MODAL | WINDOW_MOVE_ON_TOP);
+
+    int index = 0;
+    int saved = 0;
+    Object* chosen = NULL;
+    bool redraw = true;
+
+    rt_skilldex_state.picking = true;
+    rt_skilldex_state.skill = skill;
+    rt_skilldex_state.candidates = (int)targets.size();
+    rt_skilldex_state.picks++;
+
+    while (win != -1) {
+        sharedFpsLimiter.mark();
+
+        if (redraw) {
+            Object* target = targets[index];
+            rt_skilldex_state.target = target;
+            rt_skill_odds_text(skill, target, rt_skilldex_state.odds, sizeof(rt_skilldex_state.odds));
+            // The view on the target while it is picked.
+            tile_set_center(target->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+            rt_skilldex_outline(target, true, &saved);
+            rt_skilldex_draw(win, width, height, skill, target, index, (int)targets.size());
+            rt_log("skilldex: %s target %d/%d %s: %s", skill_name(skill), index + 1, (int)targets.size(), rt_context_name(target), rt_skilldex_state.odds);
+            redraw = false;
+        }
+
+        int key = get_input();
+        float flickX;
+        float flickY;
+        bool flick = gamepad_consume_menu_flick(&flickX, &flickY);
+        int step = 0;
+        if (key == KEY_ARROW_RIGHT || key == KEY_ARROW_DOWN || (flick && (flickX > 0.0f || flickY > 0.0f))) {
+            step = 1;
+        } else if (key == KEY_ARROW_LEFT || key == KEY_ARROW_UP || flick) {
+            step = -1;
+        }
+
+        if (key == KEY_ESCAPE || game_user_wants_to_quit != 0) {
+            rt_skilldex_outline(targets[index], false, &saved);
+            break;
+        }
+        if (key == KEY_RETURN) {
+            rt_skilldex_outline(targets[index], false, &saved);
+            chosen = targets[index];
+            break;
+        }
+        if (step != 0 && targets.size() > 1) {
+            rt_skilldex_outline(targets[index], false, &saved);
+            index = (index + step + (int)targets.size()) % (int)targets.size();
+            redraw = true;
+        }
+
+        renderPresent();
+        sharedFpsLimiter.throttle();
+    }
+
+    if (win != -1) {
+        win_delete(win);
+    }
+    tile_set_center(centerWas, TILE_SET_CENTER_REFRESH_WINDOW);
+    gamepad_set_menu_key_mode(keyModeWas);
+    text_font(oldFont);
+    if (wasEnabled) {
+        map_enable_bk_processes();
+    }
+    rt_skilldex_state.picking = false;
+    rt_skilldex_state.target = NULL;
+    return chosen;
+}
+
+void rt_skilldex_run()
+{
+    rt_skilldex_state.opens++;
+    while (true) {
+        int rc = skilldex_select();
+        int skill = rt_skilldex_skill(rc);
+        if (skill == -1) {
+            rt_log("skilldex: closed");
+            return;
+        }
+
+        if (skill == SKILL_SNEAK) {
+            rt_toggle_sneak();
+            return;
+        }
+
+        // The original rule: no healing and no theft during a fight.
+        if ((skill == SKILL_FIRST_AID || skill == SKILL_DOCTOR || skill == SKILL_STEAL) && rt_player_in_combat()) {
+            rt_context_print("You cannot do that in combat.");
+            continue;
+        }
+
+        Object* target = rt_skilldex_pick(skill);
+        if (target == NULL) {
+            // B: back to the Skilldex.
+            continue;
+        }
+
+        char odds[200];
+        rt_skill_odds_text(skill, target, odds, sizeof(odds));
+        rt_context_print("%s", odds);
+        rt_skilldex_state.uses++;
+        rt_skilldex_state.lastSkill = skill;
+        rt_skilldex_state.lastTarget = target;
+        rt_log("skilldex: %s on %s", skill_name(skill), rt_context_name(target));
+        action_use_skill_on(obj_dude, target, skill);
+        return;
+    }
 }
 
 // Diagnostics: logs every call to one of `opcodes` in the script with the

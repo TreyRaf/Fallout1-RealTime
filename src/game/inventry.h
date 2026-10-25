@@ -133,6 +133,9 @@ typedef struct InvenRtLootState {
     // Stacks left behind by the last Take All.
     int takeAllLeft;
     char lastMessage[128];
+    // Stealing: the shown chance the selected item goes unnoticed (-1 none).
+    int stealOdds;
+    bool stealing;
 } InvenRtLootState;
 
 const InvenRtLootState* inven_rt_loot_state();

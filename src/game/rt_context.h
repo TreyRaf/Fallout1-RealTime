@@ -72,6 +72,33 @@ const RtContextStats* rt_context_get_stats();
 // (-1 cancels, -2 disables the override).
 void rt_context_set_menu_choice(int choice);
 
+// The Skilldex for the controller (View, or Y on the Pip-Boy Skills page):
+// the original Skilldex window with a highlight, then the target picked
+// with the controller (no mouse crosshair). Gameplay is paused throughout.
+void rt_skilldex_run();
+
+// The skill level and, where the original rules make it computable, the
+// chance on this target (First Aid, Doctor), or what the target's script
+// requires. Never rolls.
+void rt_skill_odds_text(int skill, Object* target, char* out, size_t size);
+
+typedef struct RtSkilldexState {
+    // The target picker is open.
+    bool picking;
+    int skill;
+    Object* target;
+    int candidates;
+    char odds[200];
+    // Openings, pickers shown and skills used.
+    int opens;
+    int picks;
+    int uses;
+    int lastSkill;
+    Object* lastTarget;
+} RtSkilldexState;
+
+const RtSkilldexState* rt_skilldex_get_state();
+
 // Automated tests: replaces the analysis of a script (NULL restores it).
 void rt_context_debug_override(int scriptIndex, const RtScriptSkills* info);
 

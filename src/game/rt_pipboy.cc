@@ -85,6 +85,8 @@ static const char* pb_damage_names[7] = { "Normal", "Laser", "Fire", "Plasma", "
 static RtPipboyState pb_state;
 static bool pb_open = false;
 static bool pb_close = false;
+// Y on the Skills page: open the Skilldex after closing.
+static bool pb_open_skilldex = false;
 static int pb_win = -1;
 static unsigned char* pb_buf = NULL;
 static unsigned char* pb_bg = NULL;
@@ -726,7 +728,7 @@ static void pb_render_stats(int top, int bottom)
         pb_draw_list(listTop, visible, SKILL_COUNT, *cursor, *scroll, labels, &values);
         pb_draw_description(listBottom + 4, bottom, skill_name(*cursor), skill_description(*cursor));
         pb_state.listCount = SKILL_COUNT;
-        pb_footer(unspent > 0 || pb_skill_added[*cursor] > 0 ? "A +1 point   X Undo point   B Close   LB/RB Page" : "D-pad Select   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer(unspent > 0 || pb_skill_added[*cursor] > 0 ? "A +1 point   X Undo   Y Skilldex   B Close   LB/RB Page" : "D-pad Select   Y Skilldex   B Close   LB/RB Page   LT/RT Tab");
         break;
     }
     case 3: {
@@ -893,6 +895,10 @@ static void pb_stats_key(int key)
             } else if (rc == -3) {
                 pb_say("%s is at its maximum.", skill_name(*cursor));
             }
+        } else if (key == GAMEPAD_KEY_Y || key == KEY_LOWERCASE_Y) {
+            // The Skilldex (manual skill use), once the Pip-Boy is closed.
+            pb_open_skilldex = true;
+            pb_close = true;
         } else if (key == GAMEPAD_KEY_X || key == KEY_LOWERCASE_X) {
             // Only points added since the Pip-Boy was opened can be taken
             // back, as on the original character screen.
@@ -1280,7 +1286,13 @@ static void pb_render_inventory(int top, int bottom)
                 pb_fill(x + 2, rowY - 1, width - 4, pb_line, pb_bar);
                 color = pb_bright;
             }
-            pb_text(x + 8, rowY, pb_action_name(pb_choices[index]), color);
+            const char* name = pb_action_name(pb_choices[index]);
+            // Explosives: "Use" sets the timer and arms them (Traps roll).
+            if (pb_choices[index] == RT_PIPBOY_ACTION_USE && pb_item != NULL
+                && (pb_item->pid == PROTO_ID_DYNAMITE_I || pb_item->pid == PROTO_ID_PLASTIC_EXPLOSIVES_I)) {
+                name = "Arm (set timer)";
+            }
+            pb_text(x + 8, rowY, name, color);
         }
         pb_footer("A Select   B Back");
         return;
@@ -2257,6 +2269,7 @@ void rt_pipboy_open(int tab, int page)
 
     pb_open = true;
     pb_close = false;
+    pb_open_skilldex = false;
     pb_mode = RT_PIPBOY_MODE_NONE;
     pb_map_centered = false;
     pb_world_centered = false;
@@ -2325,6 +2338,10 @@ void rt_pipboy_open(int tab, int page)
     }
     intface_redraw();
     rt_log("pipboy: closed");
+    if (pb_open_skilldex) {
+        pb_open_skilldex = false;
+        GNW_add_input_buffer(KEY_LOWERCASE_S);
+    }
 }
 
 void rt_pipboy_show_scanner()

@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "game/actions.h"
 #include "game/combat.h"
 #include "game/critter.h"
@@ -794,11 +796,10 @@ int skill_use(Object* obj, Object* a2, int skill, int criticalChanceModifier)
     return 0;
 }
 
-// 0x4991C8
-int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
+// RT: the steal modifier of `skill_check_stealing`, shared with the odds
+// shown before an attempt (`skill_rt_steal_odds`).
+static int skill_steal_modifier(Object* a1, Object* a2, Object* item)
 {
-    int howMuch;
-
     int stealModifier = 1 - gStealCount;
 
     if (a1 != obj_dude || !perk_level(PERK_PICKPOCKET)) {
@@ -816,6 +817,82 @@ int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
     if ((a2->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
         stealModifier += 20;
     }
+
+    return stealModifier;
+}
+
+// RT: the chance (%) that `skill_check_stealing` lets the item go unnoticed,
+// computed from the same rolls without making them: the steal roll only
+// matters through its criticals (a critical success is never caught, a
+// critical failure always is, criticals start on day 2); otherwise the
+// owner's catch roll decides. `stealCheck` and `catchChance` receive the two
+// percentages the rolls use.
+int skill_rt_steal_odds(Object* a1, Object* a2, Object* item, int* stealCheck, int* catchChance)
+{
+    int stealModifier = skill_steal_modifier(a1, a2, item);
+    int stealChance = std::min(stealModifier + skill_level(a1, SKILL_STEAL), 95);
+    int catchValue = PID_TYPE(a2->pid) == OBJ_TYPE_CRITTER
+        ? skill_level(a2, SKILL_STEAL) - stealModifier
+        : 30 - stealModifier;
+
+    if (stealCheck != NULL) {
+        *stealCheck = stealChance;
+    }
+    if (catchChance != NULL) {
+        *catchChance = std::clamp(catchValue, 0, 100);
+    }
+
+    if (a1 == obj_dude && isPartyMember(a2)) {
+        return 100;
+    }
+
+    bool criticals = game_time() / GAME_TIME_TICKS_PER_DAY >= 1;
+    int criticalChance = stat_level(a1, STAT_CRITICAL_CHANCE);
+    double caught = std::clamp(catchValue, 0, 100) / 100.0;
+    double unnoticed = 0.0;
+    for (int roll = 1; roll <= 100; roll++) {
+        int delta = stealChance - roll;
+        double criticalSuccess = 0.0;
+        double criticalFailure = 0.0;
+        if (criticals) {
+            if (delta < 0) {
+                criticalFailure = std::clamp(-delta / 10, 0, 100) / 100.0;
+            } else {
+                criticalSuccess = std::clamp(delta / 10 + criticalChance, 0, 100) / 100.0;
+            }
+        }
+        unnoticed += criticalSuccess + (1.0 - criticalSuccess - criticalFailure) * (1.0 - caught);
+    }
+
+    return (int)(unnoticed + 0.5);
+}
+
+// RT: First Aid and Doctor uses left today (3 per day, the original limit),
+// read without using one; -1 for other skills.
+int skill_rt_uses_left(int skill)
+{
+    if (skill != SKILL_FIRST_AID && skill != SKILL_DOCTOR) {
+        return -1;
+    }
+
+    int left = 0;
+    for (int slot = 0; slot < SKILLS_MAX_USES_PER_DAY; slot++) {
+        if (timesSkillUsed[skill][slot] == 0) {
+            left++;
+        }
+    }
+    if (left == 0 && (game_time() - timesSkillUsed[skill][0]) / GAME_TIME_TICKS_PER_HOUR > 24) {
+        left = 1;
+    }
+    return left;
+}
+
+// 0x4991C8
+int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
+{
+    int howMuch;
+
+    int stealModifier = skill_steal_modifier(a1, a2, item);
 
     int stealChance = stealModifier + skill_level(a1, SKILL_STEAL);
     if (stealChance > 95) {

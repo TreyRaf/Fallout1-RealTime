@@ -3771,6 +3771,15 @@ static void loot_rt_draw()
 
     if (loot_rt.lastMessage[0] != '\0' && SDL_GetTicks() < loot_rt_message_until) {
         loot_rt_text_centered(buffer, y, loot_rt.lastMessage, amber);
+    } else if (gIsSteal && loot_rt.selectedItem != NULL) {
+        // Stealing: the chance this item goes unnoticed (the original steal
+        // and catch rolls, computed without rolling), apart from the skill.
+        int check;
+        int catchChance;
+        int odds = skill_rt_steal_odds(inven_dude, target_stack[target_curr_stack], loot_rt.selectedItem, &check, &catchChance);
+        loot_rt.stealOdds = odds;
+        snprintf(text, sizeof(text), "%s unnoticed: %d%%  (Steal %d%%)", playerSide ? "Plant" : "Take", odds, skill_level(inven_dude, SKILL_STEAL));
+        loot_rt_text_centered(buffer, y, text, amber);
     }
     y += line;
 
@@ -4057,6 +4066,8 @@ int loot_container(Object* a1, Object* a2)
     gamepad_set_menu_key_mode(true);
     memset(&loot_rt, 0, sizeof(loot_rt));
     loot_rt.open = true;
+    loot_rt.stealing = gIsSteal != 0;
+    loot_rt.stealOdds = -1;
     loot_rt.side = INVEN_RT_LOOT_SIDE_LOOT;
     loot_rt_draw();
     rt_log("loot: open (%d items here, %d carried)", loot_rt.count[INVEN_RT_LOOT_SIDE_LOOT], loot_rt.count[INVEN_RT_LOOT_SIDE_PLAYER]);
@@ -6170,7 +6181,12 @@ int inven_set_timer(Object* a1)
         }
     }
 
+    // RT: the controller drives the timer window like the quantity window
+    // (D-pad, LT/RT, A sets the timer, B cancels).
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    gamepad_set_menu_key_mode(true);
     int seconds = do_move_timer(INVENTORY_WINDOW_TYPE_SET_TIMER, a1, 180);
+    gamepad_set_menu_key_mode(keyModeWas);
 
     if (!v1) {
         // NOTE: Uninline.

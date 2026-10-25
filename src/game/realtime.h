@@ -93,6 +93,8 @@ typedef struct RtStats {
     float sprintCalmAp;
     // AP regenerated while sprinting outside combat.
     float sprintCalmRegen;
+    // R3 / Skilldex Sneak toggles.
+    int sneakToggles;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -141,6 +143,9 @@ bool rt_is_engaged(Object* critter);
 // Whether a hostile critter is engaged with the player team nearby (the
 // real-time equivalent of being in combat).
 bool rt_player_in_combat();
+
+// Toggles Sneak (R3, or Sneak in the Skilldex).
+void rt_toggle_sneak();
 const char* rt_get_log_dir();
 unsigned int rt_get_time();
 int rt_get_pending_count();

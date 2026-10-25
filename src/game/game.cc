@@ -34,6 +34,8 @@
 #include "game/perk.h"
 #include "game/pipboy.h"
 #include "game/proto.h"
+#include "game/realtime.h"
+#include "game/rt_context.h"
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/queue.h"
@@ -617,7 +619,11 @@ int game_handle_input(int eventCode, bool isInCombatMode)
     case KEY_UPPERCASE_S:
     case KEY_LOWERCASE_S:
         // skilldex
-        if (intface_is_enabled()) {
+        if (intface_is_enabled() && rt_enabled()) {
+            // RT: the Skilldex with controller target selection.
+            gsound_play_sfx_file("ib1p1xx1");
+            rt_skilldex_run();
+        } else if (intface_is_enabled()) {
             gsound_play_sfx_file("ib1p1xx1");
 
             int mode = -1;

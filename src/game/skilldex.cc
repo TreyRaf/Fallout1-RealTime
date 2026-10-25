@@ -3,6 +3,8 @@
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
+
 #include "game/art.h"
 #include "game/cycle.h"
 #include "game/game.h"
@@ -12,10 +14,12 @@
 #include "game/map.h"
 #include "game/message.h"
 #include "game/object.h"
+#include "game/realtime.h"
 #include "game/skill.h"
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/debug.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
@@ -113,12 +117,86 @@ static unsigned char* winbuf;
 // 0x66519C
 static int fontsave;
 
+// RT: the highlighted row (kept between openings).
+static int skilldex_rt_selected = 0;
+static bool skilldex_rt_open = false;
+
+bool skilldex_rt_is_open()
+{
+    return skilldex_rt_open;
+}
+
+int skilldex_rt_get_selected()
+{
+    return skilldex_rt_selected;
+}
+
+static void skilldex_rt_row_rect(int row, Rect* rect)
+{
+    if (row < SKILLDEX_SKILL_COUNT) {
+        rect->ulx = 15;
+        rect->uly = 45 + 36 * row;
+        rect->lrx = rect->ulx + ginfo[SKILLDEX_FRM_BUTTON_OFF].width - 1;
+        rect->lry = rect->uly + ginfo[SKILLDEX_FRM_BUTTON_OFF].height - 1;
+    } else {
+        rect->ulx = 48;
+        rect->uly = 338;
+        rect->lrx = rect->ulx + ginfo[SKILLDEX_FRM_LITTLE_RED_BUTTON_UP].width - 1;
+        rect->lry = rect->uly + ginfo[SKILLDEX_FRM_LITTLE_RED_BUTTON_UP].height - 1;
+    }
+}
+
+// Frames the highlighted row (2 pixels outside its button), restoring the
+// background around the others.
+static void skilldex_rt_highlight()
+{
+    int width = ginfo[SKILLDEX_FRM_BACKGROUND].width;
+    int height = ginfo[SKILLDEX_FRM_BACKGROUND].height;
+    unsigned char* background = skldxbmp[SKILLDEX_FRM_BACKGROUND];
+
+    for (int row = 0; row <= SKILLDEX_SKILL_COUNT; row++) {
+        Rect rect;
+        skilldex_rt_row_rect(row, &rect);
+        int left = std::max(rect.ulx - 2, 0);
+        int top = std::max(rect.uly - 2, 0);
+        int right = std::min(rect.lrx + 2, width - 1);
+        int bottom = std::min(rect.lry + 2, height - 1);
+        for (int y = top; y <= bottom; y++) {
+            bool edgeRow = y < rect.uly || y > rect.lry;
+            for (int x = left; x <= right; x++) {
+                if (edgeRow || x < rect.ulx || x > rect.lrx) {
+                    winbuf[y * width + x] = background[y * width + x];
+                }
+            }
+        }
+
+        if (row == skilldex_rt_selected) {
+            draw_box(winbuf, width, left, top, right, bottom, colorTable[32747]);
+            draw_box(winbuf, width, left + 1, top + 1, right - 1, bottom - 1, colorTable[992]);
+        }
+    }
+
+    win_draw(skldxwin);
+}
+
 // 0x499560
 int skilldex_select()
 {
     if (skilldex_start() == -1) {
         debug_printf("\n ** Error loading skilldex dialog data! **\n");
         return -1;
+    }
+
+    // RT: controller highlight (D-pad up/down, A uses the highlighted skill,
+    // B cancels). The last row is CANCEL.
+    skilldex_rt_open = true;
+    bool controller = rt_enabled();
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    if (controller) {
+        gamepad_set_menu_key_mode(true);
+    }
+    if (controller) {
+        skilldex_rt_highlight();
     }
 
     int rc = -1;
@@ -129,17 +207,26 @@ int skilldex_select()
 
         if (keyCode == KEY_ESCAPE || keyCode == KEY_UPPERCASE_S || keyCode == KEY_LOWERCASE_S || keyCode == 500 || game_user_wants_to_quit != 0) {
             rc = 0;
+        } else if (controller && (keyCode == KEY_ARROW_UP || keyCode == KEY_ARROW_DOWN)) {
+            int rows = SKILLDEX_SKILL_COUNT + 1;
+            skilldex_rt_selected = (skilldex_rt_selected + (keyCode == KEY_ARROW_UP ? rows - 1 : 1)) % rows;
+            skilldex_rt_highlight();
         } else if (keyCode == KEY_RETURN) {
             gsound_play_sfx_file("ib1p1xx1");
-            rc = 0;
+            rc = controller && skilldex_rt_selected < SKILLDEX_SKILL_COUNT ? skilldex_rt_selected + 1 : 0;
         } else if (keyCode >= 501 && keyCode <= 509) {
             rc = keyCode - 500;
+            skilldex_rt_selected = rc - 1;
         }
 
         renderPresent();
         sharedFpsLimiter.throttle();
     }
 
+    skilldex_rt_open = false;
+    if (controller) {
+        gamepad_set_menu_key_mode(keyModeWas);
+    }
     if (rc != 0) {
         block_for_tocks(1000 / 9);
     }

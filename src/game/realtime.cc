@@ -687,6 +687,24 @@ bool rt_is_engaged(Object* critter)
     return it != rt_states.end() && it->second.engaged;
 }
 
+// R3 (or Sneak in the Skilldex): the original Sneak toggle (the detection
+// rules and the HUD's SNEAK box are the original game's). Fallout 1 has no
+// sneaking animation: the player walks normally. A run in progress is
+// turned off, since running ends sneaking (unless Silent Running).
+void rt_toggle_sneak()
+{
+    bool on = !is_pc_flag(PC_FLAG_SNEAKING);
+    if (on && rt_run_toggled && !perk_level(PERK_SILENT_RUNNING)) {
+        rt_run_toggled = false;
+        rt_log("run: off (sneaking)");
+    }
+
+    pc_flag_toggle(PC_FLAG_SNEAKING);
+    rt_stats.sneakToggles++;
+    rt_print(on ? "Sneaking." : "You stop sneaking.");
+    rt_log("sneak: %s", on ? "on" : "off");
+}
+
 bool rt_player_in_combat()
 {
     for (Object* critter : rt_critters) {
@@ -1833,10 +1851,10 @@ static void rt_update_dude(float dtMs)
     bool pressDown = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_DOWN);
     bool pressLeft = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_LEFT);
     bool pressRight = gamepad_consume_press(GAMEPAD_BUTTON_DPAD_RIGHT);
-    // R3 opens the Skilldex (the D-pad now belongs to favorites and
-    // interaction selection). Y is reserved.
+    // R3 toggles Sneak, View (Back) opens the Skilldex, Y cycles the attack
+    // mode.
     bool pressR3 = gamepad_consume_press(GAMEPAD_BUTTON_RIGHT_STICK);
-    gamepad_consume_press(GAMEPAD_BUTTON_Y);
+    bool pressY = gamepad_consume_press(GAMEPAD_BUTTON_Y);
     float flickX;
     float flickY;
     bool flick = gamepad_consume_flick(&flickX, &flickY);
@@ -1881,7 +1899,7 @@ static void rt_update_dude(float dtMs)
     // reloads, interactions or equipment changes until the queue is done.
     // The lock can still be moved (it doesn't change any queued target).
     if (rt_aimed_is_executing()) {
-        if (pressAttack || pressX || pressA || pressRB || pressBack || pressLB || pressR3
+        if (pressAttack || pressX || pressA || pressRB || pressBack || pressLB || pressR3 || pressY
             || pressUp || pressDown || pressLeft || pressRight || pressRun) {
             rt_print("Aimed attacks in progress. B cancels the rest.");
         }
@@ -1913,11 +1931,15 @@ static void rt_update_dude(float dtMs)
             GNW_add_input_buffer(KEY_LOWERCASE_B);
         }
     }
-    if (pressBack) {
+    if (pressY) {
+        // Attack mode (single/burst, punch/kick, swing/thrust).
         GNW_add_input_buffer(KEY_LOWERCASE_N);
     }
-    if (pressR3) {
+    if (pressBack) {
         GNW_add_input_buffer(KEY_LOWERCASE_S);
+    }
+    if (pressR3) {
+        rt_toggle_sneak();
     }
 
     if (pressLB) {
@@ -2338,8 +2360,10 @@ static void rt_update_movement(bool canAct)
         return;
     }
 
-    if (wantRun && !perk_level(PERK_SILENT_RUNNING)) {
+    if (wantRun && !perk_level(PERK_SILENT_RUNNING) && is_pc_flag(PC_FLAG_SNEAKING)) {
+        // As in the original: running ends sneaking (Silent Running aside).
         pc_flag_off(PC_FLAG_SNEAKING);
+        rt_print("You stop sneaking to run.");
     }
 
     rt_move_active = true;

@@ -59,6 +59,7 @@ void intface_end_window_close(bool animated);
 void intface_end_buttons_enable();
 void intface_end_buttons_disable();
 int refresh_box_bar_win();
+int intface_rt_shown_indicators();
 bool enable_box_bar_win();
 bool disable_box_bar_win();
 

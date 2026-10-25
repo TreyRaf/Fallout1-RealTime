@@ -37,6 +37,8 @@
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
 #include "game/rt_rules.h"
+#include "game/queue.h"
+#include "game/skilldex.h"
 #include "game/worldmap.h"
 #include "game/map_defs.h"
 #include "int/support/intextra.h"
@@ -216,6 +218,20 @@ typedef enum AutotestCheck {
     C_RULE_LONG_RANGE_SHOWN,
     C_RULE_FRIENDLY_FOE,
     C_RULE_SPRINT,
+    C_SKILLDEX_NAV,
+    C_SKILLDEX_PICK,
+    C_SKILLDEX_USE,
+    C_SKILLDEX_DOCTOR,
+    C_SKILLDEX_PIPBOY,
+    C_SNEAK_TOGGLE,
+    C_SNEAK_HUD,
+    C_SNEAK_INPUT,
+    C_SNEAK_PERSIST,
+    C_STEAL_CONTEXT,
+    C_STEAL_FLOW,
+    C_TRAP_CONTEXT,
+    C_TRAP_ARM,
+    C_REPAIR_CONTEXT,
     C_COUNT,
 } AutotestCheck;
 
@@ -233,8 +249,8 @@ static const char* at_check_names[C_COUNT] = {
     "Combat starting during a run drains AP until it is out",
     "Combat ending during a run stops the AP drain at once",
     "B opens the Pip-Boy, it stays open, B closes it",
-    "D-pad with no favorites assigned opens nothing; R3 opens the Skilldex",
-    "Y does nothing in gameplay; LB never changes the lock",
+    "D-pad with no favorites assigned opens nothing; View opens the Skilldex",
+    "Y cycles the attack mode (no menu); LB never changes the lock",
     "Menu: D-pad moves the cursor between buttons",
     "Menu: LT/RT do nothing (no lock, no attack)",
     "Menu: A activates the selected button",
@@ -375,6 +391,20 @@ static const char* at_check_names[C_COUNT] = {
     "Long-range hit chance shown = the hit chance the attack rolls",
     "Friendly Foe: companion bursts and strays never hit the player; hostile fire still does",
     "Bonus Move: sprint drains 50% less in combat; no drain outside combat either way",
+    "Skilldex: View opens it, D-pad moves the highlight, B closes it without using a skill",
+    "Skilldex: a skill needing a target opens the controller picker (skill % and target chance shown apart); B goes back to the list",
+    "Skilldex: First Aid used on yourself through the picker (original healing, daily uses)",
+    "Skilldex: Doctor opens its picker with its chance per check",
+    "Skilldex: Y on the Pip-Boy Skills page closes the Pip-Boy and opens the Skilldex",
+    "Sneak: R3 toggles it; walking keeps it; running ends it (unless Silent Running)",
+    "Sneak: SNEAK box in the HUD; next to LEVEL when a level up is pending; level-up state untouched",
+    "Sneak: R3 does nothing in the Skilldex or the Pip-Boy",
+    "Sneak: state and SNEAK box restored after loading",
+    "Steal: A is Steal only while sneaking; approaching or highlighting takes nothing",
+    "Steal: A opens the original steal screen with the item's chance unnoticed; the original check decides",
+    "Traps: a detected trap offers 'Disarm trap' and A runs its script; hidden (undetected) traps aren't offered",
+    "Traps: explosives arm through the timer window (controller) with the original Traps roll",
+    "Repair: a repairable object offers Repair and A runs its script; an unmet requirement blocks the attempt",
 };
 
 static int at_results[C_COUNT];
@@ -954,6 +984,17 @@ static int at_current_hit_mode()
         return -1;
     }
     return hitMode;
+}
+
+// The attack mode with its aimed flag (mode * 2 + aimed).
+static int at_attack_state()
+{
+    int hitMode;
+    bool aiming;
+    if (intface_get_attack(&hitMode, &aiming) != 0) {
+        return -1;
+    }
+    return hitMode * 2 + (aiming ? 1 : 0);
 }
 
 static int at_current_anim()
@@ -1654,11 +1695,11 @@ static bool step_inventory(unsigned int elapsed, bool first, bool timedOut)
 static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
 {
     // With no favorites assigned yet, D-pad up and down open nothing (they
-    // activate a favorite directly); R3 opens the Skilldex.
+    // activate a favorite directly); View (Back) opens the Skilldex.
     static const GamepadButton buttons[] = {
         GAMEPAD_BUTTON_DPAD_UP,
         GAMEPAD_BUTTON_DPAD_DOWN,
-        GAMEPAD_BUTTON_RIGHT_STICK,
+        GAMEPAD_BUTTON_BACK,
     };
     static const char* names[] = {
         "D-pad up",
@@ -1677,7 +1718,7 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
     }
 
     if (at_count_a >= 3) {
-        at_check(C_SCREENS, at_count_b == 3, "%d of 3 presses did what they should (D-pad: no menu, nothing used; R3: Skilldex, closed with B)", at_count_b);
+        at_check(C_SCREENS, at_count_b == 3, "%d of 3 presses did what they should (D-pad: no menu, nothing used; View: Skilldex, closed with B)", at_count_b);
         at_menu_expected = false;
         return true;
     }
@@ -1710,11 +1751,21 @@ static bool step_screens(unsigned int elapsed, bool first, bool timedOut)
 }
 static bool step_y_lb(unsigned int elapsed, bool first, bool timedOut)
 {
+    static int modeBefore;
+    static int modeAfter;
     if (first) {
         at_count_a = rt_get_stats()->targetingRequests;
         at_count_b = rt_aimed_get_state()->refusals;
         at_flag_a = false;
         at_flag_b = false;
+        // A weapon with two attack modes (single/burst): unarmed has only one
+        // selectable mode.
+        Object* weapon = at_create_burst_weapon();
+        if (weapon == NULL || !at_wield(weapon)) {
+            at_log("Y: could not equip a two-mode weapon");
+        }
+        modeBefore = at_attack_state();
+        modeAfter = modeBefore;
         at_expect_menu(NULL, NULL);
         at_press(GAMEPAD_BUTTON_Y);
         return false;
@@ -1724,6 +1775,11 @@ static bool step_y_lb(unsigned int elapsed, bool first, bool timedOut)
         at_flag_a = true;
         at_flag_b = at_menu_seen;
         at_menu_seen = false;
+        // Y cycled the attack mode; back to the one before.
+        modeAfter = at_attack_state();
+        for (int guard = 0; guard < 6 && at_attack_state() != modeBefore; guard++) {
+            intface_toggle_item_state();
+        }
         // LB: AIMED SHOT (opens only with a target; the default script closes it).
         at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
     }
@@ -1733,11 +1789,13 @@ static bool step_y_lb(unsigned int elapsed, bool first, bool timedOut)
         at_menu_expected = false;
         int lb = rt_get_stats()->targetingRequests - at_count_a;
         int refusals = rt_aimed_get_state()->refusals - at_count_b;
-        at_check(C_Y_LB, !at_flag_b && lb == 1 && rt_get_lock() == NULL,
-            "Y opened a menu=%d, LB presses=%d, LB locked something=%d", at_flag_b, lb, rt_get_lock() != NULL);
+        at_check(C_Y_LB, !at_flag_b && modeAfter != modeBefore && lb == 1 && rt_get_lock() == NULL,
+            "Y: attack mode %d -> %d (restored to %d), opened a menu=%d; LB presses=%d, LB locked something=%d",
+            modeBefore, modeAfter, at_attack_state(), at_flag_b, lb, rt_get_lock() != NULL);
         // The no-target case is checked in the aimed shot entry step, where
         // no enemy is around for sure (here a rat may have noticed the player).
         at_log("LB: aimed shot screen opened=%d, refused=%d (%s)", lbOpenedMenu, refusals, rt_aimed_get_state()->message);
+        at_unarmed();
         return true;
     }
     return false;
@@ -2450,11 +2508,11 @@ static bool at_kind_ready()
         Object* current = NULL;
         intface_get_current_item(&current);
         if (current == at_burst_weapon && anim != ANIM_FIRE_BURST) {
-            // Back cycles the attack mode (single -> burst).
+            // Y cycles the attack mode (single -> burst).
             static unsigned int lastPress = 0;
             if (SDL_GetTicks() - lastPress > 600) {
                 lastPress = SDL_GetTicks();
-                at_press(GAMEPAD_BUTTON_BACK);
+                at_press(GAMEPAD_BUTTON_Y);
             }
         }
         return anim == ANIM_FIRE_BURST;
@@ -7544,7 +7602,7 @@ static bool step_aim_limits(unsigned int elapsed, bool first, bool timedOut)
             static unsigned int lastPress = 0;
             if (now - lastPress > 600) {
                 lastPress = now;
-                at_press(GAMEPAD_BUTTON_BACK);
+                at_press(GAMEPAD_BUTTON_Y);
             }
             break;
         }
@@ -11661,6 +11719,762 @@ static bool step_rules_perks_after_load(unsigned int elapsed, bool first, bool t
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Steps: Skilldex, Sneak and contextual skills
+// -----------------------------------------------------------------------------
+
+static int at_sk_phase;
+static unsigned int at_sk_time;
+static int at_sk_values[8];
+static bool at_sk_flags[12];
+
+// A free hex next to the player (on screen or not).
+static int at_adjacent_free_tile()
+{
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(obj_dude->tile, rotation, 1);
+        if (tile != -1 && obj_blocking_at(NULL, tile, obj_dude->elevation) == NULL) {
+            return tile;
+        }
+    }
+    at_log("harness: no free hex next to the player (tile %d)", obj_dude->tile);
+    return -1;
+}
+
+// Presses `button` once per call while `count` presses are left, spaced out.
+static bool at_sk_press_series(GamepadButton button, int* count, unsigned int elapsed)
+{
+    if (*count <= 0) {
+        return true;
+    }
+    if (elapsed - at_sk_time >= 250 && at_aim_released()) {
+        at_press(button);
+        at_sk_time = elapsed;
+        (*count)--;
+    }
+    return false;
+}
+
+// Skilldex: down twice, screenshot, B.
+static bool at_menu_skilldex_nav(unsigned int elapsed)
+{
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed > 600 && skilldex_rt_is_open()) {
+            at_sk_values[0] = skilldex_rt_get_selected();
+            at_sk_values[1] = 2;
+            at_sk_time = elapsed;
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (at_sk_press_series(GAMEPAD_BUTTON_DPAD_DOWN, &at_sk_values[1], elapsed) && elapsed - at_sk_time > 400) {
+            at_sk_values[2] = skilldex_rt_get_selected();
+            at_screenshot("50_skilldex");
+            at_press(GAMEPAD_BUTTON_B);
+            at_sk_phase = 2;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_skilldex_nav(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_sk_phase = 0;
+        at_sk_values[3] = rt_skilldex_get_state()->opens;
+        at_sk_values[4] = rt_skilldex_get_state()->uses;
+        at_expect_menu(NULL, at_menu_skilldex_nav);
+        at_press(GAMEPAD_BUTTON_BACK);
+        return false;
+    }
+
+    if ((at_menu_done && elapsed > 800 && !skilldex_rt_is_open()) || timedOut) {
+        at_menu_expected = false;
+        int opens = rt_skilldex_get_state()->opens - at_sk_values[3];
+        int uses = rt_skilldex_get_state()->uses - at_sk_values[4];
+        at_check(C_SKILLDEX_NAV, opens == 1 && at_sk_values[2] == (at_sk_values[0] + 2) % 9 && !skilldex_rt_is_open() && uses == 0,
+            "View opened it=%d; highlight %d -> %d after D-pad down x2; B closed it=%d, skills used %d",
+            opens, at_sk_values[0], at_sk_values[2], !skilldex_rt_is_open(), uses);
+        return true;
+    }
+    return false;
+}
+
+// Skilldex: First Aid row, A (picker), B (back to the list), A, A (use).
+static int at_sk_target_row;
+static bool at_menu_skilldex_use(unsigned int elapsed)
+{
+    const RtSkilldexState* state = rt_skilldex_get_state();
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed > 600 && skilldex_rt_is_open()) {
+            at_sk_values[1] = (at_sk_target_row - skilldex_rt_get_selected() + 9) % 9;
+            at_sk_time = elapsed;
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (at_sk_press_series(GAMEPAD_BUTTON_DPAD_DOWN, &at_sk_values[1], elapsed) && elapsed - at_sk_time > 400) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_sk_time = elapsed;
+            at_sk_phase = 2;
+        }
+        break;
+    case 2:
+        // The picker, on the player first.
+        if (state->picking && elapsed - at_sk_time > 700) {
+            at_sk_flags[0] = state->target == obj_dude;
+            at_sk_flags[1] = strstr(state->odds, "Chance here") != NULL && strstr(state->odds, "Uses left today") != NULL;
+            at_sk_values[5] = state->candidates;
+            at_log("skilldex: picker for %s on %s: %s (%d targets)", skill_name(state->skill),
+                state->target == obj_dude ? "the player" : object_name(state->target), state->odds, state->candidates);
+            at_screenshot("51_skilldex_target");
+            at_press(GAMEPAD_BUTTON_B);
+            at_sk_time = elapsed;
+            at_sk_phase = 3;
+        }
+        break;
+    case 3:
+        // B went back to the list.
+        if (!state->picking && skilldex_rt_is_open() && elapsed - at_sk_time > 600) {
+            at_sk_flags[2] = true;
+            at_press(GAMEPAD_BUTTON_A);
+            at_sk_time = elapsed;
+            at_sk_phase = 4;
+        }
+        break;
+    case 4:
+        if (state->picking && elapsed - at_sk_time > 600) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_sk_phase = 5;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_skilldex_first_aid(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_hostiles();
+        memset(at_sk_flags, 0, sizeof(at_sk_flags));
+        at_sk_phase = 0;
+        at_sk_target_row = 4; // First Aid
+        at_no_heal = true;
+        int max = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+        critter_adjust_hits(obj_dude, (max - 12) - critter_get_hits(obj_dude));
+        at_sk_values[3] = critter_get_hits(obj_dude);
+        at_sk_values[4] = rt_skilldex_get_state()->uses;
+        at_sk_values[6] = skill_rt_uses_left(SKILL_FIRST_AID);
+        at_expect_menu(NULL, at_menu_skilldex_use);
+        at_press(GAMEPAD_BUTTON_BACK);
+        return false;
+    }
+
+    // The use runs as an animation after the screens close.
+    if ((at_menu_done && elapsed > 1500 && !anim_busy(obj_dude) && !skilldex_rt_is_open()) || timedOut) {
+        at_menu_expected = false;
+        const RtSkilldexState* state = rt_skilldex_get_state();
+        int uses = state->uses - at_sk_values[4];
+        int usesLeft = skill_rt_uses_left(SKILL_FIRST_AID);
+        int hp = critter_get_hits(obj_dude);
+        // Success heals and uses one of the 3 daily uses; failure does neither.
+        bool attempted = (hp > at_sk_values[3] && usesLeft == at_sk_values[6] - 1) || (hp == at_sk_values[3] && usesLeft == at_sk_values[6]);
+        at_check(C_SKILLDEX_PICK, at_sk_flags[0] && at_sk_flags[1] && at_sk_flags[2],
+            "First Aid picker: player first=%d, skill and chance shown separately=%d (%d targets); B back to the list=%d",
+            at_sk_flags[0], at_sk_flags[1], at_sk_values[5], at_sk_flags[2]);
+        at_check(C_SKILLDEX_USE, uses == 1 && state->lastSkill == SKILL_FIRST_AID && state->lastTarget == obj_dude && attempted,
+            "First Aid used from the Skilldex on yourself: uses %d, HP %d -> %d, uses left today %d -> %d",
+            uses, at_sk_values[3], hp, at_sk_values[6], usesLeft);
+        at_no_heal = false;
+        at_heal();
+        return true;
+    }
+    return false;
+}
+
+// Doctor: opens its picker (then B, B).
+static bool at_menu_skilldex_doctor(unsigned int elapsed)
+{
+    const RtSkilldexState* state = rt_skilldex_get_state();
+    switch (at_sk_phase) {
+    case 0:
+    case 1:
+        return at_menu_skilldex_use(elapsed) && false;
+    case 2:
+        if (state->picking && elapsed - at_sk_time > 600) {
+            at_sk_flags[3] = state->skill == SKILL_DOCTOR && state->target == obj_dude && strstr(state->odds, "per check") != NULL;
+            at_log("skilldex: Doctor picker: %s", state->odds);
+            at_press(GAMEPAD_BUTTON_B);
+            at_sk_time = elapsed;
+            at_sk_phase = 3;
+        }
+        break;
+    case 3:
+        if (!state->picking && skilldex_rt_is_open() && elapsed - at_sk_time > 600) {
+            at_press(GAMEPAD_BUTTON_B);
+            at_sk_phase = 4;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_skilldex_doctor(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_sk_phase = 0;
+        at_sk_flags[3] = false;
+        at_sk_target_row = 5; // Doctor
+        at_no_heal = true;
+        critter_adjust_hits(obj_dude, -5);
+        at_expect_menu(NULL, at_menu_skilldex_doctor);
+        at_press(GAMEPAD_BUTTON_BACK);
+        return false;
+    }
+    if ((at_menu_done && elapsed > 800 && !skilldex_rt_is_open()) || timedOut) {
+        at_menu_expected = false;
+        at_check(C_SKILLDEX_DOCTOR, at_sk_flags[3], "Doctor picker on yourself with its chance per check=%d", at_sk_flags[3]);
+        at_no_heal = false;
+        at_heal();
+        return true;
+    }
+    return false;
+}
+
+// Pip-Boy Skills page: Y closes it and opens the Skilldex; B closes that.
+static bool at_menu_pipboy_skilldex(unsigned int elapsed)
+{
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed > 800 && rt_pipboy_is_open()) {
+            at_screenshot("54_pipboy_skills");
+            at_press(GAMEPAD_BUTTON_Y);
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (skilldex_rt_is_open()) {
+            at_sk_flags[4] = !rt_pipboy_is_open();
+            at_sk_time = elapsed;
+            at_sk_phase = 2;
+        }
+        break;
+    case 2:
+        if (elapsed - at_sk_time > 600) {
+            at_press(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_skilldex_pipboy(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_sk_phase = 0;
+        at_sk_flags[4] = false;
+        at_sk_values[3] = rt_skilldex_get_state()->opens;
+        at_expect_menu(NULL, at_menu_pipboy_skilldex);
+        rt_pipboy_open(RT_PIPBOY_TAB_STATS, 2);
+        return false;
+    }
+    if ((at_menu_done && elapsed > 800 && !skilldex_rt_is_open() && !rt_pipboy_is_open()) || timedOut) {
+        at_menu_expected = false;
+        int opens = rt_skilldex_get_state()->opens - at_sk_values[3];
+        at_check(C_SKILLDEX_PIPBOY, opens == 1 && at_sk_flags[4],
+            "Y on the Pip-Boy Skills page: Pip-Boy closed and the Skilldex opened=%d (openings %d)", at_sk_flags[4], opens);
+        return true;
+    }
+    return false;
+}
+
+// Sneak: R3 on, HUD boxes (with LEVEL), running ends it, R3 off.
+static bool step_sneak(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        if (is_pc_flag(PC_FLAG_SNEAKING)) {
+            pc_flag_off(PC_FLAG_SNEAKING);
+        }
+        if (rt_is_run_toggled()) {
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+        }
+        at_sk_phase = 0;
+        at_sk_time = elapsed;
+        memset(at_sk_flags, 0, sizeof(at_sk_flags));
+        at_sk_values[0] = rt_get_stats()->sneakToggles;
+        at_sk_values[1] = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE);
+        return false;
+    }
+
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed - at_sk_time > 500 && at_aim_released()) {
+            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+            at_sk_time = elapsed;
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (elapsed - at_sk_time > 500) {
+            at_sk_flags[0] = is_pc_flag(PC_FLAG_SNEAKING);
+            at_sk_flags[1] = (intface_rt_shown_indicators() & 1) != 0;
+            // With a level up pending too: both boxes, side by side.
+            if (!at_sk_values[1]) {
+                pc_flag_on(PC_FLAG_LEVEL_UP_AVAILABLE);
+            }
+            at_sk_values[2] = intface_rt_shown_indicators();
+            at_screenshot("52_sneak_level");
+            if (!at_sk_values[1]) {
+                pc_flag_off(PC_FLAG_LEVEL_UP_AVAILABLE);
+            }
+            at_sk_flags[2] = is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE) == (at_sk_values[1] != 0);
+            // The animation: Fallout 1's critter art has no sneaking
+            // animation; the walk stays.
+            int walk = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_WALK, (obj_dude->fid & 0xF000) >> 12, 1);
+            at_log("sneak: on=%d, HUD %d; with LEVEL: HUD %d; walk art present=%d (no sneak animation type exists)",
+                at_sk_flags[0], intface_rt_shown_indicators(), at_sk_values[2], art_exists(walk));
+            at_sk_time = elapsed;
+            at_sk_phase = 2;
+        }
+        break;
+    case 2:
+        // Walking keeps sneaking.
+        at_stick_open_direction();
+        if (elapsed - at_sk_time > 1000) {
+            at_sk_flags[3] = is_pc_flag(PC_FLAG_SNEAKING) && FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK;
+            at_press(GAMEPAD_BUTTON_LEFT_STICK);
+            at_sk_time = elapsed;
+            at_sk_phase = 3;
+        }
+        break;
+    case 3:
+        // Running ends it (unless Silent Running).
+        at_stick_open_direction();
+        if (elapsed - at_sk_time > 1200) {
+            at_sk_flags[4] = perk_level(PERK_SILENT_RUNNING) != 0 || !is_pc_flag(PC_FLAG_SNEAKING);
+            at_sk_flags[5] = (intface_rt_shown_indicators() & 1) == 0 || perk_level(PERK_SILENT_RUNNING) != 0;
+            at_stick_release();
+            if (rt_is_run_toggled()) {
+                at_press(GAMEPAD_BUTTON_LEFT_STICK);
+            }
+            at_sk_time = elapsed;
+            at_sk_phase = 4;
+        }
+        break;
+    case 4:
+        // R3 on, then off.
+        if (elapsed - at_sk_time > 600 && at_aim_released()) {
+            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+            at_sk_time = elapsed;
+            at_sk_phase = 5;
+        }
+        break;
+    case 5:
+        if (elapsed - at_sk_time > 600 && at_aim_released()) {
+            at_sk_flags[6] = is_pc_flag(PC_FLAG_SNEAKING);
+            at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+            at_sk_time = elapsed;
+            at_sk_phase = 6;
+        }
+        break;
+    case 6:
+        if (elapsed - at_sk_time > 600) {
+            at_sk_flags[7] = !is_pc_flag(PC_FLAG_SNEAKING) && (intface_rt_shown_indicators() & 1) == 0;
+            int toggles = rt_get_stats()->sneakToggles - at_sk_values[0];
+            at_check(C_SNEAK_TOGGLE, at_sk_flags[0] && at_sk_flags[3] && at_sk_flags[4] && at_sk_flags[6] && at_sk_flags[7] && toggles == 3,
+                "R3: on=%d; walking keeps it=%d; running ends it=%d; R3 on again=%d, off=%d (toggles %d)",
+                at_sk_flags[0], at_sk_flags[3], at_sk_flags[4], at_sk_flags[6], at_sk_flags[7], toggles);
+            at_check(C_SNEAK_HUD, at_sk_flags[1] && at_sk_values[2] == 3 && at_sk_flags[2] && at_sk_flags[5] && at_sk_flags[7],
+                "SNEAK box shown=%d; with a level up pending both boxes (mask %d, 3 = SNEAK+LEVEL); level-up state untouched=%d; gone when sneaking ended=%d/%d",
+                at_sk_flags[1], at_sk_values[2], at_sk_flags[2], at_sk_flags[5], at_sk_flags[7]);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// R3 inside the Skilldex and the Pip-Boy does nothing.
+static bool at_menu_r3_then_b(unsigned int elapsed)
+{
+    if (at_sk_phase == 0 && elapsed > 700) {
+        at_press(GAMEPAD_BUTTON_RIGHT_STICK);
+        at_sk_phase = 1;
+    } else if (at_sk_phase == 1 && elapsed > 1300) {
+        at_press(GAMEPAD_BUTTON_B);
+        at_sk_phase = 2;
+        return true;
+    }
+    return false;
+}
+
+static bool step_sneak_menus(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_sk_values[0] = rt_get_stats()->sneakToggles;
+        at_sk_values[1] = 0;
+        at_sk_phase = 0;
+        at_expect_menu(NULL, at_menu_r3_then_b);
+        at_press(GAMEPAD_BUTTON_BACK);
+        return false;
+    }
+
+    if (at_sk_values[1] == 0 && at_menu_done && elapsed > 800 && !skilldex_rt_is_open()) {
+        at_sk_values[1] = 1;
+        at_sk_phase = 0;
+        at_expect_menu(NULL, at_menu_r3_then_b);
+        rt_pipboy_open(RT_PIPBOY_TAB_INVENTORY, 0);
+        return false;
+    }
+
+    if ((at_sk_values[1] == 1 && at_menu_done && elapsed > 1600 && !rt_pipboy_is_open()) || timedOut) {
+        at_menu_expected = false;
+        int toggles = rt_get_stats()->sneakToggles - at_sk_values[0];
+        at_check(C_SNEAK_INPUT, toggles == 0 && !is_pc_flag(PC_FLAG_SNEAKING),
+            "R3 in the Skilldex and the Pip-Boy: sneak toggles %d, sneaking=%d", toggles, is_pc_flag(PC_FLAG_SNEAKING));
+        return true;
+    }
+    return false;
+}
+
+// Steal: A is Steal only while sneaking; it opens the steal screen.
+static Object* at_steal_target;
+static Object* at_steal_item;
+
+static bool at_menu_steal(unsigned int elapsed)
+{
+    const InvenRtLootState* state = inven_rt_loot_state();
+    switch (at_sk_phase) {
+    case 0:
+        if (state->open && elapsed > 800) {
+            at_sk_flags[3] = state->stealing;
+            at_sk_values[2] = state->stealOdds;
+            at_screenshot("53_steal");
+            at_press(GAMEPAD_BUTTON_A);
+            at_sk_time = elapsed;
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (!state->open || elapsed - at_sk_time > 1200) {
+            at_sk_flags[4] = !state->open;
+            if (state->open) {
+                at_press(GAMEPAD_BUTTON_B);
+            }
+            at_sk_phase = 2;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_steal(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_hostiles();
+        at_move_to_open_spot(2);
+        // Fixtures go on screen: the view on the player.
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        memset(at_sk_flags, 0, sizeof(at_sk_flags));
+        at_sk_phase = 0;
+        at_steal_target = at_spawn_rat_at(at_adjacent_free_tile(), false);
+        at_steal_item = NULL;
+        int stimpak = at_item_pid_by_name("Stimpak");
+        if (at_steal_target != NULL && stimpak != -1 && obj_pid_new(&at_steal_item, stimpak) != -1) {
+            Rect rect;
+            item_add_force(at_steal_target, at_steal_item, 1);
+            obj_disconnect(at_steal_item, &rect);
+        }
+        if (at_steal_target == NULL || at_steal_item == NULL) {
+            at_check(C_STEAL_CONTEXT, false, "fixtures missing (target %d, item %d)", at_steal_target != NULL, at_steal_item != NULL);
+            at_erase(at_steal_target);
+            return true;
+        }
+        if (is_pc_flag(PC_FLAG_SNEAKING)) {
+            pc_flag_off(PC_FLAG_SNEAKING);
+        }
+
+        char normal[96];
+        char sneaking[96];
+        rt_context_describe(at_steal_target, normal, sizeof(normal));
+        rt_toggle_sneak();
+        rt_context_describe(at_steal_target, sneaking, sizeof(sneaking));
+        at_sk_flags[0] = strstr(normal, "Steal") == NULL;
+        at_sk_flags[1] = strcmp(sneaking, "Steal") == 0;
+        // Sneaking next to it took nothing.
+        at_sk_flags[2] = at_count_pid_in(at_steal_target, at_steal_item->pid) == 1;
+        at_log("steal: A outside sneak '%s', sneaking '%s'", normal, sneaking);
+
+        at_sk_values[0] = at_count_pid_in(obj_dude, at_steal_item->pid);
+        at_sk_values[1] = rt_context_get_stats()->skillUses;
+        at_expect_menu(NULL, at_menu_steal);
+        rt_context_interact(at_steal_target);
+        return false;
+    }
+
+    if ((at_menu_done && elapsed > 1500 && !inven_rt_loot_state()->open) || timedOut) {
+        at_menu_expected = false;
+        int taken = at_count_pid_in(obj_dude, at_steal_item->pid) - at_sk_values[0];
+        bool caught = at_steal_target != NULL && !critter_is_dead(at_steal_target)
+            && (at_sk_flags[4] || at_steal_target->data.critter.combat.whoHitMe == obj_dude || rt_is_hostile(at_steal_target));
+        at_check(C_STEAL_CONTEXT, at_sk_flags[0] && at_sk_flags[1] && at_sk_flags[2],
+            "A outside sneak isn't Steal=%d; sneaking A = Steal=%d; nothing taken by sneaking next to it=%d",
+            at_sk_flags[0], at_sk_flags[1], at_sk_flags[2]);
+        at_check(C_STEAL_FLOW, at_sk_flags[3] && at_sk_values[2] >= 0 && at_sk_values[2] <= 100 && (taken == 1 || caught),
+            "A opened the steal screen=%d with the item's chance unnoticed %d%%; A on the Stimpak: taken=%d, caught (screen closed / owner reacts)=%d",
+            at_sk_flags[3], at_sk_values[2], taken, caught);
+        if (is_pc_flag(PC_FLAG_SNEAKING)) {
+            rt_toggle_sneak();
+        }
+        at_erase(at_steal_target);
+        at_steal_target = NULL;
+        at_clear_hostiles();
+        return true;
+    }
+    return false;
+}
+
+// A scenery object next to the player running `script`.
+static Object* at_scripted_scenery(const char* script)
+{
+    int scriptIndex = at_script_index(script);
+    int tile = at_adjacent_free_tile();
+    if (scriptIndex == -1 || tile == -1) {
+        return NULL;
+    }
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_SCENERY << 24) | index;
+        Proto* proto;
+        Object* obj;
+        if (proto_ptr(pid, &proto) == -1 || obj_pid_new(&obj, pid) == -1) {
+            continue;
+        }
+        if (obj->sid != -1) {
+            scr_remove(obj->sid);
+            obj->sid = -1;
+        }
+        Rect rect;
+        obj_move_to_tile(obj, tile, obj_dude->elevation, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        if (obj_new_sid_inst(obj, SCRIPT_TYPE_ITEM, scriptIndex) == -1) {
+            at_erase(obj);
+            return NULL;
+        }
+        return obj;
+    }
+    return NULL;
+}
+
+static bool at_is_candidate(Object* obj)
+{
+    Object* list[32];
+    int count = rt_get_interact_candidates(list, 32);
+    for (int index = 0; index < count; index++) {
+        if (list[index] == obj) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Traps: a trapped object offers Disarm; hidden, it isn't offered.
+static Object* at_trap;
+static bool step_traps(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_hostiles();
+        memset(at_sk_flags, 0, sizeof(at_sk_flags));
+        at_move_to_open_spot(2);
+        // Fixtures go on screen: the view on the player.
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        at_trap = at_scripted_scenery("VBOOM.int");
+        if (at_trap == NULL) {
+            at_check(C_TRAP_CONTEXT, false, "no trap fixture");
+            return true;
+        }
+        char text[96];
+        rt_context_describe(at_trap, text, sizeof(text));
+        at_sk_flags[0] = strstr(text, "Disarm trap") != NULL;
+        at_log("traps: A on the trap: '%s'", text);
+        // Undetected (hidden): not offered.
+        at_trap->flags |= OBJECT_HIDDEN;
+        at_sk_phase = 0;
+        at_sk_time = elapsed;
+        return false;
+    }
+
+    at_heal();
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed - at_sk_time > 300) {
+            at_sk_flags[1] = !at_is_candidate(at_trap);
+            at_trap->flags &= ~OBJECT_HIDDEN;
+            at_sk_time = elapsed;
+            at_sk_phase = 1;
+        }
+        break;
+    case 1:
+        if (elapsed - at_sk_time > 300) {
+            at_sk_flags[2] = at_is_candidate(at_trap);
+            at_sk_values[0] = rt_context_get_stats()->skillUses;
+            rt_context_interact(at_trap);
+            at_sk_time = elapsed;
+            at_sk_phase = 2;
+        }
+        break;
+    case 2:
+        if (elapsed - at_sk_time > 2500 && !anim_busy(obj_dude)) {
+            int uses = rt_context_get_stats()->skillUses - at_sk_values[0];
+            at_check(C_TRAP_CONTEXT, at_sk_flags[0] && at_sk_flags[1] && at_sk_flags[2] && uses == 1,
+                "trap: A shows 'Disarm trap'=%d; hidden (undetected) not offered=%d; visible offered=%d; A ran the script's Traps check=%d",
+                at_sk_flags[0], at_sk_flags[1], at_sk_flags[2], uses);
+            at_erase(at_trap);
+            at_trap = NULL;
+            at_heal();
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// Arming: dynamite from the inventory, the timer window with the controller.
+static bool at_menu_timer_accept(unsigned int elapsed)
+{
+    if (elapsed > 900) {
+        at_screenshot("55_arm_timer");
+        at_press(GAMEPAD_BUTTON_A);
+        return true;
+    }
+    return false;
+}
+
+static bool step_traps_arm(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!first) {
+        return true;
+    }
+
+    Object* dynamite;
+    if (obj_pid_new(&dynamite, PROTO_ID_DYNAMITE_I) == -1) {
+        at_check(C_TRAP_ARM, false, "no dynamite prototype");
+        return true;
+    }
+    Rect rect;
+    item_add_force(obj_dude, dynamite, 1);
+    obj_disconnect(dynamite, &rect);
+
+    at_expect_menu(NULL, at_menu_timer_accept);
+    int rc = protinst_use_item(obj_dude, dynamite);
+    at_menu_expected = false;
+    bool armed = dynamite->pid == PROTO_ID_DYNAMITE_II;
+    bool queued = queue_find(dynamite, EVENT_TYPE_EXPLOSION) || queue_find(dynamite, EVENT_TYPE_EXPLOSION_FAILURE);
+
+    // Defused again and removed (no explosion in the test).
+    queue_remove_this(dynamite, EVENT_TYPE_EXPLOSION);
+    queue_remove_this(dynamite, EVENT_TYPE_EXPLOSION_FAILURE);
+    item_remove_mult(obj_dude, dynamite, 1);
+    obj_erase_object(dynamite, &rect);
+
+    at_check(C_TRAP_ARM, rc == 0 && armed && queued,
+        "dynamite Use (Pip-Boy: 'Arm (set timer)'): timer window with the controller, armed=%d, explosion queued (Traps roll decides timing)=%d",
+        armed, queued);
+    return true;
+}
+
+// Repair: offered on a repairable object; a requirement it doesn't meet
+// blocks the attempt.
+static Object* at_repair;
+static bool step_repair(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_clear_hostiles();
+        memset(at_sk_flags, 0, sizeof(at_sk_flags));
+        at_move_to_open_spot(2);
+        // Fixtures go on screen: the view on the player.
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        at_repair = at_scripted_scenery("fieldgen.int");
+        if (at_repair == NULL) {
+            at_check(C_REPAIR_CONTEXT, false, "no repair fixture");
+            return true;
+        }
+        char text[96];
+        rt_context_describe(at_repair, text, sizeof(text));
+        at_sk_flags[0] = strstr(text, "Repair") != NULL;
+        at_log("repair: A on the field generator: '%s'", text);
+        at_sk_values[0] = rt_context_get_stats()->skillUses;
+        rt_context_interact(at_repair);
+        at_sk_time = elapsed;
+        at_sk_phase = 0;
+        return false;
+    }
+
+    switch (at_sk_phase) {
+    case 0:
+        if (elapsed - at_sk_time > 2500 && !anim_busy(obj_dude)) {
+            at_sk_values[1] = rt_context_get_stats()->skillUses - at_sk_values[0];
+            // A requirement above the player's skill (as a script check).
+            Script* script;
+            if (scr_ptr(at_repair->sid, &script) != -1) {
+                RtScriptSkills info;
+                memset(&info, 0, sizeof(info));
+                info.hasProc = true;
+                for (int skill = 0; skill < SKILL_COUNT; skill++) {
+                    info.skills[skill].requirement = -1;
+                }
+                info.skills[SKILL_REPAIR].handled = true;
+                info.skills[SKILL_REPAIR].requirement = 300;
+                rt_context_debug_override(script->scr_script_idx, &info);
+                at_sk_values[2] = rt_context_get_stats()->skillUses;
+                at_sk_values[3] = rt_context_get_stats()->skillBlocked;
+                rt_context_interact(at_repair);
+                at_sk_flags[1] = rt_context_get_stats()->skillBlocked == at_sk_values[3] + 1
+                    && rt_context_get_stats()->skillUses == at_sk_values[2];
+                rt_context_debug_override(script->scr_script_idx, NULL);
+            }
+            at_check(C_REPAIR_CONTEXT, at_sk_flags[0] && at_sk_values[1] == 1 && at_sk_flags[1],
+                "field generator: A shows Repair=%d; A ran the script's Repair check=%d; with a 300%% requirement blocked without attempting=%d",
+                at_sk_flags[0], at_sk_values[1], at_sk_flags[1]);
+            at_erase(at_repair);
+            at_repair = NULL;
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+// Sneak across save/load.
+static bool at_sneak_saved = false;
+static bool step_sneak_before_save(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (!is_pc_flag(PC_FLAG_SNEAKING)) {
+        rt_toggle_sneak();
+    }
+    at_sneak_saved = is_pc_flag(PC_FLAG_SNEAKING);
+    return true;
+}
+
+static bool step_sneak_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    bool sneaking = is_pc_flag(PC_FLAG_SNEAKING);
+    bool box = (intface_rt_shown_indicators() & 1) != 0;
+    at_check(C_SNEAK_PERSIST, at_sneak_saved && sneaking && box,
+        "saved sneaking=%d; after load sneaking=%d, SNEAK box shown=%d", at_sneak_saved, sneaking, box);
+    if (sneaking) {
+        rt_toggle_sneak();
+    }
+    return true;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -11726,12 +12540,24 @@ static const AtStep at_steps[] = {
     { "character rules: long-range accuracy", step_rules_long_range, 30000 },
     { "character rules: Friendly Foe", step_rules_friendly_foe, 10000 },
     { "character rules: Bonus Move sprint", step_rules_sprint, 60000 },
+    { "skilldex: View, navigation, cancel", step_skilldex_nav, 15000 },
+    { "skilldex: First Aid on yourself", step_skilldex_first_aid, 30000 },
+    { "skilldex: Doctor picker", step_skilldex_doctor, 20000 },
+    { "skilldex: from the Pip-Boy Skills page", step_skilldex_pipboy, 20000 },
+    { "sneak: R3, HUD, running", step_sneak, 30000 },
+    { "sneak: R3 in menus", step_sneak_menus, 20000 },
+    { "contextual steal", step_steal, 40000 },
+    { "contextual traps", step_traps, 20000 },
+    { "arming explosives", step_traps_arm, 15000 },
+    { "contextual repair", step_repair, 20000 },
+    { "sneak on for the save", step_sneak_before_save, 2000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
     { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
     { "favorites after load", step_fav_persist, 3000 },
     { "level-up indicator after load", step_level_after_load, 3000 },
     { "perk selections after load", step_rules_perks_after_load, 3000 },
+    { "sneak after load", step_sneak_after_load, 3000 },
     { "map transition", step_map_change, 30000 },
     { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },

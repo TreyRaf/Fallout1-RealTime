@@ -2442,6 +2442,31 @@ static void reset_box_bar_win()
 // Updates indicator bar.
 //
 // 0x45455C
+// RT: the indicator boxes currently shown above the interface bar, as a
+// mask: 1 SNEAK, 2 LEVEL, 4 ADDICT (tests).
+int intface_rt_shown_indicators()
+{
+    if (bar_window == -1) {
+        return 0;
+    }
+
+    int mask = 0;
+    for (int index = 0; index < INDICATOR_SLOTS_COUNT; index++) {
+        switch (bboxslot[index]) {
+        case INDICATOR_SNEAK:
+            mask |= 1;
+            break;
+        case INDICATOR_LEVEL:
+            mask |= 2;
+            break;
+        case INDICATOR_ADDICT:
+            mask |= 4;
+            break;
+        }
+    }
+    return mask;
+}
+
 int refresh_box_bar_win()
 {
     if (interfaceWindow != -1 && box_status_flag && !intfaceHidden) {

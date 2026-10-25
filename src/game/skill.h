@@ -33,6 +33,11 @@ char* skill_attribute(int skill);
 int skill_pic(int skill);
 int skill_use(Object* obj, Object* a2, int skill, int a4);
 int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting);
+
+// RT: odds shown before a skill attempt, computed from the original rolls
+// without making them.
+int skill_rt_steal_odds(Object* a1, Object* a2, Object* item, int* stealCheck, int* catchChance);
+int skill_rt_uses_left(int skill);
 int skill_use_slot_save(DB_FILE* stream);
 int skill_use_slot_load(DB_FILE* stream);
 

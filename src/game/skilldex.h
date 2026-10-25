@@ -18,6 +18,10 @@ typedef enum SkilldexRC {
 
 int skilldex_select();
 
+// RT: whether the Skilldex is open and its highlighted row (tests).
+bool skilldex_rt_is_open();
+int skilldex_rt_get_selected();
+
 } // namespace fallout
 
 #endif /* FALLOUT_GAME_SKILLDEX_H_ */
