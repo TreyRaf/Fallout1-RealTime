@@ -1604,6 +1604,67 @@ static int SaveSlot()
     return 0;
 }
 
+int lsg_rt_autosave(int slot, const char* description)
+{
+    if (slot < 0 || slot >= 10) {
+        return -1;
+    }
+
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    // Never over a save of the player's own.
+    snprintf(gmpath, sizeof(gmpath), "%s\\%s%.2d\\%s", "SAVEGAME", "SLOT", slot + 1, "SAVE.DAT");
+    flptr = db_fopen(gmpath, "rb");
+    if (flptr != NULL) {
+        int rc = LoadHeader(slot);
+        db_fclose(flptr);
+        char existing[LOAD_SAVE_DESCRIPTION_LENGTH + 1];
+        strncpy(existing, LSData[slot].description, LOAD_SAVE_DESCRIPTION_LENGTH);
+        existing[LOAD_SAVE_DESCRIPTION_LENGTH] = '\0';
+        if (rc == -1 || strcmp(existing, description) != 0) {
+            return -2;
+        }
+    }
+
+    memset(LSData[slot].description, 0, LOAD_SAVE_DESCRIPTION_LENGTH);
+    strncpy(LSData[slot].description, description, LOAD_SAVE_DESCRIPTION_LENGTH - 1);
+
+    int previousCursor = slot_cursor;
+    slot_cursor = slot;
+
+    thumbnail_image[1] = NULL;
+    int rc = QuickSnapShot() == 1 ? SaveSlot() : -1;
+    if (thumbnail_image[1] != NULL) {
+        mem_free(snapshot);
+        thumbnail_image[1] = NULL;
+    }
+
+    slot_cursor = previousCursor;
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    return rc == -1 ? -1 : 0;
+}
+
+// RT: loads `slot` (0-9) without any screen (as a quick load does).
+int lsg_rt_load(int slot)
+{
+    if (slot < 0 || slot >= 10) {
+        return -1;
+    }
+
+    if (!config_get_string(&game_config, GAME_CONFIG_SYSTEM_KEY, GAME_CONFIG_MASTER_PATCHES_KEY, &patches)) {
+        patches = emgpath;
+    }
+
+    int previousCursor = slot_cursor;
+    slot_cursor = slot;
+    int rc = LoadSlot(slot);
+    slot_cursor = previousCursor;
+    gmouse_set_cursor(MOUSE_CURSOR_ARROW);
+    return rc == -1 ? -1 : 0;
+}
+
 // 0x46FCC4
 int isLoadingGame()
 {

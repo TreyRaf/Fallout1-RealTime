@@ -94,8 +94,9 @@ These replace the original weapon AP costs for what the player pays (`rt_attack_
   - The player keeps walking, attacking, reloading or using items while the enemy aims and fires.
   - On a hit, the player's own short hit reaction plays at the impact if the player is standing. A walk, attack, reload, chem use or holster of theirs is never interrupted (no reaction plays then). A miss plays none.
   - The damage is applied when the attack lands, as before.
+  - The HP counter in the interface rolls to the new value over about 0.3 s while play goes on (the original counted down while holding the whole game). Healing rolls the same way.
   - Heavy outcomes (knockdown, knockout, knockback, fire, death, weapon loss) play in the enemy's sequence and hold the player as before. Such an attack waits while the player is in an attack of their own.
-- **One enemy attack at a time:** still one committed enemy attack on the player at a time (the slot), with the 0.7 s recovery after each. Enemies may now attack while the player's own attack plays, and a buffered RT or RB press, reload or chem use no longer holds them back (only AIMED SHOT planning does).
+- **One enemy attack at a time:** still one committed enemy attack on the player at a time (the slot), with the 0.7 s recovery after each. Enemies may now attack while the player's own attack plays (except the enemy a swing is aimed at, until the swing's hit is decided, as with the target of a locked-on attack), and a buffered RT or RB press, reload or chem use no longer holds them back (only AIMED SHOT planning does).
 
 ## RT timing and spam
 

@@ -44,6 +44,11 @@ void intface_disable();
 bool intface_is_enabled();
 void intface_redraw();
 void intface_update_hit_points(bool animate);
+// RT: the hit points the counter shows right now (it rolls to a new value
+// over a few frames).
+int intface_rt_hit_points_shown();
+// RT: moves that counter on (called every gameplay tick).
+void intface_rt_roll_hit_points();
 void intface_update_ac(bool animate);
 void intface_update_move_points(int actionPoints, int bonusMove);
 int intface_get_attack(int* hitMode, bool* aiming);

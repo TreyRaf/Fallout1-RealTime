@@ -26,6 +26,7 @@
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
+#include "game/loadsave.h"
 #include "game/map.h"
 #include "game/object.h"
 #include "game/party.h"
@@ -33,6 +34,7 @@
 #include "game/proto.h"
 #include "game/roll.h"
 #include "game/rt_aimed.h"
+#include "game/rt_autotest.h"
 #include "game/rt_context.h"
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
@@ -200,6 +202,7 @@ static bool rt_obj_in_attack(Object* obj);
 static void rt_timing_clear(const char* reason);
 static int rt_timing_preview();
 static void rt_update_player_impacts();
+static void rt_update_autosave();
 static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation = HIT_LOCATION_UNCALLED);
 static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toHit);
 static int rt_player_swing(int hitMode);
@@ -335,6 +338,14 @@ static int rt_timing_interruptions = 0;
 // (0 when the reload isn't one).
 static unsigned int rt_reload_commit_at = 0;
 static unsigned int rt_reload_started_at = 0;
+// Autosave: how often (real time, 0 = never), into which slot (1-10), when
+// the last one was (or the game was loaded), and since when one is due.
+#define RT_AUTOSAVE_DESCRIPTION "Autosave"
+static unsigned int rt_autosave_ms = 10 * 60000;
+static int rt_autosave_slot = 10;
+static const char* rt_autosave_description = RT_AUTOSAVE_DESCRIPTION;
+static unsigned int rt_autosave_since = 0;
+static unsigned int rt_autosave_due_at = 0;
 // Its weapon code and the length of its idle animation.
 static int rt_reload_idle_code = 0;
 static unsigned int rt_reload_idle_anim_ms = 0;
@@ -517,6 +528,16 @@ static void rt_init()
     if (config_get_value(&game_config, RT_CONFIG_SECTION, "camera_zoom_transition_ms", &value) && value >= 0 && value <= 1000) {
         rt_cam_zoom_ms = value;
     }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "autosave_minutes", &value) && value >= 0 && value <= 240) {
+        rt_autosave_ms = (unsigned int)value * 60000;
+    }
+    if (config_get_value(&game_config, RT_CONFIG_SECTION, "autosave_slot", &value) && value >= 1 && value <= 10) {
+        rt_autosave_slot = value;
+    }
+    // Test runs never autosave unless a test asks (see `rt_debug_autosave`).
+    if (rt_autotest_enabled()) {
+        rt_autosave_ms = 0;
+    }
     gamepad_set_look_deadzone(rt_cam_deadzone_pct / 100.0f);
 
     rt_open_log();
@@ -526,6 +547,7 @@ static void rt_init()
         rt_camera_edge_scroll, rt_camera_margin_pct, rt_run_drain_ms, rt_ap_regen_ms, rt_ms_per_ap);
     rt_log("config: camera_pan_deadzone_pct=%d camera_pan_speed=%d camera_pan_smoothing_ms=%d camera_follow_ms=%d camera_zoom_transition_ms=%d camera_zoom_out=%.2f",
         rt_cam_deadzone_pct, rt_cam_pan_speed, rt_cam_pan_smoothing_ms, rt_cam_follow_ms, rt_cam_zoom_ms, rt_view_get_max_zoom());
+    rt_log("config: autosave every %u min into slot %d", rt_autosave_ms / 60000, rt_autosave_slot);
     rt_log("controllers detected at startup: %d%s%s",
         gamepad_get_detected_count(),
         gamepad_get_detected_count() > 0 ? ", using: " : "",
@@ -694,6 +716,11 @@ void rt_reset()
     rt_registering_target = NULL;
     rt_registering_detached = NULL;
     rt_player_impacts.clear();
+    // A loaded game starts a new autosave interval.
+    if (isLoadingGame()) {
+        rt_autosave_since = SDL_GetTicks();
+        rt_autosave_due_at = 0;
+    }
     rt_timing_clear(NULL);
     rt_timing_ready_at = 0;
     rt_timing_recovering = false;
@@ -1000,6 +1027,8 @@ void rt_tick()
     rt_camera_dt = (float)realDelta;
     rt_update_camera();
     rt_update_indicator();
+    intface_rt_roll_hit_points();
+    rt_update_autosave();
 }
 
 static void rt_rebuild_critter_list()
@@ -1472,6 +1501,13 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
     // another enemy attack on the player.
     bool onPlayer = defender == obj_dude && attacker != obj_dude;
     if (rt_obj_in_attack(attacker) || (onPlayer ? rt_player_under_attack() : rt_obj_in_attack(defender))) {
+        return RT_ATTACK_BUSY;
+    }
+
+    // The enemy a swing of the player's is aimed at waits for the swing's
+    // hit to be decided, as the target of a locked-on attack waits for it
+    // to land (its own attack would leave the swing without contact).
+    if (attacker != obj_dude && rt_swing.active && !rt_swing.resolved && attacker == rt_swing.aim) {
         return RT_ATTACK_BUSY;
     }
 
@@ -5749,6 +5785,72 @@ void rt_play_draw(Object* weapon)
         rt_stats.drawsPlayed++;
         rt_log("draw: taking out %s", object_name(weapon));
     }
+}
+
+// -----------------------------------------------------------------------------
+// Autosave
+// -----------------------------------------------------------------------------
+
+// Every `autosave_minutes` of real time the game is saved into
+// `autosave_slot`, at the first quiet moment: no attack, swing, reload, chem
+// use, holster or AIMED SHOT of the player's in progress and no attack
+// pending (a save keeps none of those), the player able to act. A walk may
+// go on. A slot holding a save of the player's own is never overwritten.
+static void rt_update_autosave()
+{
+    if (rt_autosave_ms == 0) {
+        return;
+    }
+
+    unsigned int now = SDL_GetTicks();
+    if (rt_autosave_since == 0) {
+        rt_autosave_since = now;
+        return;
+    }
+    if (now - rt_autosave_since < rt_autosave_ms) {
+        return;
+    }
+    if (rt_autosave_due_at == 0) {
+        rt_autosave_due_at = now;
+    }
+
+    int results = obj_dude->data.critter.combat.results;
+    bool walking = anim_busy(obj_dude) && (FID_ANIM_TYPE(obj_dude->fid) == ANIM_WALK || FID_ANIM_TYPE(obj_dude->fid) == ANIM_RUNNING);
+    if (!rt_pending.empty() || rt_swing.active || rt_reload_active || rt_chem_active || rt_holster_active
+        || rt_aimed_is_executing() || (anim_busy(obj_dude) && !walking)
+        || (results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_DEAD)) != 0
+        || game_ui_is_disabled() || obj_dude->elevation != map_elevation) {
+        return;
+    }
+
+    unsigned int waited = now - rt_autosave_due_at;
+    rt_autosave_since = now;
+    rt_autosave_due_at = 0;
+
+    int rc = lsg_rt_autosave(rt_autosave_slot - 1, rt_autosave_description);
+    if (rc == 0) {
+        rt_stats.autosaves++;
+        rt_stats.lastAutosaveWaitMs = waited;
+        rt_print("Game autosaved (slot %d).", rt_autosave_slot);
+        rt_log("autosave: slot %d saved (%u ms after it was due)", rt_autosave_slot, waited);
+    } else if (rc == -2) {
+        rt_stats.autosaveRefusals++;
+        rt_print("Autosave skipped: slot %d holds another save.", rt_autosave_slot);
+        rt_log("autosave: slot %d holds a save that isn't an autosave, left alone", rt_autosave_slot);
+    } else {
+        rt_stats.autosaveFailures++;
+        rt_print("Autosave failed.");
+        rt_log("autosave: saving into slot %d failed", rt_autosave_slot);
+    }
+}
+
+void rt_debug_autosave(unsigned int intervalMs, int slot, const char* description)
+{
+    rt_autosave_ms = intervalMs;
+    rt_autosave_slot = slot;
+    rt_autosave_description = description != NULL ? description : RT_AUTOSAVE_DESCRIPTION;
+    rt_autosave_since = SDL_GetTicks();
+    rt_autosave_due_at = 0;
 }
 
 // R3: toggles between the default view and the wider one, keeping the

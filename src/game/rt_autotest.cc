@@ -9,6 +9,7 @@
 #include <time.h>
 
 #include <algorithm>
+#include <filesystem>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -29,6 +30,7 @@
 #include "game/gdialog.h"
 #include "game/config.h"
 #include "game/gconfig.h"
+#include "game/loadsave.h"
 #include "game/map.h"
 #include "game/object.h"
 #include "game/party.h"
@@ -352,6 +354,9 @@ typedef enum AutotestCheck {
     C_RIFLE_AMMO,
     C_RIFLE_INTERRUPT,
     C_TENT,
+    C_AUTOSAVE,
+    C_AUTOSAVE_SAFE,
+    C_HP_COUNTER,
     C_COUNT,
 } AutotestCheck;
 
@@ -634,6 +639,9 @@ static const char* at_check_names[C_COUNT] = {
     "Hunting Rifle: ammunition moves once; no firing while reloading",
     "Hunting Rifle: interrupted reload loses nothing; then fires and walks normally",
     "Shady Sands: an enemy outside a tent doesn't shoot the player inside",
+    "Autosave: made on its interval at a quiet moment, into its own slot",
+    "Autosave: never over another save; the autosave loads",
+    "The hit points counter rolls without holding the game",
 };
 
 static int at_results[C_COUNT];
@@ -21017,6 +21025,330 @@ static bool step_tent(unsigned int elapsed, bool first, bool timedOut)
     return false;
 }
 
+// -----------------------------------------------------------------------------
+// Autosave
+// -----------------------------------------------------------------------------
+
+// The test uses a slot nobody uses (removed afterwards); the description
+// marks its saves.
+#define AT_AUTOSAVE_DESCRIPTION "Autotest autosave"
+
+static int at_as_slot = -1;
+
+static void at_as_path(int slot, const char* file, char* path, size_t size)
+{
+    snprintf(path, size, "data\\SAVEGAME\\SLOT%.2d%s%s", slot, file != NULL ? "\\" : "", file != NULL ? file : "");
+}
+
+static bool at_as_exists(int slot)
+{
+    char path[COMPAT_MAX_PATH];
+    at_as_path(slot, NULL, path, sizeof(path));
+    return std::filesystem::exists(path);
+}
+
+// The character name and description in a slot's save header.
+static bool at_as_header(int slot, char* name, char* description)
+{
+    char path[COMPAT_MAX_PATH];
+    at_as_path(slot, "SAVE.DAT", path, sizeof(path));
+    FILE* stream = fopen(path, "rb");
+    if (stream == NULL) {
+        return false;
+    }
+    char header[91];
+    bool ok = fread(header, 1, sizeof(header), stream) == sizeof(header);
+    fclose(stream);
+    if (ok) {
+        memcpy(name, header + 29, 32);
+        name[31] = '\0';
+        memcpy(description, header + 61, 30);
+        description[29] = '\0';
+    }
+    return ok;
+}
+
+// Autosave: due every interval of real time, made at the first quiet
+// moment (not during a reload), into its own slot, which it keeps
+// overwriting; never over another save; the autosave loads.
+static bool step_autosave(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        rt_debug_set_ai_paused(true);
+        at_as_slot = -1;
+        for (int slot = 9; slot >= 4 && at_as_slot == -1; slot--) {
+            if (!at_as_exists(slot)) {
+                at_as_slot = slot;
+            }
+        }
+        if (at_as_slot == -1) {
+            at_check(C_AUTOSAVE, false, "no unused save slot (4-9) for the test");
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        at_log("autosave: testing with slot %d", at_as_slot);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("autosave: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    Object* pistol = at_vw_objs[0];
+    switch (at_vw_phase) {
+    case 0:
+        // An empty pistol in hand, to reload while the autosave is due.
+        at_vw_objs[0] = at_test_pistol();
+        pistol = at_vw_objs[0];
+        if (since < 500 || pistol == NULL || !at_wield(pistol) || anim_busy(obj_dude)) {
+            break;
+        }
+        item_w_set_curr_ammo(pistol, 0);
+        intface_update_ammo_lights();
+        at_vw_values[0] = stats->autosaves;
+        at_vw_values[1] = stats->autosaveRefusals;
+        at_vw_values[2] = stats->autosaveFailures;
+        rt_debug_autosave(3000, at_as_slot, AT_AUTOSAVE_DESCRIPTION);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // The reload starts shortly before the autosave is due.
+        if (since < 2500) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_X);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (rt_is_reloading()) {
+            at_vw_flags[0] = true;
+            if (stats->autosaves != at_vw_values[0]) {
+                at_vw_flags[1] = true;
+            }
+        }
+        if (stats->autosaves == at_vw_values[0]) {
+            if (since > 10000) {
+                at_check(C_AUTOSAVE, false, "no autosave within 10 s of it being due");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_values[3] = (int)stats->lastAutosaveWaitMs;
+        at_vw_values[4] = obj_dude->tile;
+        at_vw_next(elapsed);
+        break;
+    case 3: {
+        // Its header, then the next one into the same slot.
+        if (at_vw_values[5] == 0) {
+            char name[32];
+            char description[30];
+            at_vw_flags[2] = at_as_header(at_as_slot, name, description)
+                && strcmp(description, AT_AUTOSAVE_DESCRIPTION) == 0
+                && strcmp(name, critter_name(obj_dude)) == 0;
+            at_log("autosave: slot %d header: name '%s', description '%s'", at_as_slot,
+                at_vw_flags[2] ? critter_name(obj_dude) : "?", at_vw_flags[2] ? AT_AUTOSAVE_DESCRIPTION : "?");
+            at_vw_values[5] = 1;
+            // The save that gets loaded below has no test gun (the loaded
+            // game recreates every object).
+            at_unarmed();
+            at_release_test_pistol();
+            at_vw_objs[0] = NULL;
+        }
+        if (stats->autosaves < at_vw_values[0] + 2) {
+            if (since > 8000) {
+                at_check(C_AUTOSAVE, false, "no second autosave");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_values[4] = obj_dude->tile;
+        at_vw_values[6] = critter_get_hits(obj_dude);
+        rt_debug_autosave(0, at_as_slot, AT_AUTOSAVE_DESCRIPTION);
+        at_check(C_AUTOSAVE,
+            at_vw_flags[0] && !at_vw_flags[1] && at_vw_values[3] > 0 && at_vw_flags[2]
+                && stats->autosaves == at_vw_values[0] + 2 && stats->autosaveFailures == at_vw_values[2],
+            "due every 3 s (test interval): the first waited %d ms for the reload to end (none during it=%d); slot %d header right=%d; the next one overwrote the slot (autosaves %d, failures %d)",
+            at_vw_values[3], !at_vw_flags[1], at_as_slot, at_vw_flags[2], stats->autosaves - at_vw_values[0],
+            stats->autosaveFailures - at_vw_values[2]);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 4: {
+        // Never over another save: the autotest's own slot 1.
+        if (!at_as_exists(1)) {
+            at_log("autosave: slot 1 is empty, refusal not tested there");
+            at_vw_flags[3] = false;
+            at_vw_phase = 6;
+            break;
+        }
+        char path[COMPAT_MAX_PATH];
+        at_as_path(1, "SAVE.DAT", path, sizeof(path));
+        at_vw_floats[0] = (float)std::filesystem::file_size(path);
+        at_vw_floats[1] = (float)std::filesystem::last_write_time(path).time_since_epoch().count();
+        at_vw_values[1] = stats->autosaveRefusals;
+        rt_debug_autosave(1000, 1, AT_AUTOSAVE_DESCRIPTION);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 5: {
+        if (stats->autosaveRefusals == at_vw_values[1] && since < 5000) {
+            break;
+        }
+        rt_debug_autosave(0, at_as_slot, AT_AUTOSAVE_DESCRIPTION);
+        char path[COMPAT_MAX_PATH];
+        at_as_path(1, "SAVE.DAT", path, sizeof(path));
+        bool untouched = (float)std::filesystem::file_size(path) == at_vw_floats[0]
+            && (float)std::filesystem::last_write_time(path).time_since_epoch().count() == at_vw_floats[1];
+        at_vw_flags[3] = stats->autosaveRefusals == at_vw_values[1] + 1 && untouched;
+        at_vw_values[7] = stats->autosaveRefusals - at_vw_values[1];
+        at_vw_flags[4] = untouched;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6: {
+        // The autosave loads: the player is back where it was saved.
+        Rect rect;
+        int elsewhere = at_free_tile(3, 6);
+        if (elsewhere != -1) {
+            obj_move_to_tile(obj_dude, elsewhere, obj_dude->elevation, &rect);
+        }
+        at_vw_values[8] = obj_dude->tile;
+        at_vw_values[9] = lsg_rt_load(at_as_slot - 1);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 7:
+        if (since < 2000) {
+            break;
+        }
+        at_check(C_AUTOSAVE_SAFE,
+            at_vw_flags[3] && at_vw_flags[4] && at_vw_values[9] == 0 && obj_dude->tile == at_vw_values[4] && at_vw_values[8] != at_vw_values[4],
+            "another save in its slot: refused %d time(s), file untouched=%d; loading the autosave: rc %d, player back at the saved tile %d (now %d, moved to %d before loading)",
+            at_vw_values[7], at_vw_flags[4], at_vw_values[9], at_vw_values[4], obj_dude->tile, at_vw_values[8]);
+        at_vw_phase = 99;
+        break;
+    case 99:
+        rt_debug_autosave(0, at_as_slot != -1 ? at_as_slot : 10, NULL);
+        at_unarmed();
+        at_release_test_pistol();
+        if (at_as_slot != -1) {
+            char path[COMPAT_MAX_PATH];
+            at_as_path(at_as_slot, NULL, path, sizeof(path));
+            std::error_code error;
+            std::filesystem::remove_all(path, error);
+            at_log("autosave: test slot %d removed", at_as_slot);
+        }
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
+// The hit points counter rolls to a new value while play goes on: an enemy
+// hit never holds the game while the number counts down.
+static bool step_hp_counter(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        // The harness otherwise heals the player every tick.
+        at_no_heal = true;
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("hp counter: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    unsigned int now = SDL_GetTicks();
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500 || anim_busy(obj_dude)) {
+            break;
+        }
+        // A direct change: the update returns at once, the counter rolls.
+        at_heal();
+        if (intface_rt_hit_points_shown() != critter_get_hits(obj_dude)) {
+            intface_update_hit_points(false);
+        }
+        int before = critter_get_hits(obj_dude);
+        critter_adjust_hits(obj_dude, -20);
+        unsigned int start = SDL_GetTicks();
+        intface_update_hit_points(true);
+        at_vw_values[0] = (int)(SDL_GetTicks() - start);
+        at_vw_values[1] = before;
+        at_vw_values[2] = critter_get_hits(obj_dude);
+        at_vw_values[3] = 0;
+        at_vw_values[4] = intface_rt_hit_points_shown();
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1: {
+        int shown = intface_rt_hit_points_shown();
+        if (shown != at_vw_values[1] && shown != at_vw_values[2]) {
+            at_vw_values[3]++;
+        }
+        if (shown != at_vw_values[2] && since < 2000) {
+            break;
+        }
+        at_vw_values[5] = (int)since;
+        at_vw_flags[0] = at_vw_values[0] <= 30 && at_vw_values[4] == at_vw_values[1] && shown == at_vw_values[2] && at_vw_values[3] > 0;
+        at_heal();
+        // Then a rat bites for a while: the frames keep coming.
+        int tile = at_free_tile(1, 1);
+        at_vw_objs[0] = at_spawn_rat_at(tile, true);
+        at_vw_values[6] = stats->playerFreeHits;
+        at_vw_values[7] = 0;
+        at_vw_floats[0] = (float)now;
+        rt_debug_set_ai_paused(false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 2: {
+        // The longest gap between two frames while it attacks.
+        int gap = (int)(now - (unsigned int)at_vw_floats[0]);
+        at_vw_floats[0] = (float)now;
+        at_vw_values[7] = std::max(at_vw_values[7], gap);
+        if (critter_get_hits(obj_dude) < 15) {
+            at_heal();
+            intface_update_hit_points(false);
+        }
+        if ((stats->playerFreeHits - at_vw_values[6] < 3 && since < 15000) || (since < 2000)) {
+            break;
+        }
+        int hits = stats->playerFreeHits - at_vw_values[6];
+        at_check(C_HP_COUNTER, at_vw_flags[0] && hits >= 1 && at_vw_values[7] <= 150,
+            "20 damage: the update returned after %d ms, the counter showed %d first, rolled through %d frame(s) in between and reached %d after %d ms; %d rat hits: longest frame gap %d ms",
+            at_vw_values[0], at_vw_values[4], at_vw_values[3], at_vw_values[2], at_vw_values[5], hits, at_vw_values[7]);
+        at_vw_phase = 99;
+        break;
+    }
+    case 99:
+        at_no_heal = false;
+        rt_debug_set_ai_paused(true);
+        at_vw_cleanup();
+        at_heal();
+        intface_update_hit_points(false);
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -21106,6 +21438,7 @@ static const AtStep at_steps[] = {
     { "stale who-hit-me", step_who_hit_me, 10000 },
     { "enemy hit reactions", step_reactions, 60000 },
     { "enemy attack eligibility", step_eligibility, 60000 },
+    { "hit points counter", step_hp_counter, 30000 },
     { "RT spam: enemies keep acting", step_spam_enemies, 20000 },
     { "RT timing accuracy", step_timing, 60000 },
     { "Hunting Rifle reload", step_rifle, 40000 },
@@ -21139,6 +21472,7 @@ static const AtStep at_steps[] = {
     { "Vault 15 rope: load", step_rope_load, 40000 },
     { "Vault 15 rope: map transition", step_rope_map, 40000 },
     { "Shady Sands tent", step_tent, 60000 },
+    { "autosave", step_autosave, 60000 },
 };
 
 #define AT_STEP_COUNT ((int)(sizeof(at_steps) / sizeof(at_steps[0])))

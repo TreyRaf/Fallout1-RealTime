@@ -121,6 +121,19 @@ The values come from `[realtime]` in `fallout.cfg` (defaults shown). Trait descr
 - **Nothing to convert:** trait effects are computed from the current traits and the armor worn, so existing characters get the new effects without anything being stored or added twice.
 - **XP fraction:** saved in a block after the favorites block (`RTRL`, version 1). Older saves load with a fraction of 0.
 
+## Autosave
+
+| Key (`[realtime]`) | Default | Meaning |
+|---|---|---|
+| `autosave_minutes` | 10 | Real-time minutes between autosaves (0 turns it off) |
+| `autosave_slot` | 10 | Save slot used (1–10) |
+
+- **When:** every `autosave_minutes` of real time, counted from the last autosave or the last game loaded. Once due, it waits for a quiet moment: no attack, swing, reload, chem use, holster or AIMED SHOT of the player's in progress and no attack pending (a save keeps none of those), the player able to act and not knocked down. Walking doesn't hold it up. Saves only happen in gameplay (not in menus, dialogue or on the world map).
+- **Where:** the slot is saved as a normal save named "Autosave" (thumbnail, character name, date), so it shows in the Load screen and loads like any other. Each autosave overwrites the previous one.
+- **Never over your saves:** if the slot holds a save with another description (one you made), the autosave is skipped with a message ("Autosave skipped: slot N holds another save.") and tried again an interval later.
+- A message "Game autosaved (slot N)." confirms each one.
+- Test runs (`--rt-autotest`) don't autosave, except in their own autosave test, which uses a free slot and removes it afterwards.
+
 ## Automated tests
 
 - **Gameplay run (`--rt-autotest`):**

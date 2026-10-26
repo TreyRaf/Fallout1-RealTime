@@ -20,6 +20,7 @@
 #include "game/item.h"
 #include "game/object.h"
 #include "game/protinst.h"
+#include "game/realtime.h"
 #include "game/proto.h"
 #include "game/proto_types.h"
 #include "game/rt_rules.h"
@@ -707,6 +708,7 @@ void intface_reset()
 // 0x453DB0
 void intface_exit()
 {
+
     if (interfaceWindow != -1) {
         display_exit();
 
@@ -1067,25 +1069,73 @@ void intface_redraw()
     refresh_box_bar_win();
 }
 
+// Last hit points rendered in interface.
+//
+// Used to animate changes.
+//
+// 0x505614
+static int last_points = 0;
+
+// Last color used to render hit points in interface.
+//
+// Used to animate changes.
+//
+// 0x505618
+static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
+
+// RT: the hit points counter rolls to a new value over the next frames
+// (`intface_rt_roll_hit_points`, every gameplay tick) instead of holding
+// the game while it counts: where it rolls from and to, and since when.
+#define INTFACE_RT_HP_ROLL_MS 300
+static bool intface_rt_hp_rolling = false;
+static int intface_rt_hp_from = 0;
+static int intface_rt_hp_to = 0;
+static unsigned int intface_rt_hp_since = 0;
+
+static int intface_hit_points_color(int hp)
+{
+    int maxHp = stat_level(obj_dude, STAT_MAXIMUM_HIT_POINTS);
+    if (hp < (int)((double)maxHp * 0.25)) {
+        return INTERFACE_NUMBERS_COLOR_RED;
+    }
+    if (hp < (int)((double)maxHp * 0.5)) {
+        return INTERFACE_NUMBERS_COLOR_YELLOW;
+    }
+    return INTERFACE_NUMBERS_COLOR_WHITE;
+}
+
+void intface_rt_roll_hit_points()
+{
+    if (!intface_rt_hp_rolling || interfaceWindow == -1) {
+        return;
+    }
+
+    unsigned int elapsed = get_time() - intface_rt_hp_since;
+    int shown = intface_rt_hp_to;
+    if (elapsed < INTFACE_RT_HP_ROLL_MS) {
+        shown = intface_rt_hp_from + (intface_rt_hp_to - intface_rt_hp_from) * (int)elapsed / INTFACE_RT_HP_ROLL_MS;
+    } else {
+        intface_rt_hp_rolling = false;
+    }
+
+    if (shown != last_points || !intface_rt_hp_rolling) {
+        int color = intface_hit_points_color(shown);
+        intface_rotate_numbers(473, 40, shown, shown, color, 0);
+        last_points = shown;
+        last_points_color = color;
+    }
+}
+
+int intface_rt_hit_points_shown()
+{
+    return last_points;
+}
+
 // Render hit points.
 //
 // 0x4545A8
 void intface_update_hit_points(bool animate)
 {
-    // Last hit points rendered in interface.
-    //
-    // Used to animate changes.
-    //
-    // 0x505614
-    static int last_points = 0;
-
-    // Last color used to render hit points in interface.
-    //
-    // Used to animate changes.
-    //
-    // 0x505618
-    static int last_points_color = INTERFACE_NUMBERS_COLOR_RED;
-
     if (interfaceWindow == -1) {
         return;
     }
@@ -1103,6 +1153,20 @@ void intface_update_hit_points(bool animate)
         color = INTERFACE_NUMBERS_COLOR_YELLOW;
     } else {
         color = INTERFACE_NUMBERS_COLOR_WHITE;
+    }
+
+    // RT: no counting that holds the game; the counter rolls from what it
+    // shows now while play goes on.
+    if (rt_enabled()) {
+        if (animate && hp != last_points) {
+            intface_rt_hp_from = last_points;
+            intface_rt_hp_to = hp;
+            intface_rt_hp_since = get_time();
+            intface_rt_hp_rolling = true;
+            return;
+        }
+        intface_rt_hp_rolling = false;
+        animate = false;
     }
 
     int v1[4];

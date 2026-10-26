@@ -212,6 +212,12 @@ typedef struct RtStats {
     // reload of any kind took.
     int idleReloads;
     unsigned int lastReloadMs;
+    // Autosaves made, refused (the slot holds another save), failed, and how
+    // long the last one waited for a quiet moment after it was due.
+    int autosaves;
+    int autosaveRefusals;
+    int autosaveFailures;
+    unsigned int lastAutosaveWaitMs;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -299,6 +305,9 @@ int rt_debug_timing_preview();
 // Tests: -1 while the player's own attack is in flight, otherwise how long
 // its recovery (the attack cooldown) still lasts.
 int rt_debug_recovery_left_ms();
+// Tests: autosave every `intervalMs` (0 = never) into `slot` (1-10) with
+// `description`; the interval starts now.
+void rt_debug_autosave(unsigned int intervalMs, int slot, const char* description);
 void rt_debug_counter_request(Object* critter, int swing, bool ranged = false);
 int rt_debug_counter_count();
 

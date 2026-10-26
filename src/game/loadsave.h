@@ -24,6 +24,12 @@ void ResetLoadSave();
 int SaveGame(int mode);
 int LoadGame(int mode);
 int isLoadingGame();
+// RT: saves into `slot` (0-9) with `description`, without any screen (as a
+// quick save does). A slot holding a save with another description is left
+// alone (returns -2). 0 on success, -1 on failure.
+int lsg_rt_autosave(int slot, const char* description);
+// RT: loads `slot` (0-9) without any screen. 0 on success.
+int lsg_rt_load(int slot);
 void KillOldMaps();
 int MapDirErase(const char* path, const char* a2);
 int MapDirEraseFile(const char* a1, const char* a2);
