@@ -2175,6 +2175,12 @@ void obj_remove_all()
     // RT: floating text refers to the objects going away.
     text_object_reset();
 
+    // RT: so does the real-time layer. It lets go of all of them first:
+    // they are freed without `obj_erase_object`, but freeing a critter's
+    // inventory goes through it, and it must not look at critters already
+    // gone.
+    rt_objects_removed();
+
     scr_remove_all();
 
     for (int tile = 0; tile < HEX_GRID_SIZE; tile++) {

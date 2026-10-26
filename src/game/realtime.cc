@@ -731,6 +731,13 @@ void rt_reset()
     rt_log("reset (map load)");
 }
 
+void rt_objects_removed()
+{
+    if (rt_initialized && rt_is_enabled) {
+        rt_reset();
+    }
+}
+
 void rt_object_erased(Object* obj)
 {
     if (!rt_initialized || obj == NULL) {

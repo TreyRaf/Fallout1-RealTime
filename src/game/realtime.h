@@ -240,6 +240,9 @@ void rt_combat_request(STRUCT_664980* attack);
 // Called when an object is removed from the game (see `obj_erase_object`),
 // so no reference to it is kept.
 void rt_object_erased(Object* obj);
+// Called before every object is removed at once (see `obj_remove_all`): the
+// real-time layer lets go of all of them (nothing once it hasn't started).
+void rt_objects_removed();
 // Bloody Mess (see `show_damage`, `show_death`): `critter` is about to die
 // a gory death from a critical hit of the player's. When its death
 // animation is over its worn armor is destroyed (once; carried spare armor
