@@ -2,6 +2,14 @@ cmake_minimum_required(VERSION 3.13)
 
 set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
 
+# Windows: the C/C++ runtime is built into the executable (no Visual C++
+# Redistributable needed), for every target including the bundled libraries.
+if(POLICY CMP0091)
+    cmake_policy(SET CMP0091 NEW)
+endif()
+set(CMAKE_POLICY_DEFAULT_CMP0091 NEW)
+set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
+
 set(EXECUTABLE_NAME fallout-ce)
 
 if (APPLE)
@@ -71,6 +79,8 @@ target_sources(${EXECUTABLE_NAME} PUBLIC
     "src/game/rt_favorites.cc"
     "src/game/rt_favorites.h"
     "src/game/rt_rules.cc"
+    "src/game/rt_setup.cc"
+    "src/game/rt_setup.h"
     "src/game/rt_rules.h"
     "src/game/rt_view.cc"
     "src/game/rt_view.h"

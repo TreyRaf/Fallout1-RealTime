@@ -6,6 +6,9 @@ set(SDL_STATIC ON)
 # Fixes _ftol2_sse already defined
 set(SDL_LIBC ON)
 
+# The C runtime goes into the executable (see the top CMakeLists.txt).
+set(SDL_FORCE_STATIC_VCRT ON)
+
 if (ANDROID)
     set(SDL_STATIC_PIC ON)
 endif()

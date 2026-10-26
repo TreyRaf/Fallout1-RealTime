@@ -46,6 +46,18 @@ int main(int argc, char* argv[])
     chdir(iOSGetDocumentsPath());
 #endif
 
+#if _WIN32
+    // RT: everything (fallout.cfg, data, saves) is next to the executable,
+    // wherever it is started from (a shortcut, another folder).
+    {
+        char* exeDir = SDL_GetBasePath();
+        if (exeDir != NULL) {
+            SetCurrentDirectoryA(exeDir);
+            SDL_free(exeDir);
+        }
+    }
+#endif
+
 #if __APPLE__ && TARGET_OS_OSX
     char* basePath = SDL_GetBasePath();
     chdir(basePath);

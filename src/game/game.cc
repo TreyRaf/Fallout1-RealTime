@@ -1,4 +1,5 @@
 #include "game/game.h"
+#include "game/rt_setup.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -137,6 +138,12 @@ int game_init(const char* windowTitle, bool isMapper, int font, int flags, int a
     }
 
     gconfig_init(isMapper, argc, argv);
+
+    // RT: on a new computer, find the player's own Fallout 1 first.
+    if (!isMapper && !rt_setup_game_files()) {
+        gconfig_exit(false);
+        return -1;
+    }
 
     game_in_mapper = isMapper;
 
