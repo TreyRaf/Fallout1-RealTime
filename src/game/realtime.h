@@ -106,6 +106,112 @@ typedef struct RtStats {
     Object* lastSwingDefender;
     // R3 wider view toggles.
     int zoomToggles;
+    // Bloody Mess: gory deaths by a critical hit of the player's that were
+    // noted, worn armor destroyed by them, and the last destroyed armor.
+    int goryDeathsNoted;
+    int armorDestroyed;
+    int lastArmorDestroyedPid;
+    Object* lastArmorDestroyedOwner;
+    // Fast Shot: animation frames played faster.
+    int fastShotFrames;
+    // When the player's last attack or swing started, and the time since the
+    // one before (game time, ms).
+    unsigned int lastPlayerAttackAt;
+    unsigned int lastPlayerAttackInterval;
+    // Melee/unarmed AP: AP spent on close-combat attacks, attacks refused for
+    // lack of AP (throws included), and the last cost charged.
+    float meleeApSpent;
+    int meleeApCharges;
+    int meleeApRefused;
+    float lastMeleeApCost;
+    // Throws: AP spent on them, throws made with RB (the right hand's
+    // thrown weapon), RB presses refused (no target, no AP...), and the
+    // held item and hit mode of the last RB throw.
+    float throwApSpent;
+    int throwApCharges;
+    int rbThrows;
+    int rbThrowRefused;
+    int lastRbThrowPid;
+    Object* lastRbThrowActiveItem;
+    // Thrown weapons taken out of the left hand or the active hand.
+    int thrownHandFixes;
+    // Counterattacks after a missed attack of the player's: requested,
+    // refused (ineligible enemy, already requested, the attack already has
+    // one), started and expired; the last counterattacker and how long after
+    // its request it attacked. Ranged ones: after a missed shot or throw.
+    int counterRequests;
+    int counterRangedRequests;
+    int counterRangedAttacks;
+    int lastCounterHitMode;
+    bool lastCounterRanged;
+    int counterIneligible;
+    int counterDuplicates;
+    int counterSwingRepeats;
+    int counterAttacks;
+    int counterExpired;
+    Object* lastCounterCritter;
+    unsigned int lastCounterDelayMs;
+    // Enemy attacks on the player granted when the last counterattack was
+    // asked for and when it started (its own grant included).
+    int lastCounterRequestGrants;
+    int lastCounterStartGrants;
+    // Two-handed melee sweeps: swings, targets attempted in all of them, the
+    // most targets one swing reached, and the targets of the latest one.
+    int sweeps;
+    int sweepTargets;
+    int sweepMaxTargets;
+    int lastSweepCount;
+    Object* lastSweepTargets[8];
+    // A target attacked twice by the same swing (must stay 0).
+    int sweepRepeats;
+    // NPC hit reactions played faster (`hit_reaction_speed`); targets let
+    // move again when their reaction was over before the attacker finished
+    // (the last one, when, and how long after its attack started); the
+    // last NPC that started a walk toward its target, and when.
+    int fastReactionAnims;
+    int reactionReleases;
+    Object* lastReleaseCritter;
+    unsigned int lastReleaseAt;
+    unsigned int lastReleaseDelayMs;
+    Object* lastAiMoveCritter;
+    unsigned int lastAiMoveAt;
+    // NPC attack eligibility: attacks not started because the hit chance
+    // was 0% or less, or the target was out of sight; NPC attacks started
+    // on the player with no positive hit chance (must stay 0); the lowest
+    // hit chance an NPC attack on the player was started with.
+    int aiZeroChanceSkips;
+    int aiSightBlockedSkips;
+    int aiHopelessAttacks;
+    int aiLowestToHit;
+    // Enemy attacks on the player: ordinary outcomes the player isn't held
+    // by (no part in the attacker's animation) and heavy ones (knockdown,
+    // death...) that hold the player as before; the player's own hit
+    // reactions played (at the impact) and skipped (busy with an attack,
+    // reload...); enemy attacks started while the player's own attack was
+    // in progress.
+    int playerFreeAttacks;
+    int playerFreeHits;
+    int playerHeldAttacks;
+    int playerReactions;
+    int playerReactionsSkipped;
+    int enemyAttacksDuringPlayerAttack;
+    // Timing of repeated manual attacks: presses made during an attack or
+    // its recovery, of those the extra ones (spam), attacks committed with
+    // a penalty, and the last committed attack's penalty, extra presses,
+    // how early its press was (ms before the recovery ended) and hit chance;
+    // timing states cleared (cancellation, weapon change, menu...).
+    int timingBusyPresses;
+    int timingSpamPresses;
+    int timingPenalized;
+    int lastTimingPenalty;
+    int lastTimingSpam;
+    int lastTimingLeadMs;
+    int lastTimingToHit;
+    int timingClears;
+    // Reloads in the armed idle pose (Hunting Rifle) and how long the last
+    // reload of any kind took.
+    int idleReloads;
+    unsigned int lastReloadMs;
 } RtStats;
 
 // The lock-on indicator (crosshair and hit chance) as currently drawn.
@@ -128,6 +234,24 @@ void rt_combat_request(STRUCT_664980* attack);
 // Called when an object is removed from the game (see `obj_erase_object`),
 // so no reference to it is kept.
 void rt_object_erased(Object* obj);
+// Bloody Mess (see `show_damage`, `show_death`): `critter` is about to die
+// a gory death from a critical hit of the player's. When its death
+// animation is over its worn armor is destroyed (once; carried spare armor
+// and natural armor are untouched).
+void rt_note_gory_death(Object* critter);
+void rt_gory_death_shown(Object* critter);
+// Fast Shot: the frame time of `anim` for `obj`, shortened for the player's
+// attack animations and the target's reactions to them (see `compute_tpf`).
+unsigned int rt_anim_frame_time(Object* obj, int anim, unsigned int frameTime);
+// Timing of repeated manual attacks: what the player's attack being
+// committed right now loses from its hit chance (see `determine_to_hit`).
+int rt_player_timing_penalty();
+// An enemy attack on the player with an ordinary outcome: the player has no
+// part in the attacker's animation (see `action_attack`, `show_damage`);
+// `rt_player_impact_cue` takes the place of the player's reaction there and
+// plays it as the player's own animation.
+bool rt_action_detached_defender(Object* obj);
+int rt_player_impact_cue(void* attacker, void* defender);
 void rt_log(const char* format, ...);
 
 // Used by the automated test and diagnostics.
@@ -148,10 +272,39 @@ int rt_get_player_slot_queue(Object** critters, int capacity);
 Object* rt_get_interact_target();
 int rt_get_camera_margin_pct();
 bool rt_is_hostile(Object* critter);
+
+// Whether `critter` is the player or a critter on the current elevation (a
+// pointer check only: nothing is read from it). For pointers that may be
+// stale, such as a critter's "who hit me".
+bool rt_is_live_critter(Object* critter);
 void rt_debug_set_lock(Object* target);
 void rt_debug_camera_follow();
 // Test fixture: sets the player's current AP.
 void rt_debug_set_ap(float ap);
+// Test fixture: NPCs stop acting while paused.
+void rt_debug_set_ai_paused(bool paused);
+// Tests: the player's next `count` attacks miss (no damage, no effects);
+// asks for a counterattack as a miss of `swing` would (see
+// `rt_request_counter`); counterattacks still owed.
+void rt_debug_force_player_misses(int count);
+// Tests: the player's next `count` attacks hit for `damage` with the
+// defender flags `flags` (0: an ordinary hit reaction; no critical or
+// knockback); attacks pending with `obj` as a target.
+void rt_debug_force_player_hits(int count, int damage, int flags = 0);
+int rt_debug_attacks_on(Object* obj);
+// Tests: whether the player is held by an attack (theirs or an enemy's).
+bool rt_debug_player_held();
+// Tests: the timing penalty the next RT attack would get now.
+int rt_debug_timing_preview();
+// Tests: -1 while the player's own attack is in flight, otherwise how long
+// its recovery (the attack cooldown) still lasts.
+int rt_debug_recovery_left_ms();
+void rt_debug_counter_request(Object* critter, int swing, bool ranged = false);
+int rt_debug_counter_count();
+
+// Whether an attack with `weapon` in `hitMode` sweeps (two-handed melee,
+// see `rt_is_sweep`).
+bool rt_weapon_sweeps(Object* weapon, int hitMode);
 float rt_get_dude_ap();
 bool rt_is_run_toggled();
 bool rt_is_engaged(Object* critter);
@@ -183,7 +336,7 @@ bool rt_aim_player_in_attack();
 
 // Commits an aimed attack: the original attack on `hitLocation`, spending
 // `apCost` AP once it has started.
-int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost);
+int rt_aim_attack(Object* target, int hitMode, int hitLocation, float apCost);
 
 // Favorites support (see `rt_favorites.h`).
 // No attack, reload, chem use or aimed queue is in progress.

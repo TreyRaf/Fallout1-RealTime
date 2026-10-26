@@ -32,7 +32,8 @@ typedef struct RtAimedEntry {
     int hitMode;
     // Prototype of the weapon used (-1 unarmed).
     int weaponPid;
-    int apCost;
+    // AP (fractions possible: an aimed punch costs 1.5).
+    float apCost;
     // Rounds (or thrown items) reserved.
     int rounds;
     // Hit chance shown when it was queued.
@@ -47,10 +48,10 @@ typedef struct RtAimedState {
     // 4-7 right column).
     int selected;
     int hitMode;
-    int apCost;
+    float apCost;
     // Usable AP left after the reservations.
-    int availableAp;
-    int reservedAp;
+    float availableAp;
+    float reservedAp;
     int reservedRounds;
     // `COMBAT_BAD_SHOT_*` for the current target.
     int badShot;

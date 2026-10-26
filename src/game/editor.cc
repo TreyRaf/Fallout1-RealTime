@@ -35,6 +35,7 @@
 #include "plib/db/db.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -582,6 +583,8 @@ static int last_level_back;
 
 // 0x56ECC8
 static bool glblmode;
+// RT: the editor is open (automated tests).
+static bool editor_rt_open = false;
 
 // 0x56ECCC
 static int tag_skill_back[NUM_TAGGED_SKILLS];
@@ -651,6 +654,8 @@ int editor_design(bool isCreationMode)
         debug_printf("\n ** Error loading character editor data! **\n");
         return -1;
     }
+
+    editor_rt_open = true;
 
     if (!glblmode) {
         if (UpdateLevel()) {
@@ -735,6 +740,14 @@ int editor_design(bool isCreationMode)
             }
         } else if (keyCode == KEY_CTRL_Q || keyCode == KEY_CTRL_X || keyCode == KEY_F10) {
             game_quit_with_confirm();
+        } else if (glblmode && keyCode == KEY_ESCAPE && game_user_wants_to_quit == 0 && gamepad_consume_menu_back()) {
+            // RT: B on the controller never throws a new character away by
+            // accident: it asks first (the Cancel button and the Escape key
+            // still leave at once, as before).
+            if (dialog_out("Discard this character and go back?", NULL, 0, 169, 126, colorTable[32328], NULL, colorTable[32328], DIALOG_BOX_YES_NO) != 0) {
+                rc = 1;
+            }
+            win_draw(edit_win);
         } else if (keyCode == 502 || keyCode == KEY_ESCAPE || keyCode == KEY_UPPERCASE_C || keyCode == KEY_LOWERCASE_C || game_user_wants_to_quit != 0) {
             rc = 1;
         } else if (glblmode && (keyCode == 517 || keyCode == KEY_UPPERCASE_N || keyCode == KEY_LOWERCASE_N)) {
@@ -787,6 +800,8 @@ int editor_design(bool isCreationMode)
     if (rc == 1) {
         RestorePlayer();
     }
+
+    editor_rt_open = false;
 
     if (is_pc_flag(PC_FLAG_LEVEL_UP_AVAILABLE)) {
         pc_flag_off(PC_FLAG_LEVEL_UP_AVAILABLE);
@@ -1484,6 +1499,12 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
 
     beginTextInput();
 
+    // RT: the controller types with the D-pad (see `editor_rt_text_entry_key`):
+    // A accepts, B cancels.
+    bool keyModeWas = gamepad_is_menu_key_mode();
+    gamepad_set_menu_key_mode(true);
+    int hintWin = editor_rt_text_hint_open(win);
+
     int blinkingCounter = 3;
     bool blink = false;
 
@@ -1494,7 +1515,17 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
         frame_time = get_time();
 
         int keyCode = get_input();
-        if (keyCode == cancelKeyCode) {
+        int oldWidth = text_width(copy);
+        copy[nameLength] = '\0';
+        bool controllerEdit = editor_rt_text_entry_key(keyCode, copy, &nameLength, maxLength, flags);
+        copy[nameLength] = ' ';
+        copy[nameLength + 1] = '\0';
+
+        if (controllerEdit) {
+            buf_fill(windowBuffer + windowWidth * y + x, oldWidth, v60, windowWidth, backgroundColor);
+            text_to_buf(windowBuffer + windowWidth * y + x, copy, windowWidth, windowWidth, textColor);
+            win_draw(win);
+        } else if (keyCode == cancelKeyCode) {
             rc = 0;
         } else if (keyCode == KEY_RETURN) {
             gsound_play_sfx_file("ib1p1xx1");
@@ -1548,6 +1579,8 @@ int get_input_str(int win, int cancelKeyCode, char* text, int maxLength, int x, 
     }
 
     endTextInput();
+    editor_rt_text_hint_close(hintWin);
+    gamepad_set_menu_key_mode(keyModeWas);
 
     if (rc == 0 || nameLength > 0) {
         copy[nameLength] = '\0';
@@ -6398,6 +6431,109 @@ int editor_rt_take_perk(int perk, int choiceA, int choiceB)
 
     free_perk -= 1;
     return 0;
+}
+
+
+// RT: controller text entry. The characters Up/Down step through.
+static char editor_rt_step_char(char current, int delta, int flags)
+{
+    static const char* characters = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789 -'.";
+    int count = (int)strlen(characters);
+    const char* at = strchr(characters, current);
+    int index = at != NULL && current != '\0' ? (int)(at - characters) : (delta > 0 ? -1 : 0);
+    for (int tries = 0; tries < count; tries++) {
+        index = (index + delta + count) % count;
+        if ((flags & 0x01) == 0 || isdoschar(characters[index])) {
+            break;
+        }
+    }
+    return characters[index];
+}
+
+bool editor_rt_text_entry_key(int keyCode, char* text, int* length, int maxLength, int flags)
+{
+    switch (keyCode) {
+    case KEY_ARROW_UP:
+    case KEY_ARROW_DOWN:
+        if (*length == 0) {
+            text[0] = 'A';
+            *length = 1;
+        } else {
+            text[*length - 1] = editor_rt_step_char(text[*length - 1], keyCode == KEY_ARROW_UP ? 1 : -1, flags);
+        }
+        break;
+    case KEY_ARROW_RIGHT:
+        if (*length >= maxLength) {
+            return true;
+        }
+        // A new letter in the case of the one before it.
+        text[*length] = *length > 0 && islower((unsigned char)text[*length - 1]) ? 'a' : 'A';
+        *length += 1;
+        break;
+    case KEY_ARROW_LEFT:
+    case GAMEPAD_KEY_X:
+        if (*length > 0) {
+            *length -= 1;
+        }
+        break;
+    case GAMEPAD_KEY_Y:
+        if (*length > 0) {
+            char ch = text[*length - 1];
+            text[*length - 1] = isupper((unsigned char)ch) ? (char)tolower((unsigned char)ch) : (char)toupper((unsigned char)ch);
+        }
+        break;
+    default:
+        return false;
+    }
+
+    text[*length] = '\0';
+    gsound_play_sfx_file("ib1p1xx1");
+    return true;
+}
+
+int editor_rt_text_hint_open(int win)
+{
+    if (!gamepad_is_connected()) {
+        return -1;
+    }
+
+    Rect rect;
+    if (win_get_rect(win, &rect) != 0) {
+        return -1;
+    }
+
+    static const char* hint = "Up/Down letter   Right add   Left/X delete   Y case   A OK   B cancel";
+    int oldFont = text_curr();
+    text_font(101);
+    int width = text_width(hint) + 12;
+    int height = text_height() + 8;
+    int x = std::clamp(rect.ulx, 0, std::max(0, screenGetWidth() - width));
+    int y = rect.lry + 4;
+    if (y + height > screenGetHeight()) {
+        y = std::max(0, rect.uly - height - 4);
+    }
+
+    int hintWin = win_add(x, y, width, height, colorTable[0], WINDOW_MOVE_ON_TOP);
+    if (hintWin != -1) {
+        unsigned char* buf = win_get_buf(hintWin);
+        draw_box(buf, width, 0, 0, width - 1, height - 1, colorTable[992]);
+        text_to_buf(buf + width * 4 + 6, hint, width - 12, width, colorTable[992]);
+        win_draw(hintWin);
+    }
+    text_font(oldFont);
+    return hintWin;
+}
+
+void editor_rt_text_hint_close(int hintWin)
+{
+    if (hintWin != -1) {
+        win_delete(hintWin);
+    }
+}
+
+bool editor_rt_is_open()
+{
+    return editor_rt_open;
 }
 
 } // namespace fallout

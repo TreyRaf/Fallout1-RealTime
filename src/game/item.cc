@@ -1393,16 +1393,11 @@ int item_w_mp_cost(Object* critter, int hit_mode, bool aiming)
             // NOTE: Uninline.
             action_points = item_w_secondary_mp_cost(weapon);
         }
-
-        if (critter == obj_dude) {
-            if (trait_level(TRAIT_FAST_SHOT)) {
-                action_points -= 1;
-            }
-        }
     }
 
     // RT: Bonus HtH Attacks (now reach) and Bonus Rate of Fire (now
-    // long-range accuracy) no longer lower attack costs.
+    // long-range accuracy) no longer lower attack costs, and Fast Shot
+    // (now a faster attack rate) no longer saves an action point.
 
     if (aiming) {
         action_points += 1;

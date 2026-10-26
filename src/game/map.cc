@@ -1372,7 +1372,13 @@ void map_fix_critter_combat_data()
             continue;
         }
 
-        if (object->data.critter.combat.whoHitMeCid == -1) {
+        // RT: a saved "who hit me" stays a combat id until turn-based combat
+        // starts (`combat_begin` turns it back into a pointer). Combat never
+        // starts in real time, so the number would be read as a pointer (a
+        // crash when the critter is hit). It is forgotten instead: combat
+        // ids are only assigned in turn-based combat, so matching it could
+        // name the wrong critter (and give kill credit to the wrong side).
+        if (object->data.critter.combat.whoHitMeCid == -1 || rt_enabled()) {
             object->data.critter.combat.whoHitMe = NULL;
         }
     }

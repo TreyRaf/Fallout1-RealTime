@@ -34,6 +34,9 @@ void gdialog_display_msg(char* msg);
 // RT: the dialogue reply window exists (the barter screen also runs in tests,
 // outside dialogue).
 bool gdialog_rt_has_reply_window();
+// RT: options chosen so far (any input), and the options shown now (tests).
+int gdialog_rt_choice_count();
+int gdialog_rt_option_count();
 int gDialogStart();
 int gDialogSayMessage();
 int gDialogOption(int messageListId, int messageId, const char* proc, int reaction);

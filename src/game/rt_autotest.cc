@@ -1,5 +1,6 @@
 #include "game/rt_autotest.h"
 
+#include <limits.h>
 #include <math.h>
 #include <stdarg.h>
 #include <stdio.h>
@@ -10,6 +11,7 @@
 #include <algorithm>
 #include <unordered_map>
 #include <unordered_set>
+#include <vector>
 
 #include <SDL.h>
 
@@ -22,6 +24,11 @@
 #include "game/intface.h"
 #include "game/inventry.h"
 #include "game/item.h"
+#include "game/mainmenu.h"
+#include "game/options.h"
+#include "game/gdialog.h"
+#include "game/config.h"
+#include "game/gconfig.h"
 #include "game/map.h"
 #include "game/object.h"
 #include "game/party.h"
@@ -52,6 +59,7 @@
 #include "platform_compat.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gamepad.h"
+#include "plib/gnw/gnw.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/kb.h"
 #include "plib/gnw/mouse.h"
@@ -59,7 +67,7 @@
 
 namespace fallout {
 
-#define AT_TOTAL_TIMEOUT 1500000
+#define AT_TOTAL_TIMEOUT 1900000
 
 // -----------------------------------------------------------------------------
 // Checks
@@ -254,6 +262,96 @@ typedef enum AutotestCheck {
     C_ZOOM_TOGGLE,
     C_ZOOM_ALIGN,
     C_ZOOM_INPUT,
+    C_PB_STICK_ONE,
+    C_PB_STICK_DIAG,
+    C_PB_STICK_NESTED,
+    C_KAMIKAZE_AC,
+    C_KAMIKAZE_AP,
+    C_FAST_RULES,
+    C_FAST_RATE,
+    C_FAST_SYNC,
+    C_BLOODY_CRIT,
+    C_BLOODY_ARMOR,
+    C_BLOODY_KEEP,
+    C_SKILLED_SKILLS,
+    C_SKILLED_XP,
+    C_SKILLED_PERKS,
+    C_TRAITS_TEXT,
+    C_TRAITS_LOAD,
+    C_DIALOGUE_NAV,
+    C_MENU_MAIN_NAV,
+    C_MENU_SELECT,
+    C_MENU_EDITOR_SPECIAL,
+    C_MENU_EDITOR_TAGS,
+    C_MENU_EDITOR_NAME,
+    C_MENU_EDITOR_B,
+    C_MENU_EDITOR_DONE,
+    C_MENU_CONFIRM,
+    C_MENU_PAUSE,
+    C_MENU_PREFS,
+    C_MENU_SAVE,
+    C_PB_PERK_ART,
+    C_PB_PERK_MAP,
+    C_PB_PERK_PREVIEW,
+    C_QP_DECAY,
+    C_QP_CONFIRM,
+    C_QP_REOPEN,
+    C_QP_SCOPE,
+    C_QP_TEXT,
+    C_MELEE_AP,
+    C_MELEE_AP_EMPTY,
+    C_MELEE_AP_REFUSE,
+    C_MELEE_AP_AIMED,
+    C_COUNTER_FIRST,
+    C_COUNTER_RULES,
+    C_COUNTER_EXPIRE,
+    C_SWEEP_DATA,
+    C_SWEEP_TARGETS,
+    C_SWEEP_COUNTER,
+    C_CLOSE_AFTER_LOAD,
+    C_AP_TABLE,
+    C_AP_GUNS_FREE,
+    C_THROW_RB,
+    C_THROW_RB_AP,
+    C_THROW_HANDS,
+    C_THROW_NO_AIM,
+    C_COUNTER_RANGED_CLOSE,
+    C_COUNTER_RANGED_SHOOT,
+    C_WHO_HIT_ME,
+    C_WHO_HIT_ME_LOAD,
+    C_REACTION_SPEED,
+    C_REACTION_QUEUE,
+    C_REACTION_RELEASE,
+    C_REACTION_PURSUIT,
+    C_REACTION_EFFECTS,
+    C_DIALOGUE_NO_PRESELECT,
+    C_ROPE_MISSING,
+    C_ROPE_ATTACH,
+    C_ROPE_REPEAT,
+    C_ROPE_DESCEND,
+    C_ROPE_HELD,
+    C_ROPE_SAVE,
+    C_ROPE_MAP,
+    C_ELIG_BLOCKED,
+    C_ELIG_PROMPT,
+    C_ELIG_ZERO,
+    C_ELIG_SLOT,
+    C_PLAYER_FREE,
+    C_SPAM_ENEMIES,
+    C_TIMING_FRESH,
+    C_TIMING_GOOD,
+    C_TIMING_EARLY,
+    C_TIMING_SPAM,
+    C_TIMING_ONCE,
+    C_TIMING_CLEAR,
+    C_TIMING_INDICATOR,
+    C_TIMING_COSTS,
+    C_TIMING_AUTO,
+    C_RIFLE_IDLE,
+    C_RIFLE_RELOAD,
+    C_RIFLE_AMMO,
+    C_RIFLE_INTERRUPT,
+    C_TENT,
     C_COUNT,
 } AutotestCheck;
 
@@ -292,7 +390,7 @@ static const char* at_check_names[C_COUNT] = {
     "Indicator = vanilla hit chance: unarmed",
     "Indicator = vanilla hit chance: melee",
     "Indicator = vanilla hit chance: guns (single and burst)",
-    "Indicator = vanilla hit chance: throwing",
+    "Indicator with a thrown weapon in the right hand: still the active item's hit chance (or Out of range)",
     "Indicator shows 'Out of range' instead of a percentage",
     "Indicator shows 'Blocked' instead of a percentage",
     "Unarmed: RT press = one attack, hold doesn't repeat",
@@ -337,7 +435,7 @@ static const char* at_check_names[C_COUNT] = {
     "Turn-based combat never started",
     "Pip-Boy: game paused while open",
     "Pip-Boy: opened while walking, A/RT inside; closing leaks no attack, interaction, movement or reopen",
-    "Pip-Boy: RT/LT switch tabs, RB/LB switch pages",
+    "Pip-Boy: LT/RT switch main tabs, left stick left/right switches subcategories",
     "Pip-Boy: B reopens it on the last tab",
     "Pip-Boy: hold, put away and hold again a weapon (hand state changes)",
     "Pip-Boy: using a Stimpak heals and consumes it",
@@ -446,6 +544,96 @@ static const char* at_check_names[C_COUNT] = {
     "R3: wider view and back to the exact default zoom, player kept in place",
     "Wider view: lock indicator and floating text stay aligned",
     "R3: one toggle per press, never Sneak; edge scrolling works zoomed out",
+    "Pip-Boy: LT/RT switch main tabs one per pull (a held trigger doesn't repeat); triggers in the Pip-Boy never attack or lock on",
+    "Pip-Boy: left stick left/right switches subcategories one per push; LB/RB and diagonal or drifting pushes change nothing; up/down scroll",
+    "Pip-Boy: nested controls first (quantity selector takes left/right); the D-pad pans the map without changing subcategory",
+    "Kamikaze: no natural (Endurance) AC and worn armor's AC halved (rounded down); other bonuses, DT/DR untouched; old Sequence bonus gone",
+    "Kamikaze: +10 maximum AP, regenerated up to, never granted by recalculation; HUD shows AP above 10",
+    "Fast Shot: no AP cost reduction; LB AIMED SHOT refused with a reason; LT lock still works",
+    "Fast Shot: attack intervals divided by 1.25 (knife swings, knife attacks on a target, pistol shots)",
+    "Fast Shot: one attack per press, damage applied once, movement and reload animations unchanged",
+    "Bloody Mess: +3% critical chance, capped at 100%",
+    "Bloody Mess: a critical kill with a gory death destroys the worn armor only (spare armor and loot stay)",
+    "Bloody Mess: non-critical, non-gory and trait-less kills keep armor; a creature's death is safe",
+    "Skilled: +10% to every skill, counted once",
+    "Skilled: positive XP x0.85 with fractions carried; negative and earned XP untouched",
+    "Skilled: perk selections at levels 2 and 4",
+    "Trait descriptions show the new effects",
+    "Traits after load: same AC, AP, skills and XP fraction, nothing added twice",
+    "Dialogue: the D-pad selects options, B doesn't end the conversation, A chooses",
+    "Main menu: D-pad and left stick select with a frame; B selects Exit instead of quitting; A starts a new game",
+    "Character selection: Create reached and pressed with the controller",
+    "Character creation: SPECIAL - and + with the controller",
+    "Character creation: tag skills and traits with the controller",
+    "Character creation: name typed with the controller",
+    "Character creation: B asks before discarding; No keeps the character",
+    "Character creation: Done starts the game with the choices; no press leaks into gameplay",
+    "Confirmation dialogs: framed Yes/No; B answers No",
+    "Pause menu: Start opens it with a selection; B closes it without leaking",
+    "Preferences: left/right change the selected switch or slider, A turns a switch, B cancels",
+    "Save screen: up/down pick a slot, A saves, the description is typed with the controller",
+    "Perk selection: each highlighted perk shows its original artwork beside name, rank, requirements and description, nothing overlapping",
+    "Perk artwork: every selectable perk has its original illustration (the character screen's mapping); missing ones reported",
+    "Perk selection: highlighting, confirming with B or leaving never takes a perk; nested controls ignore sideways pushes",
+    "Quick Pockets: full bonus when stealing quickly, fading to the normal chance (never below), caps kept",
+    "Quick Pockets: the timer runs through the quantity selector; the bonus is recalculated when a theft is confirmed",
+    "Quick Pockets: reopening the same target resumes the timer until the reset time; focus loss and disconnection suspend it",
+    "Quick Pockets: looting and trading never get the bonus",
+    "Quick Pockets: new description; prerequisites and ranks kept; the original AP saving removed",
+    "Melee and unarmed attacks spend their AP once when committed (swing or lock-on)",
+    "A swing at empty space costs its AP and gives no counterattack",
+    "Too little AP: the attack is refused with a message and nothing is spent",
+    "AIMED SHOT spends only its own cost (no ordinary melee cost on top)",
+    "A missed close-combat attack: that enemy (only) attacks next",
+    "Counterattacks: one per enemy, one per swing, only enemies able to fight",
+    "Counterattacks expire and never block the attack queue",
+    "Two-handed melee weapons sweep (weapon data); guns, thrown, one-handed and unarmed attacks don't",
+    "Sweep: every enemy in the arc and reach, each with its own attack, at most once; walls, reach, the back and bystanders respected; one AP charge",
+    "Sweep: several misses give one counterattack",
+    "After load: Quick Pockets records kept, no steal session, menu input mode or counterattack left over",
+    "Attack AP: fists and kicks 0.5, knuckles 1, knives and club 1, heavy melee 2, throws 3; guns 0 except AIMED SHOT (pistols 3, rifles/SMGs/shotguns 4, big guns 5); aimed melee +1; thrown weapons refused in the left hand",
+    "Ordinary gunfire costs no AP",
+    "RB throws the right hand's thrown weapon (3 AP) without changing the active weapon; the next one fills the hand; a missed throw gives a counterattack",
+    "RB with too little AP: refused, nothing thrown",
+    "Thrown weapons stay in the right hand and are never the active item; RB without one switches hands",
+    "Throws can't be aimed; a throw mode costs 3 AP",
+    "Missed shot: a melee enemy gets the counterattack, closes in and attacks",
+    "Missed shot: an armed enemy in range shoots back as its counterattack",
+    "A stale \"who hit me\" (saved id or removed critter) is forgotten and never read",
+    "After load: no critter keeps a stale \"who hit me\"",
+    "Enemy hit reactions play faster; nothing else does",
+    "Repeated hits never queue reactions or attacks on one enemy",
+    "A hit enemy may move again once its reaction is over",
+    "A distant enemy hit while chasing walks on promptly",
+    "Killing hits and knockdowns work as before",
+    "Dialogue: no option is selected or chosen by the talk press or by A without a selection",
+    "Vault 15 shaft without a rope: Use says a rope is needed, nothing changes",
+    "Vault 15 shaft: A attaches a carried rope through the shaft's script",
+    "Vault 15 shaft: repeated A presses use one rope",
+    "Vault 15 roped shaft: A climbs down",
+    "Vault 15 shaft: A attaches the rope in the active hand",
+    "Vault 15 ropes stay attached after saving and loading",
+    "Vault 15 ropes stay attached after leaving the map and coming back",
+    "Enemies behind cover don't shoot; they move to a clear shot",
+    "An enemy attacks promptly once it has a valid shot",
+    "No enemy attack without a positive hit chance; a small chance is enough",
+    "Enemies without a valid attack don't hold the attack slot",
+    "Ordinary enemy attacks don't hold the player; hits play a reaction, misses none",
+    "RT spam: enemies keep moving and attacking while the player attacks",
+    "RT timing: a fresh press keeps the normal hit chance",
+    "RT timing: a press near the end of the recovery keeps the normal hit chance",
+    "RT timing: an early buffered press costs accuracy",
+    "RT timing: spam costs more (up to the maximum) and starts one attack",
+    "RT timing: the penalty is used once",
+    "RT timing: weapon change, controller disconnect and menus clear presses and penalty",
+    "RT timing: the indicator includes the buffered press's penalty",
+    "RT spam: AP is charged only for committed attacks",
+    "RT timing: held automatic fire is unaffected",
+    "Hunting Rifle: armed idle pose when idle",
+    "Hunting Rifle: reloads in the idle pose for the original duration",
+    "Hunting Rifle: ammunition moves once; no firing while reloading",
+    "Hunting Rifle: interrupted reload loses nothing; then fires and walks normally",
+    "Shady Sands: an enemy outside a tent doesn't shoot the player inside",
 };
 
 static int at_results[C_COUNT];
@@ -469,6 +657,10 @@ static void at_hook();
 static void at_log(const char* format, ...);
 static void at_check(AutotestCheck check, bool passed, const char* format, ...);
 static void at_press(GamepadButton button);
+static void at_lstick_pulse(float x, float y, int polls = 4);
+// Quick Pockets sessions seen by the loot and barter steps (see `step_qp`).
+static int at_qp_sessions_before_loot = -1;
+static int at_qp_sessions_after_barter = -1;
 static void at_release_all();
 static void at_screenshot(const char* name);
 static int at_screendump(int width, int height, unsigned char* data, unsigned char* palette);
@@ -478,11 +670,12 @@ static void at_clear_hostiles();
 static void at_record_save_state();
 static bool at_aim_released();
 static int at_clear_rats_near(int radius);
+static bool at_tile_free(int tile);
 static void at_record_level_state();
 
 static bool at_enabled = false;
 // Optional: only run steps whose name contains this text (development aid).
-static char at_only[64] = "";
+static char at_only[256] = "";
 
 // Perk state at save time (character rules).
 static int at_rule_saved_perks = -1;
@@ -496,6 +689,15 @@ static unsigned int at_last_select_key = 0;
 static bool at_turn_based_seen = false;
 
 static GamepadState at_pad;
+// A short left stick push (menus, the Pip-Boy), held for a few polls.
+static float at_lstick_x = 0.0f;
+static float at_lstick_y = 0.0f;
+static int at_lstick_frames = 0;
+// `--rt-autotest-menus`: the controller drives the main menu, character
+// creation and the pause menu instead of the gameplay steps.
+static bool at_menus_mode = false;
+static bool at_menus_pregame_done = false;
+static void at_menus_pregame(unsigned int now);
 static int at_press_frames[GAMEPAD_BUTTON_COUNT];
 static int at_press_gap[GAMEPAD_BUTTON_COUNT];
 
@@ -553,6 +755,9 @@ void rt_autotest_parse_args(int argc, char** argv)
     for (int index = 1; index < argc; index++) {
         if (SDL_strcasecmp(argv[index], "--rt-autotest") == 0) {
             at_enabled = true;
+        } else if (SDL_strcasecmp(argv[index], "--rt-autotest-menus") == 0) {
+            at_enabled = true;
+            at_menus_mode = true;
         } else if (SDL_strncasecmp(argv[index], "--rt-autotest-only=", 19) == 0) {
             at_enabled = true;
             SDL_strlcpy(at_only, argv[index] + 19, sizeof(at_only));
@@ -583,6 +788,11 @@ bool rt_autotest_enabled()
 bool rt_autotest_finished()
 {
     return at_finished;
+}
+
+bool rt_autotest_menus_mode()
+{
+    return at_menus_mode;
 }
 
 static void at_log(const char* format, ...)
@@ -697,7 +907,9 @@ static void at_hook()
     }
 
     if (!gamepad_is_gameplay_mode()) {
-        if (at_start_time == 0) {
+        if (at_menus_mode && !at_menus_pregame_done) {
+            at_menus_pregame(now);
+        } else if (at_start_time == 0) {
             // Character selection: take the first premade character.
             if (now - at_last_select_key > 700) {
                 at_last_select_key = now;
@@ -735,6 +947,11 @@ static void at_hook()
             state.buttons[button] = true;
             at_press_frames[button]--;
         }
+    }
+    if (at_lstick_frames > 0) {
+        state.leftX = at_lstick_x;
+        state.leftY = at_lstick_y;
+        at_lstick_frames--;
     }
     state.leftTrigger = state.buttons[GAMEPAD_BUTTON_LEFT_TRIGGER] ? 1.0f : 0.0f;
     state.rightTrigger = state.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] ? 1.0f : 0.0f;
@@ -778,9 +995,36 @@ static int at_screendump(int width, int height, unsigned char* data, unsigned ch
         fwrite(quad, 1, 4, stream);
     }
 
+    // The controller's menu selection frame is drawn over the finished
+    // image (see `gamepad_render_menu_highlight`); the screenshot gets it too.
+    Rect frame;
+    bool framed = gamepad_get_menu_highlight(&frame);
+    std::vector<unsigned char> row(width);
+    unsigned char amber = colorTable[(31 << 10) | (26 << 5) | 7];
     unsigned char padding[3] = { 0, 0, 0 };
     for (int y = height - 1; y >= 0; y--) {
-        fwrite(data + y * width, 1, width, stream);
+        memcpy(row.data(), data + y * width, width);
+        if (framed) {
+            for (int inset = 0; inset < 2; inset++) {
+                int left = frame.ulx - 2 + inset;
+                int right = frame.lrx + 2 - inset;
+                int top = frame.uly - 2 + inset;
+                int bottom = frame.lry + 2 - inset;
+                if (y == top || y == bottom) {
+                    for (int x = std::max(left, 0); x <= std::min(right, width - 1); x++) {
+                        row[x] = amber;
+                    }
+                } else if (y > top && y < bottom) {
+                    if (left >= 0 && left < width) {
+                        row[left] = amber;
+                    }
+                    if (right >= 0 && right < width) {
+                        row[right] = amber;
+                    }
+                }
+            }
+        }
+        fwrite(row.data(), 1, width, stream);
         fwrite(padding, 1, rowSize - width, stream);
     }
 
@@ -2627,8 +2871,19 @@ static bool at_kind_ready()
                 break;
             }
         }
-        at_wield(at_throw_weapon);
-        return anim == ANIM_THROW_ANIM;
+        // Thrown weapons go in the right hand (item 2) and are thrown with
+        // RB; the left hand stays the active one.
+        if (at_throw_weapon == NULL) {
+            return false;
+        }
+        Object* right = inven_right_hand(obj_dude);
+        if (right == NULL || right->pid != at_throw_pid) {
+            if (!anim_busy(obj_dude) && !rt_is_reloading()) {
+                inven_rt_equip(at_throw_weapon, INVEN_RT_SLOT_RIGHT_HAND);
+            }
+            return false;
+        }
+        return !intface_is_item_right_hand();
     }
     default: {
         if (at_burst_weapon == NULL) {
@@ -2725,6 +2980,11 @@ static void at_check_hit_chance(AutotestCheck check)
     }
     char note[240];
     bool matches = at_indicator_matches(at_target, note, sizeof(note));
+    // Throws: the indicator stays the active (left hand) item's, so fists
+    // show "Out of range" for a target 2+ hexes away.
+    if (!matches && check == C_HIT_THROW && at_current_hit_mode() == HIT_MODE_PUNCH && obj_dist(obj_dude, at_target) > 1) {
+        matches = rt_get_indicator()->visible && strcmp(rt_get_indicator()->text, "Out of range") == 0;
+    }
     at_check(check, matches, "%s", note);
 }
 
@@ -2780,7 +3040,9 @@ static bool step_attack_kind(unsigned int elapsed, bool first, bool timedOut)
             at_screenshot(at_kind == AT_SINGLE ? "12_indicator_gun" : "13_indicator_burst");
         }
         at_counter_before = at_kind_counter();
-        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        // Throws cost AP (3); RB throws the right hand's thrown weapon.
+        rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+        at_press(at_kind == AT_THROW ? GAMEPAD_BUTTON_RIGHT_SHOULDER : GAMEPAD_BUTTON_RIGHT_TRIGGER);
         at_phase = 2;
         at_phase_start = now;
         break;
@@ -2843,7 +3105,8 @@ static bool step_attack_kind(unsigned int elapsed, bool first, bool timedOut)
             at_toughened = at_target;
             at_log("harness: %s toughened to %d HP for the automatic-fire test", critter_name(at_target), critter_get_hits(at_target));
         }
-        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+        rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+        at_pad.buttons[at_kind == AT_THROW ? GAMEPAD_BUTTON_RIGHT_SHOULDER : GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
         at_phase = 4;
         at_phase_start = now;
         break;
@@ -2854,6 +3117,7 @@ static bool step_attack_kind(unsigned int elapsed, bool first, bool timedOut)
             break;
         }
         at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_SHOULDER] = false;
         at_count_a = at_kind_counter() - at_counter_before;
         at_phase = 5;
         at_phase_start = now;
@@ -2945,7 +3209,16 @@ static bool step_burst(unsigned int elapsed, bool first, bool timedOut)
 static bool step_throw(unsigned int elapsed, bool first, bool timedOut)
 {
     at_kind = AT_THROW;
-    return step_attack_kind(elapsed, first, timedOut);
+    bool done = step_attack_kind(elapsed, first, timedOut);
+    if (done) {
+        // The rest of the stack goes back to the inventory (RB switches
+        // hands again).
+        Object* right = inven_right_hand(obj_dude);
+        if (rt_is_thrown_weapon(right)) {
+            inven_rt_unequip(right);
+        }
+    }
+    return done;
 }
 
 // Held automatic fire stops when the locked target dies; it does not move on
@@ -2968,9 +3241,18 @@ static bool step_no_transfer(unsigned int elapsed, bool first, bool timedOut)
         if (!at_kind_ready()) {
             break;
         }
-        // A fresh, weak target plus another enemy nearby.
+        // A fresh, weak target plus another enemy nearby: behind the player,
+        // out of the burst's spread (a burst can kill a rat next to the
+        // target, leaving nobody to wrongly switch to).
         at_target = at_spawn_rat(2, 3, true);
-        at_spawn_rat(2, 4, true);
+        if (at_target != NULL) {
+            int behind = tile_num_in_direction(obj_dude->tile, (tile_dir(obj_dude->tile, at_target->tile) + 3) % ROTATION_COUNT, 3);
+            if (at_tile_free(behind)) {
+                at_spawn_rat_at(behind, true);
+            } else {
+                at_spawn_rat(2, 4, true);
+            }
+        }
         if (at_target == NULL) {
             if (timedOut) {
                 return true;
@@ -3973,6 +4255,7 @@ static bool step_skills(unsigned int elapsed, bool first, bool timedOut)
         at_flag_a = stats->skillBlocked == at_count_b + 1 && stats->skillUses == at_count_a && !anim_busy(obj_dude) && !at_door_picked();
         at_log("skills: requirement 80%% with Lockpick %d%%: blocked=%d, attempted=%d",
             skill_level(obj_dude, SKILL_LOCKPICK), stats->skillBlocked - at_count_b, stats->skillUses - at_count_a);
+        at_log("skills: player busy=%d (anim %d), door picked=%d", anim_busy(obj_dude) != 0, FID_ANIM_TYPE(obj_dude->fid), at_door_picked());
         // Meeting it lets the attempt through.
         at_set_lockpick_points(300);
         at_count_a = stats->skillUses;
@@ -4225,7 +4508,7 @@ static bool at_menu_save_script(unsigned int elapsed)
     }
     if (at_phase == 1 && elapsed > 3500) {
         at_screenshot("16_save_screen");
-        at_press(GAMEPAD_BUTTON_START);
+        at_press(GAMEPAD_BUTTON_A);
         at_phase = at_save_slot_existed ? 2 : 4;
     }
     // "Save game already exists, overwrite?": D-pad to YES, then A.
@@ -4240,7 +4523,7 @@ static bool at_menu_save_script(unsigned int elapsed)
     }
     if (at_phase == 4 && elapsed > 6800) {
         at_screenshot("17_save_comment");
-        at_press(GAMEPAD_BUTTON_START);
+        at_press(GAMEPAD_BUTTON_A);
         at_phase = 5;
     }
     if (at_phase >= 5 && elapsed > 9500 && (elapsed / 1000) % 2 == 0) {
@@ -4326,7 +4609,7 @@ static bool at_menu_load_script(unsigned int elapsed)
     }
     if (at_phase == 2 && elapsed > 3800) {
         at_screenshot("18_load_screen");
-        at_press(GAMEPAD_BUTTON_START);
+        at_press(GAMEPAD_BUTTON_A);
         at_phase = 3;
     }
     if (at_phase >= 3 && elapsed > 9000 && (elapsed / 1000) % 2 == 0) {
@@ -5364,7 +5647,7 @@ static const RtPipboyState* at_pb()
     return rt_pipboy_get_state();
 }
 
-// Presses RT/LT until `tab` is shown; true once there.
+// Pulls RT until `tab` is shown; true once there.
 static bool at_pb_goto_tab(int tab)
 {
     if (at_pb()->tab == tab) {
@@ -5376,13 +5659,22 @@ static bool at_pb_goto_tab(int tab)
     return false;
 }
 
+// Pushes the left stick right until subcategory `page` is shown (back on
+// the tab's own page first).
 static bool at_pb_goto_page(int page)
 {
     if (at_pb()->page == page && at_pb()->mode == RT_PIPBOY_MODE_NONE) {
         return true;
     }
-    if (at_pb_ready()) {
-        at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+    if (at_pb_ready(250)) {
+        if (at_pb()->mode != RT_PIPBOY_MODE_NONE) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+        } else {
+            at_lstick_x = 1.0f;
+            at_lstick_y = 0.0f;
+            at_lstick_frames = 4;
+            at_pb_last_press = SDL_GetTicks();
+        }
     }
     return false;
 }
@@ -5495,17 +5787,19 @@ static bool at_menu_pipboy_script(unsigned int elapsed)
         }
         break;
     case 3: {
-        // RB then LB: one page forward and back.
+        // Left stick right then left: one subcategory forward and back.
         static int before;
         if (at_pb_tries == 0 && at_pb_ready()) {
             before = state->page;
-            at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+            at_lstick_pulse(1.0f, 0.0f);
+            at_pb_last_press = SDL_GetTicks();
             at_pb_tries = 1;
         } else if (at_pb_tries == 1 && at_pb_ready(300)) {
             if (state->page == (before + 1) % 6) {
                 at_pb_page_moves++;
             }
-            at_pb_tap(GAMEPAD_BUTTON_LEFT_SHOULDER);
+            at_lstick_pulse(-1.0f, 0.0f);
+            at_pb_last_press = SDL_GetTicks();
             at_pb_tries = 2;
         } else if (at_pb_tries == 2 && at_pb_ready(300)) {
             if (state->page == before) {
@@ -5957,7 +6251,7 @@ static bool step_pipboy(unsigned int elapsed, bool first, bool timedOut)
                 "attacks=%d interactions=%d opens=%d moved after close=%d lock=%d still open=%d",
                 attacks, interactions, opens, moved, rt_get_lock() != NULL, state->open);
             at_check(C_PB_TABS, at_pb_tab_moves == 2 && at_pb_page_moves == 2,
-                "RT/LT tab moves=%d of 2, RB/LB page moves=%d of 2", at_pb_tab_moves, at_pb_page_moves);
+                "RT/LT tab moves=%d of 2, left stick subcategory moves=%d of 2", at_pb_tab_moves, at_pb_page_moves);
             at_check(C_PB_EQUIP, at_pb_weapon != NULL && at_pb_equipped && at_pb_unequipped && inven_right_hand(obj_dude) == at_pb_weapon,
                 "equip right=%d, put away=%d, held again=%d", at_pb_equipped, at_pb_unequipped, inven_right_hand(obj_dude) == at_pb_weapon);
             at_check(C_PB_USE, at_pb_used, "Stimpak used from the Pip-Boy (HP before %d, now %d)", at_pb_hp_before, critter_get_hits(obj_dude));
@@ -6375,12 +6669,12 @@ static bool at_aim_released()
 // weapon fit (plus 2 AP), and AP filled up.
 static void at_aim_full_ap()
 {
-    int cost = item_w_mp_cost(obj_dude, at_current_hit_mode(), true);
+    float cost = (float)rt_attack_ap_cost(obj_dude, at_current_hit_mode(), true);
     int current = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
-    int wanted = 3 * cost + 2;
+    int wanted = (int)ceilf(3.0f * cost) + 2;
     if (current != wanted) {
         stat_set_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS, stat_get_bonus(obj_dude, STAT_MAXIMUM_ACTION_POINTS) + wanted - current);
-        at_log("harness: maximum AP set to %d (3 aimed attacks of %d AP + 2)", stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS), cost);
+        at_log("harness: maximum AP set to %d (3 aimed attacks of %.1f AP + 2)", stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS), cost);
     }
     rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
 }
@@ -6696,14 +6990,14 @@ static bool at_aim_q_dpad_ok;
 static bool at_aim_q_odds_ok;
 static int at_aim_q_after_two;
 static int at_aim_q_after_undo;
-static int at_aim_q_reserved_one;
-static int at_aim_q_free_one;
+static float at_aim_q_reserved_one;
+static float at_aim_q_free_one;
 static bool at_aim_q_switched;
 static int at_aim_q_refusals_before;
 static bool at_aim_q_refused_ap;
 static int at_aim_q_final_length;
-static int at_aim_q_cost;
-static int at_aim_q_free_start;
+static float at_aim_q_cost;
+static float at_aim_q_free_start;
 static RtAimedEntry at_aim_q_plan[RT_AIMED_QUEUE_MAX];
 static int at_aim_q_favorites_before;
 static int at_aim_q_cycles_before;
@@ -6816,7 +7110,7 @@ static bool at_menu_aim_queue_script(unsigned int elapsed)
             at_aim_q_refused_ap = state->refusals == at_aim_q_refusals_before + 1 && strstr(state->message, "AP") != NULL;
             at_aim_q_final_length = state->queueLength;
             memcpy(at_aim_q_plan, state->queue, sizeof(at_aim_q_plan));
-            at_log("aim: queue %d, reserved %d AP, free %d AP, message '%s'", state->queueLength, state->reservedAp, state->availableAp, state->message);
+            at_log("aim: queue %d, reserved %.1f AP, free %.1f AP, message '%s'", state->queueLength, state->reservedAp, state->availableAp, state->message);
             at_screenshot("aim_04_queue");
             at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
             at_pb_next(11);
@@ -6899,9 +7193,9 @@ static bool step_aim_queue(unsigned int elapsed, bool first, bool timedOut)
         at_check(C_AIM_QUEUE,
             at_aim_q_dpad_ok && at_aim_q_reserved_one == at_aim_q_cost && at_aim_q_free_one == at_aim_q_free_start - at_aim_q_cost
                 && at_aim_q_after_two == 2 && at_aim_q_after_undo == 1 && at_aim_q_switched && at_aim_q_final_length == 3,
-            "D-pad moved the part=%d (no favorites/cycling), 1 queued: %d AP reserved, %d of %d free; same part twice -> %d, X -> %d, flick switched to rat 2=%d, final queue %d",
+            "D-pad moved the part=%d (no favorites/cycling), 1 queued: %.1f AP reserved, %.1f of %.1f free; same part twice -> %d, X -> %d, flick switched to rat 2=%d, final queue %d",
             at_aim_q_dpad_ok, at_aim_q_reserved_one, at_aim_q_free_one, at_aim_q_free_start, at_aim_q_after_two, at_aim_q_after_undo, at_aim_q_switched, at_aim_q_final_length);
-        at_check(C_AIM_LIMITS, at_aim_q_refused_ap, "a 4th aimed attack (%d AP each) with %d AP free was refused=%d",
+        at_check(C_AIM_LIMITS, at_aim_q_refused_ap, "a 4th aimed attack (%.1f AP each) with %.1f AP free was refused=%d",
             at_aim_q_cost, at_aim_q_free_start - 3 * at_aim_q_cost, at_aim_q_refused_ap);
         if (!rt_aimed_is_executing()) {
             at_check(C_AIM_EXECUTE, false, "RT did not start the queue");
@@ -6945,7 +7239,7 @@ static bool step_aim_queue(unsigned int elapsed, bool first, bool timedOut)
         {
             int committed = at_aim()->committed - at_aim_x_committed_before;
             float spent = at_aim_x_ap_start - rt_get_dude_ap();
-            float expected = (float)(committed * at_aim_q_cost);
+            float expected = committed * at_aim_q_cost;
             // AP never went up during execution; it went down by exactly the
             // committed attacks' cost.
             bool apOk = at_aim_x_ap_max <= at_aim_x_ap_start + 0.001f && fabsf(spent - expected) < 0.01f;
@@ -6953,7 +7247,7 @@ static bool step_aim_queue(unsigned int elapsed, bool first, bool timedOut)
                 && obj_dude->tile == at_aim_x_tile_before
                 && stats->playerAttacks - at_aim_x_attacks_before == committed;
             at_check(C_AIM_AP, apOk && committed == 3,
-                "AP %.2f at start, highest %.2f during execution, %.2f at the end: spent %.2f for %d committed attacks of %d AP",
+                "AP %.2f at start, highest %.2f during execution, %.2f at the end: spent %.2f for %d committed attacks of %.1f AP",
                 at_aim_x_ap_start, at_aim_x_ap_max, rt_get_dude_ap(), spent, committed, at_aim_q_cost);
             at_flag_a = at_aim_x_order_ok && at_aim_x_seen == 3 && committed == 3 && at_aim_x_blocked_ok;
             at_count_a = committed;
@@ -7223,7 +7517,7 @@ static int at_aim_i_phase;
 static float at_aim_i_ap;
 static int at_aim_i_committed;
 static int at_aim_i_skipped;
-static int at_aim_i_cost;
+static float at_aim_i_cost;
 static int at_aim_i_attacks;
 
 static void at_aim_i_open(AtMenuScript* script)
@@ -7281,7 +7575,7 @@ static bool step_aim_interrupt(unsigned int elapsed, bool first, bool timedOut)
         at_aim_i_committed = state->committed;
         at_aim_i_skipped = state->skipped;
         at_aim_i_attacks = rt_get_stats()->aimedAttacks;
-        at_aim_i_cost = item_w_mp_cost(obj_dude, at_current_hit_mode(), true);
+        at_aim_i_cost = (float)rt_attack_ap_cost(obj_dude, at_current_hit_mode(), true);
         at_aim_i_cancelled_before = state->cancelled;
         at_aim_i_phase++;
         break;
@@ -7352,7 +7646,7 @@ static bool step_aim_interrupt(unsigned int elapsed, bool first, bool timedOut)
             int skipped = state->skipped - at_aim_i_skipped;
             float spent = at_aim_i_ap - rt_get_dude_ap();
             at_check(C_AIM_SKIP_DEAD, committed == 1 && skipped == 1 && fabsf(spent - at_aim_i_cost) < 0.01f && state->reservedAp == 0,
-                "committed %d, skipped %d (target dead), AP spent %.2f (one attack = %d), still reserved %d",
+                "committed %d, skipped %d (target dead), AP spent %.2f (one attack = %.1f), still reserved %.1f",
                 committed, skipped, spent, at_aim_i_cost, state->reservedAp);
         }
         at_aim_rats[1] = NULL;
@@ -7395,7 +7689,7 @@ static bool step_aim_interrupt(unsigned int elapsed, bool first, bool timedOut)
             float spent = at_aim_i_ap - rt_get_dude_ap();
             at_flag_b = !rt_aimed_is_executing() && committed >= 1 && committed < 3
                 && fabsf(spent - committed * at_aim_i_cost) < 0.01f && state->reservedAp == 0;
-            at_log("aim B during execution: committed %d of 3, AP spent %.2f, executing %d, reserved %d",
+            at_log("aim B during execution: committed %d of 3, AP spent %.2f, executing %d, reserved %.1f",
                 committed, spent, rt_aimed_is_executing(), state->reservedAp);
         }
         // Afterwards an ordinary RT press attacks normally.
@@ -9490,6 +9784,7 @@ static bool step_loot(unsigned int elapsed, bool first, bool timedOut)
 {
     unsigned int now = SDL_GetTicks();
     if (first) {
+        at_qp_sessions_before_loot = rt_quick_pockets_state()->sessions;
         at_release_all();
         at_clear_hostiles();
         rt_debug_set_lock(NULL);
@@ -10153,6 +10448,7 @@ static bool step_holster(unsigned int elapsed, bool first, bool timedOut)
 {
     unsigned int now = SDL_GetTicks();
     if (first) {
+        at_qp_sessions_after_barter = rt_quick_pockets_state()->sessions;
         at_release_all();
         at_clear_hostiles();
         rt_debug_set_lock(NULL);
@@ -11729,6 +12025,7 @@ static float at_sprint_ap;
 static float at_sprint_rate[2];
 static Object* at_sprint_rat;
 static float at_sprint_calm;
+static int at_sprint_retries;
 
 static bool step_rules_sprint(unsigned int elapsed, bool first, bool timedOut)
 {
@@ -11739,6 +12036,7 @@ static bool step_rules_sprint(unsigned int elapsed, bool first, bool timedOut)
         at_sprint_rate[0] = -1.0f;
         at_sprint_rate[1] = -1.0f;
         at_sprint_calm = -1.0f;
+        at_sprint_retries = 0;
         at_clear_hostiles();
         at_release_all();
         return false;
@@ -11786,8 +12084,17 @@ static bool step_rules_sprint(unsigned int elapsed, bool first, bool timedOut)
         {
             float ms = stats->sprintCombatMs - at_sprint_ms;
             float ap = stats->sprintCombatAp - at_sprint_ap;
-            at_sprint_rate[at_phase == 2 ? 0 : 1] = ms > 100.0f ? ap / ms : -1.0f;
             at_log("rules: combat sprint, Bonus Move %d: %.0f ms running, %.3f AP (%.5f AP/ms)", at_phase == 2 ? 0 : 1, ms, ap, ms > 0 ? ap / ms : 0.0f);
+            // Too short a sample (the run was blocked, e.g. by the rat):
+            // sprint again.
+            if (ms <= 100.0f && at_sprint_retries < 3) {
+                at_sprint_retries++;
+                at_log("rules: sprint sample too short, again (%d)", at_sprint_retries);
+                at_time_a = now;
+                at_phase -= 1;
+                break;
+            }
+            at_sprint_rate[at_phase == 2 ? 0 : 1] = ms > 100.0f ? ap / ms : -1.0f;
         }
         at_time_a = now;
         at_phase += 1;
@@ -12413,7 +12720,12 @@ static bool step_steal(unsigned int elapsed, bool first, bool timedOut)
         return false;
     }
 
-    if ((at_menu_done && elapsed > 1500 && !inven_rt_loot_state()->open) || timedOut) {
+    // A caught theft closes the screen at once (the script may not see it).
+    bool closedOnA = at_sk_phase == 1 && !inven_rt_loot_state()->open && elapsed > 1500;
+    if (closedOnA) {
+        at_sk_flags[4] = true;
+    }
+    if ((at_menu_done && elapsed > 1500 && !inven_rt_loot_state()->open) || closedOnA || timedOut) {
         at_menu_expected = false;
         int taken = at_count_pid_in(obj_dude, at_steal_item->pid) - at_sk_values[0];
         bool caught = at_steal_target != NULL && !critter_is_dead(at_steal_target)
@@ -13863,6 +14175,6848 @@ static bool step_sneak_after_load(unsigned int elapsed, bool first, bool timedOu
     return true;
 }
 
+// -----------------------------------------------------------------------------
+// Controller menus (`--rt-autotest-menus`), dialogue
+// -----------------------------------------------------------------------------
+
+static void at_lstick_pulse(float x, float y, int polls)
+{
+    at_lstick_x = x;
+    at_lstick_y = y;
+    at_lstick_frames = polls;
+}
+
+static bool at_rect_same(const Rect& a, const Rect& b)
+{
+    return a.ulx == b.ulx && a.uly == b.uly && a.lrx == b.lrx && a.lry == b.lry;
+}
+
+// The button with `eventCode` has the controller's selection frame.
+static bool at_nav_selected(int eventCode)
+{
+    Rect target;
+    Rect selected;
+    return win_find_nav_button(eventCode, &target) && gamepad_get_menu_highlight(&selected) && at_rect_same(selected, target);
+}
+
+// Where a D-pad press in (dirX, dirY) would put the cursor: the same choice
+// as `gamepad_menu_navigate` (nearest ahead, sideways distance counted
+// twice). False if no button is in that direction.
+static bool at_nav_predict(int dirX, int dirY, int mouseX, int mouseY, int* outX, int* outY)
+{
+    int xs[256];
+    int ys[256];
+    int count = win_get_nav_points(xs, ys, 256);
+    int best = -1;
+    int bestScore = 0;
+    for (int index = 0; index < count; index++) {
+        int vx = xs[index] - mouseX;
+        int vy = ys[index] - mouseY;
+        int along = vx * dirX + vy * dirY;
+        if (along <= 4) {
+            continue;
+        }
+        int across = abs(dirX != 0 ? vy : vx);
+        int score = along + across * 2;
+        if (best == -1 || score < bestScore) {
+            best = index;
+            bestScore = score;
+        }
+    }
+    if (best == -1) {
+        return false;
+    }
+    *outX = xs[best];
+    *outY = ys[best];
+    return true;
+}
+
+static unsigned int at_nav_last = 0;
+static int at_nav_presses = 0;
+
+// Steps the D-pad (or the left stick) toward the button with `eventCode`,
+// one press at a time; true once it is selected.
+static bool at_nav_to(int eventCode, bool useStick = false)
+{
+    Rect target;
+    if (!win_find_nav_button(eventCode, &target)) {
+        return false;
+    }
+    if (at_nav_selected(eventCode)) {
+        return true;
+    }
+
+    unsigned int now = SDL_GetTicks();
+    if (now - at_nav_last < 220) {
+        return false;
+    }
+    at_nav_last = now;
+    at_nav_presses++;
+
+    int mouseX;
+    int mouseY;
+    mouse_get_position(&mouseX, &mouseY);
+    int dx = (target.ulx + target.lrx) / 2 - mouseX;
+    int dy = (target.uly + target.lry) / 2 - mouseY;
+    if (at_nav_presses % 10 == 0) {
+        Rect selected = { -1, -1, -1, -1 };
+        gamepad_get_menu_highlight(&selected);
+        at_log("nav: to event %d at %d,%d-%d,%d; cursor %d,%d; framed %d,%d-%d,%d (%d presses)", eventCode,
+            target.ulx, target.uly, target.lrx, target.lry, mouseX, mouseY, selected.ulx, selected.uly, selected.lrx, selected.lry, at_nav_presses);
+    }
+    // The direction whose next stop is closest to the target (a player
+    // follows the frame the same way).
+    static const int dirs[4][2] = { { 1, 0 }, { -1, 0 }, { 0, 1 }, { 0, -1 } };
+    int bestDir = abs(dx) > abs(dy) ? (dx > 0 ? 0 : 1) : (dy > 0 ? 2 : 3);
+    long long bestDistance = -1;
+    for (int dir = 0; dir < 4; dir++) {
+        int x;
+        int y;
+        if (!at_nav_predict(dirs[dir][0], dirs[dir][1], mouseX, mouseY, &x, &y)) {
+            continue;
+        }
+        long long ex = (target.ulx + target.lrx) / 2 - x;
+        long long ey = (target.uly + target.lry) / 2 - y;
+        long long distance = ex * ex + ey * ey;
+        if (x >= target.ulx && x <= target.lrx && y >= target.uly && y <= target.lry) {
+            distance = -2;
+        }
+        if (bestDistance == -1 || distance < bestDistance) {
+            bestDir = dir;
+            bestDistance = distance;
+        }
+    }
+    if (useStick) {
+        at_lstick_pulse((float)dirs[bestDir][0], (float)dirs[bestDir][1]);
+    } else {
+        static const GamepadButton buttons[4] = { GAMEPAD_BUTTON_DPAD_RIGHT, GAMEPAD_BUTTON_DPAD_LEFT, GAMEPAD_BUTTON_DPAD_DOWN, GAMEPAD_BUTTON_DPAD_UP };
+        at_press(buttons[bestDir]);
+    }
+    return false;
+}
+
+// Screens that go through their controls as a list (Preferences): Up or
+// Down until the button with `eventCode` is selected.
+static bool at_nav_list_to(int eventCode, GamepadButton direction)
+{
+    if (at_nav_selected(eventCode)) {
+        return true;
+    }
+    unsigned int now = SDL_GetTicks();
+    if (now - at_nav_last >= 220) {
+        at_nav_last = now;
+        at_nav_presses++;
+        at_press(direction);
+    }
+    return false;
+}
+
+static int at_mn_phase = 0;
+static unsigned int at_mn_time = 0;
+static unsigned int at_mn_start = 0;
+static int at_mn_tries = 0;
+static int at_mn_values[16];
+static bool at_mn_flags[16];
+static Rect at_mn_rect;
+static unsigned int at_mn_signature = 0;
+static char at_mn_note[160];
+
+static bool at_mn_ready(unsigned int gap)
+{
+    return SDL_GetTicks() - at_mn_time >= gap;
+}
+
+static void at_mn_next(int phase)
+{
+    at_mn_phase = phase;
+    at_mn_time = SDL_GetTicks();
+    at_mn_tries = 0;
+    at_nav_presses = 0;
+    at_log("menus: phase %d", phase);
+}
+
+// The tag skills and traits character creation picks.
+static const int at_mn_tags[3] = { SKILL_SMALL_GUNS, SKILL_UNARMED, SKILL_SPEECH };
+static const int at_mn_traits[2] = { TRAIT_KAMIKAZE, TRAIT_SKILLED };
+static bool at_mn_shot_kamikaze = false;
+
+static void at_mn_fail(const char* where)
+{
+    at_log("menus: stuck in phase %d (%s)", at_mn_phase, where);
+    AutotestCheck pending[] = {
+        C_MENU_MAIN_NAV,
+        C_MENU_SELECT,
+        C_MENU_EDITOR_SPECIAL,
+        C_MENU_EDITOR_TAGS,
+        C_MENU_EDITOR_NAME,
+        C_MENU_EDITOR_B,
+        C_MENU_EDITOR_DONE,
+        C_MENU_CONFIRM,
+    };
+    for (AutotestCheck check : pending) {
+        if (at_results[check] == -1) {
+            at_check(check, false, "not reached: stuck in phase %d (%s)", at_mn_phase, where);
+        }
+    }
+    at_menus_pregame_done = true;
+    at_finish();
+    // Leaves the editor or selection screen and quits from the main menu.
+    game_user_wants_to_quit = 3;
+}
+
+// Main menu, character selection and character creation, with controller
+// input only (runs inside those screens' input loops).
+static void at_menus_pregame(unsigned int now)
+{
+    if (at_mn_start == 0) {
+        at_mn_start = now;
+        at_mn_time = now;
+        memset(at_mn_values, 0, sizeof(at_mn_values));
+        memset(at_mn_flags, 0, sizeof(at_mn_flags));
+        at_log("menus: controller menu test started");
+    }
+
+    if (now - at_mn_start > 180000) {
+        at_mn_fail("overall timeout");
+        return;
+    }
+    if (at_mn_phase > 0 && at_mn_ready(25000)) {
+        at_mn_fail("phase timeout");
+        return;
+    }
+
+    switch (at_mn_phase) {
+    case 0:
+        // The main menu, first with the D-pad...
+        if (!in_main_menu || !at_mn_ready(1500)) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+        at_mn_next(1);
+        break;
+    case 1:
+        if (!at_mn_ready(450)) {
+            break;
+        }
+        at_mn_flags[0] = gamepad_get_menu_highlight(&at_mn_rect);
+        // ...then with the left stick (toward the other buttons).
+        at_lstick_pulse(0.0f, at_nav_selected(KEY_LOWERCASE_I) ? 1.0f : -1.0f);
+        at_mn_next(2);
+        break;
+    case 2: {
+        if (!at_mn_ready(450)) {
+            break;
+        }
+        Rect selected;
+        at_mn_flags[1] = gamepad_get_menu_highlight(&selected) && !at_rect_same(selected, at_mn_rect);
+        at_screenshot("m1_main_menu");
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(3);
+        break;
+    }
+    case 3:
+        if (!at_mn_ready(600)) {
+            break;
+        }
+        // B selected Exit; the game is still running.
+        at_mn_flags[2] = in_main_menu && at_nav_selected(KEY_LOWERCASE_E);
+        at_mn_next(4);
+        break;
+    case 4:
+        if (at_nav_to(KEY_LOWERCASE_N)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(5);
+        }
+        break;
+    case 5: {
+        // Character selection.
+        Rect create;
+        if (at_mn_tries++ % 120 == 0) {
+            int xs[64];
+            int ys[64];
+            int mouseX;
+            int mouseY;
+            mouse_get_position(&mouseX, &mouseY);
+            at_log("menus: waiting for the selection: main menu %d, %d buttons, cursor %d,%d, framed %d",
+                in_main_menu, win_get_nav_points(xs, ys, 64), mouseX, mouseY, gamepad_get_menu_highlight(NULL));
+        }
+        if (in_main_menu || !win_find_nav_button(KEY_LOWERCASE_C, &create)) {
+            break;
+        }
+        at_check(C_MENU_MAIN_NAV, at_mn_flags[0] && at_mn_flags[1] && at_mn_flags[2],
+            "D-pad selection framed=%d, left stick moved it=%d, B selected Exit (game kept running)=%d, A on New Game opened the selection",
+            at_mn_flags[0], at_mn_flags[1], at_mn_flags[2]);
+        at_mn_next(6);
+        break;
+    }
+    case 6:
+        if (!at_mn_ready(800)) {
+            break;
+        }
+        if (at_nav_to(KEY_LOWERCASE_C, true)) {
+            at_screenshot("m2_select");
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(7);
+        }
+        break;
+    case 7:
+        if (!editor_rt_is_open() || !at_mn_ready(800)) {
+            break;
+        }
+        at_check(C_MENU_SELECT, true, "Create selected with the left stick and pressed with A; the editor opened");
+        at_mn_values[0] = stat_get_base(obj_dude, STAT_STRENGTH);
+        at_mn_values[1] = stat_get_base(obj_dude, STAT_AGILITY);
+        at_mn_values[2] = character_points;
+        at_log("menus: editor open, ST %d AG %d, %d character points", at_mn_values[0], at_mn_values[1], at_mn_values[2]);
+        at_mn_next(8);
+        break;
+    case 8:
+        // Agility -1.
+        if (at_nav_to(510 + STAT_AGILITY)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(9);
+        }
+        break;
+    case 9:
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_values[3] = stat_get_base(obj_dude, STAT_AGILITY);
+        at_mn_values[4] = character_points;
+        at_mn_next(10);
+        break;
+    case 10:
+        // Agility +1 again.
+        if (at_nav_to(503 + STAT_AGILITY)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(11);
+        }
+        break;
+    case 11:
+        // Strength + until the points are spent.
+        if (!at_mn_ready(450)) {
+            break;
+        }
+        if (character_points == 0 || stat_get_base(obj_dude, STAT_STRENGTH) >= 10 || at_mn_tries > 12) {
+            bool minus = at_mn_values[3] == at_mn_values[1] - 1 && at_mn_values[4] == at_mn_values[2] + 1;
+            int strength = stat_get_base(obj_dude, STAT_STRENGTH);
+            int agility = stat_get_base(obj_dude, STAT_AGILITY);
+            at_check(C_MENU_EDITOR_SPECIAL, minus && agility == at_mn_values[1] && strength == at_mn_values[0] + at_mn_values[2] && character_points == 0,
+                "AG - : %d -> %d with points %d -> %d; AG + back to %d; ST + : %d -> %d; points left %d",
+                at_mn_values[1], at_mn_values[3], at_mn_values[2], at_mn_values[4], agility, at_mn_values[0], strength, character_points);
+            at_mn_next(12);
+            break;
+        }
+        if (at_nav_to(503 + STAT_STRENGTH)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_time = SDL_GetTicks();
+            at_mn_tries++;
+        }
+        break;
+    case 12:
+    case 13:
+    case 14:
+        // Tag skills.
+        if (!at_mn_ready(450)) {
+            break;
+        }
+        if (at_nav_to(536 + at_mn_tags[at_mn_phase - 12])) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(at_mn_phase + 1);
+        }
+        break;
+    case 15:
+    case 16:
+        // Traits.
+        if (!at_mn_ready(450)) {
+            break;
+        }
+        if (at_mn_phase == 16 && !at_mn_shot_kamikaze) {
+            // Kamikaze was just taken: its card (the text must fit).
+            at_mn_shot_kamikaze = true;
+            at_screenshot("m3a_kamikaze_card");
+        }
+        if (at_nav_to(555 + at_mn_traits[at_mn_phase - 15])) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(at_mn_phase + 1);
+        }
+        break;
+    case 17: {
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        int tags[NUM_TAGGED_SKILLS];
+        skill_get_tags(tags, NUM_TAGGED_SKILLS);
+        int tagged = 0;
+        for (int skill : at_mn_tags) {
+            for (int index = 0; index < NUM_TAGGED_SKILLS; index++) {
+                if (tags[index] == skill) {
+                    tagged++;
+                }
+            }
+        }
+        int trait1;
+        int trait2;
+        trait_get(&trait1, &trait2);
+        bool traits = (trait1 == at_mn_traits[0] || trait2 == at_mn_traits[0]) && (trait1 == at_mn_traits[1] || trait2 == at_mn_traits[1]);
+        at_screenshot("m3_editor_choices");
+        at_check(C_MENU_EDITOR_TAGS, tagged == 3 && traits,
+            "tagged %d of 3 (Small Guns, Unarmed, Speech); traits %d and %d (Kamikaze %d, Skilled %d)",
+            tagged, trait1, trait2, at_mn_traits[0], at_mn_traits[1]);
+        at_mn_next(18);
+        break;
+    }
+    case 18:
+        // The name.
+        if (at_nav_to(517)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(19);
+        }
+        break;
+    case 19:
+        // Typing: clear, then A, add, B: "AB".
+        if (!gamepad_is_menu_key_mode() || !at_mn_ready(250)) {
+            break;
+        }
+        if (at_mn_tries < 14) {
+            at_press(GAMEPAD_BUTTON_DPAD_LEFT);
+        } else if (at_mn_tries == 14) {
+            at_press(GAMEPAD_BUTTON_DPAD_UP);
+        } else if (at_mn_tries == 15) {
+            at_press(GAMEPAD_BUTTON_DPAD_RIGHT);
+        } else if (at_mn_tries == 16) {
+            at_press(GAMEPAD_BUTTON_DPAD_UP);
+        } else if (at_mn_tries == 17) {
+            at_screenshot("m4_editor_name");
+        } else {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(20);
+            break;
+        }
+        at_mn_tries++;
+        at_mn_time = SDL_GetTicks();
+        break;
+    case 20:
+        if (gamepad_is_menu_key_mode() || !at_mn_ready(600)) {
+            break;
+        }
+        snprintf(at_mn_note, sizeof(at_mn_note), "%s", critter_name(obj_dude));
+        at_check(C_MENU_EDITOR_NAME, strcmp(at_mn_note, "AB") == 0 && editor_rt_is_open(),
+            "typed with Left (clear), Up, Right, Up, then A: name '%s' (expected 'AB'), editor still open %d", at_mn_note, editor_rt_is_open());
+        at_mn_signature = win_get_nav_signature();
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(21);
+        break;
+    case 21: {
+        // B: a confirmation, not a discarded character.
+        if (!at_mn_ready(900)) {
+            break;
+        }
+        Rect selected;
+        at_mn_flags[3] = win_get_nav_signature() != at_mn_signature && editor_rt_is_open();
+        at_mn_flags[4] = gamepad_get_menu_highlight(&selected);
+        at_screenshot("m5_editor_discard");
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(22);
+        break;
+    }
+    case 22:
+        if (!at_mn_ready(900)) {
+            break;
+        }
+        at_mn_flags[5] = win_get_nav_signature() == at_mn_signature && editor_rt_is_open() && strcmp(critter_name(obj_dude), "AB") == 0;
+        at_check(C_MENU_EDITOR_B, at_mn_flags[3] && at_mn_flags[5],
+            "B opened a question (editor kept)=%d; B again answered No: question gone, editor and name kept=%d",
+            at_mn_flags[3], at_mn_flags[5]);
+        at_check(C_MENU_CONFIRM, at_mn_flags[3] && at_mn_flags[4] && at_mn_flags[5],
+            "discard question: a Yes/No button framed=%d, B answered No=%d", at_mn_flags[4], at_mn_flags[5]);
+        at_mn_next(23);
+        break;
+    case 23:
+        // Done.
+        if (at_nav_to(500)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(24);
+        }
+        break;
+    case 24:
+        if (editor_rt_is_open()) {
+            if (at_mn_ready(3000)) {
+                at_mn_fail("Done did not close the editor");
+            }
+            break;
+        }
+        at_log("menus: character created, starting the game");
+        at_menus_pregame_done = true;
+        break;
+    }
+}
+
+// Menus mode, in gameplay: the created character, and nothing the last A
+// press did leaked into gameplay.
+static bool step_mn_after_creation(unsigned int elapsed, bool first, bool timedOut)
+{
+    static int interactions;
+    static int attacks;
+    if (first) {
+        interactions = rt_context_get_stats()->interactions;
+        attacks = rt_get_stats()->playerAttacks;
+        return false;
+    }
+    if (elapsed < 2500 && !timedOut) {
+        return false;
+    }
+
+    int tags[NUM_TAGGED_SKILLS];
+    skill_get_tags(tags, NUM_TAGGED_SKILLS);
+    int tagged = 0;
+    for (int skill : at_mn_tags) {
+        for (int index = 0; index < NUM_TAGGED_SKILLS; index++) {
+            if (tags[index] == skill) {
+                tagged++;
+            }
+        }
+    }
+    bool traits = trait_level(at_mn_traits[0]) && trait_level(at_mn_traits[1]);
+    bool character = strcmp(critter_name(obj_dude), "AB") == 0
+        && stat_get_base(obj_dude, STAT_STRENGTH) == at_mn_values[0] + at_mn_values[2]
+        && tagged == 3 && traits;
+    bool noLeak = rt_context_get_stats()->interactions == interactions && rt_get_stats()->playerAttacks == attacks
+        && !rt_pipboy_is_open();
+    at_check(C_MENU_EDITOR_DONE, character && noLeak,
+        "in the game as '%s', ST %d, %d of 3 tags, Kamikaze+Skilled %d; no interaction, attack or Pip-Boy from the last press=%d",
+        critter_name(obj_dude), stat_get_base(obj_dude, STAT_STRENGTH), tagged, traits, noLeak);
+    return true;
+}
+
+// Pause menu -> Preferences: switch and slider with left/right, A turns a
+// switch, B cancels (restores), B closes the menu.
+static bool at_mn_pause_script(unsigned int elapsed)
+{
+    switch (at_mn_phase) {
+    case 0:
+        if (elapsed < 800) {
+            break;
+        }
+        at_mn_flags[0] = options_rt_is_menu_open() && gamepad_get_menu_highlight(NULL);
+        at_screenshot("m6_pause_menu");
+        at_mn_next(1);
+        break;
+    case 1:
+        if (at_nav_to(502)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(2);
+        }
+        break;
+    case 2:
+        if (!options_rt_is_prefs_open() || !at_mn_ready(800)) {
+            break;
+        }
+        at_mn_values[0] = options_rt_debug_pref(0);
+        at_mn_values[1] = options_rt_debug_pref(13);
+        at_mn_next(3);
+        break;
+    case 3:
+        // Game difficulty (the first in the list): one step with the D-pad.
+        if (at_nav_list_to(505, GAMEPAD_BUTTON_DPAD_UP)) {
+            at_press(at_mn_values[0] < 2 ? GAMEPAD_BUTTON_DPAD_RIGHT : GAMEPAD_BUTTON_DPAD_LEFT);
+            at_mn_next(4);
+        }
+        break;
+    case 4:
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_values[2] = options_rt_debug_pref(0);
+        at_mn_flags[1] = at_nav_selected(505) && abs(at_mn_values[2] - at_mn_values[0]) == 1;
+        // A turns it to the next position.
+        at_press(GAMEPAD_BUTTON_A);
+        at_mn_next(5);
+        break;
+    case 5:
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_values[3] = options_rt_debug_pref(0);
+        at_mn_flags[2] = at_mn_values[3] == (at_mn_values[2] + 1) % 3;
+        at_mn_next(6);
+        break;
+    case 6:
+        // Master volume: a slider further down the list, with the left stick.
+        if (at_nav_list_to(505 + 13, GAMEPAD_BUTTON_DPAD_DOWN)) {
+            at_lstick_pulse(at_mn_values[1] < 30000 ? 1.0f : -1.0f, 0.0f);
+            at_mn_next(7);
+        }
+        break;
+    case 7:
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_values[4] = options_rt_debug_pref(13);
+        at_mn_flags[3] = at_mn_values[4] != at_mn_values[1];
+        at_screenshot("m7_preferences");
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(8);
+        break;
+    case 8:
+        if (!at_mn_ready(800)) {
+            break;
+        }
+        at_mn_flags[4] = !options_rt_is_prefs_open() && options_rt_is_menu_open()
+            && options_rt_debug_pref(0) == at_mn_values[0] && options_rt_debug_pref(13) == at_mn_values[1];
+        at_check(C_MENU_PREFS, at_mn_flags[1] && at_mn_flags[2] && at_mn_flags[3] && at_mn_flags[4],
+            "difficulty %d -> %d with the D-pad=%d, A turned it to %d=%d; master volume %d -> %d with the stick=%d; B cancelled (restored %d/%d, back in the menu)=%d",
+            at_mn_values[0], at_mn_values[2], at_mn_flags[1], at_mn_values[3], at_mn_flags[2],
+            at_mn_values[1], at_mn_values[4], at_mn_flags[3], options_rt_debug_pref(0), options_rt_debug_pref(13), at_mn_flags[4]);
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(9);
+        break;
+    case 9:
+        return at_mn_ready(300);
+    }
+    return false;
+}
+
+static bool step_mn_pause(unsigned int elapsed, bool first, bool timedOut)
+{
+    static int pipboyOpens;
+    static int interactions;
+    if (first) {
+        at_release_all();
+        at_mn_next(0);
+        memset(at_mn_flags, 0, sizeof(at_mn_flags));
+        pipboyOpens = rt_pipboy_get_state()->opens;
+        interactions = rt_context_get_stats()->interactions;
+        at_expect_menu(NULL, at_mn_pause_script);
+        at_press(GAMEPAD_BUTTON_START);
+        return false;
+    }
+
+    // The last B closes the menu (the script may not see its own end).
+    if (at_menu_seen && at_mn_phase >= 9 && !options_rt_is_menu_open() && elapsed > 1000) {
+        if (SDL_GetTicks() - at_mn_time < 1500) {
+            return false;
+        }
+        // The B that closed the menu didn't open the Pip-Boy (B in gameplay).
+        bool noLeak = rt_pipboy_get_state()->opens == pipboyOpens && rt_context_get_stats()->interactions == interactions;
+        at_check(C_MENU_PAUSE, at_mn_flags[0] && noLeak,
+            "Start opened the menu with a framed button=%d; B closed it, no Pip-Boy or interaction afterwards=%d", at_mn_flags[0], noLeak);
+        at_menu_expected = false;
+        return true;
+    }
+
+    if (timedOut) {
+        at_check(C_MENU_PAUSE, false, "timed out in phase %d", at_mn_phase);
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+static time_t at_mn_save_since = 0;
+
+// Pause menu -> Save: slot 3 with Up/Down, A; overwrite question answered
+// No with B, then Yes; description typed with the D-pad.
+static bool at_mn_save_script(unsigned int elapsed)
+{
+    switch (at_mn_phase) {
+    case 0:
+        if (elapsed < 800) {
+            break;
+        }
+        if (at_nav_to(500)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(1);
+        }
+        break;
+    case 1:
+        // The save screen takes keys: Up to the first slot, then Down twice.
+        if (!gamepad_is_menu_key_mode() || !at_mn_ready(250)) {
+            break;
+        }
+        if (at_mn_tries < 10) {
+            at_press(GAMEPAD_BUTTON_DPAD_UP);
+        } else if (at_mn_tries < 12) {
+            at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+        } else {
+            at_screenshot("m8_save_screen");
+            at_mn_signature = win_get_nav_signature();
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(2);
+            break;
+        }
+        at_mn_tries++;
+        at_mn_time = SDL_GetTicks();
+        break;
+    case 2:
+        if (!at_mn_ready(1000)) {
+            break;
+        }
+        if (!gamepad_is_menu_key_mode()) {
+            // "Overwrite?": framed buttons; B answers No.
+            at_mn_flags[0] = true;
+            at_mn_flags[1] = gamepad_get_menu_highlight(NULL);
+            at_screenshot("m9_save_overwrite");
+            at_press(GAMEPAD_BUTTON_B);
+            at_mn_next(3);
+        } else {
+            at_mn_next(6);
+        }
+        break;
+    case 3:
+        if (!at_mn_ready(800)) {
+            break;
+        }
+        // Back on the save screen; ask again and take Yes.
+        at_mn_flags[2] = gamepad_is_menu_key_mode() && options_rt_is_menu_open();
+        at_press(GAMEPAD_BUTTON_A);
+        at_mn_next(4);
+        break;
+    case 4:
+        if (!at_mn_ready(800) || gamepad_is_menu_key_mode()) {
+            break;
+        }
+        if (at_nav_to(500)) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(5);
+        }
+        break;
+    case 5:
+        if (at_mn_ready(1000)) {
+            at_mn_next(6);
+        }
+        break;
+    case 6:
+        // The description: clear it, type "A", accept.
+        if (!at_mn_ready(250)) {
+            break;
+        }
+        if (at_mn_tries < 30) {
+            at_press(GAMEPAD_BUTTON_DPAD_LEFT);
+        } else if (at_mn_tries == 30) {
+            at_press(GAMEPAD_BUTTON_DPAD_UP);
+        } else if (at_mn_tries == 31) {
+            at_screenshot("m10_save_description");
+        } else {
+            at_press(GAMEPAD_BUTTON_A);
+            at_mn_next(7);
+            break;
+        }
+        at_mn_tries++;
+        at_mn_time = SDL_GetTicks();
+        break;
+    case 7:
+        return at_mn_ready(2000) || !options_rt_is_menu_open();
+    }
+    return false;
+}
+
+static bool step_mn_save(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        at_mn_next(0);
+        memset(at_mn_flags, 0, sizeof(at_mn_flags));
+        at_mn_save_since = time(NULL) - 1;
+        at_expect_menu(NULL, at_mn_save_script);
+        at_press(GAMEPAD_BUTTON_START);
+        return false;
+    }
+
+    bool closed = at_menu_seen && !options_rt_is_menu_open() && elapsed > 1500;
+    if (closed || timedOut) {
+        bool saved = at_file_recent("data\\SAVEGAME\\SLOT03\\SAVE.DAT", at_mn_save_since);
+        at_check(C_MENU_SAVE, saved && closed,
+            "slot 3 picked with Up/Down and saved with A (overwrite question shown=%d), description typed with the D-pad: SLOT03 written=%d, menus closed=%d",
+            at_mn_flags[0], saved, closed);
+        if (at_mn_flags[0]) {
+            bool confirm = at_mn_flags[1] && at_mn_flags[2];
+            at_check(C_MENU_CONFIRM, confirm, "overwrite question: framed button=%d, B answered No (back on the save screen)=%d", at_mn_flags[1], at_mn_flags[2]);
+        }
+        if (at_menu_seen && options_rt_is_menu_open()) {
+            at_press(GAMEPAD_BUTTON_B);
+        }
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+// Dialogue (main run, on a map with NPCs): the controller picks options.
+static Object* at_dlg_npc = NULL;
+static int at_dlg_tries = 0;
+static Object* at_dlg_tried[8];
+// The talk press is held into the dialogue until then; options chosen before
+// a step; the sub-step of a choice (D-pad, then A).
+static unsigned int at_dlg_hold_until = 0;
+static int at_dlg_choices = 0;
+static int at_dlg_sub = 0;
+
+static bool at_menu_dialogue_script(unsigned int elapsed)
+{
+    switch (at_mn_phase) {
+    case 0: {
+        if (!dialog_active() || elapsed < 1000) {
+            break;
+        }
+        // A was held from the talk press into the dialogue; let go of it.
+        if (at_pad.buttons[GAMEPAD_BUTTON_A]) {
+            if (SDL_GetTicks() >= at_dlg_hold_until) {
+                at_pad.buttons[GAMEPAD_BUTTON_A] = false;
+                at_mn_time = SDL_GetTicks();
+            }
+            break;
+        }
+        if (!at_mn_ready(700)) {
+            break;
+        }
+        // Nothing chose an option, nothing is selected.
+        at_mn_flags[5] = gdialog_rt_choice_count() == at_dlg_choices;
+        int mouseX;
+        int mouseY;
+        mouse_get_position(&mouseX, &mouseY);
+        at_mn_flags[0] = gdialog_rt_option_count() > 0 && gamepad_is_choice_unselected()
+            && !gamepad_get_menu_highlight(&at_mn_rect) && !win_get_nav_button_at(mouseX, mouseY, NULL, NULL);
+        {
+            Rect first = { -1, -1, -1, -1 };
+            Rect second = { -1, -1, -1, -1 };
+            win_find_nav_button(49, &first);
+            win_find_nav_button(50, &second);
+            at_log("dialogue: %d options, option 1 at %d,%d-%d,%d, option 2 at %d,%d-%d,%d, cursor at %d,%d",
+                gdialog_rt_option_count(), first.ulx, first.uly, first.lrx, first.lry, second.ulx, second.uly, second.lrx, second.lry, mouseX, mouseY);
+        }
+        at_screenshot("70_dialogue");
+        at_dlg_choices = gdialog_rt_choice_count();
+        at_press(GAMEPAD_BUTTON_A);
+        at_mn_next(1);
+        break;
+    }
+    case 1:
+        // A with nothing selected does nothing.
+        if (!at_mn_ready(700)) {
+            break;
+        }
+        at_mn_flags[4] = dialog_active() && gdialog_rt_choice_count() == at_dlg_choices && gamepad_is_choice_unselected();
+        at_press(GAMEPAD_BUTTON_B);
+        at_mn_next(2);
+        break;
+    case 2:
+        if (!at_mn_ready(800)) {
+            break;
+        }
+        at_mn_flags[2] = dialog_active();
+        at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+        at_mn_next(3);
+        break;
+    case 3:
+        // The D-pad selects the first option.
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_flags[1] = at_nav_selected(49) && gamepad_get_menu_highlight(&at_mn_rect);
+        if (gdialog_rt_option_count() > 1) {
+            at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+            at_mn_next(4);
+        } else {
+            at_mn_flags[6] = true;
+            at_mn_flags[8] = at_mn_flags[1];
+            at_mn_next(6);
+        }
+        break;
+    case 4: {
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        Rect selected;
+        at_mn_flags[6] = at_nav_selected(50) && gamepad_get_menu_highlight(&selected) && !at_rect_same(selected, at_mn_rect);
+        at_press(GAMEPAD_BUTTON_DPAD_UP);
+        at_mn_next(5);
+        break;
+    }
+    case 5:
+        if (!at_mn_ready(500)) {
+            break;
+        }
+        at_mn_flags[8] = at_nav_selected(49);
+        at_mn_next(6);
+        break;
+    case 6:
+        // Ends the conversation: A on the first option of each reply,
+        // selected with the D-pad (every reply starts with none).
+        if (!dialog_active()) {
+            at_mn_flags[3] = true;
+            if (at_mn_tries <= 1) {
+                at_mn_flags[7] = true;
+            }
+            return true;
+        }
+        if (at_dlg_sub == 0) {
+            if (!at_mn_ready(1300)) {
+                break;
+            }
+            if (at_mn_tries == 1) {
+                // The next reply: nothing selected again.
+                at_mn_flags[7] = gamepad_is_choice_unselected() && !gamepad_get_menu_highlight(&at_mn_rect);
+            }
+            if (at_mn_tries > 0) {
+                at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+            }
+            at_dlg_sub = 1;
+            at_mn_time = SDL_GetTicks();
+            break;
+        }
+        if (!at_mn_ready(400)) {
+            break;
+        }
+        at_press(GAMEPAD_BUTTON_A);
+        at_dlg_sub = 0;
+        at_mn_tries++;
+        at_mn_time = SDL_GetTicks();
+        if (at_mn_tries > 25) {
+            // The conversation never ended: the run can't continue.
+            at_check(C_DIALOGUE_NAV, false, "the conversation did not end after %d choices", at_mn_tries);
+            at_finish();
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_dialogue(unsigned int elapsed, bool first, bool timedOut)
+{
+    static unsigned int talkAt;
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_dlg_npc = NULL;
+        at_dlg_tries = 0;
+        talkAt = 0;
+        memset(at_mn_flags, 0, sizeof(at_mn_flags));
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_DIALOGUE_NAV, false, "timed out (NPC %s, tries %d, in dialogue %d, phase %d)",
+            at_dlg_npc != NULL ? critter_name(at_dlg_npc) : "(none)", at_dlg_tries, dialog_active(), at_mn_phase);
+        at_menu_expected = false;
+        return true;
+    }
+
+    if (at_pad.buttons[GAMEPAD_BUTTON_A] && SDL_GetTicks() >= at_dlg_hold_until && !dialog_active()) {
+        at_pad.buttons[GAMEPAD_BUTTON_A] = false;
+    }
+
+    if (at_dlg_npc == NULL || (talkAt != 0 && SDL_GetTicks() - talkAt > 4000 && !at_menu_seen)) {
+        // The next scripted, calm NPC: stand next to it and press A.
+        if (at_dlg_tries >= 6) {
+            at_check(C_DIALOGUE_NAV, false, "no NPC started a conversation after %d tries", at_dlg_tries);
+            at_menu_expected = false;
+            return true;
+        }
+        int seen = 0;
+        int talkers = 0;
+        Object* best = NULL;
+        // NPCs who talk (A offers Talk), on this elevation first.
+        for (int pass = 0; pass < ELEVATION_COUNT && best == NULL; pass++) {
+            int elevation = (obj_dude->elevation + pass) % ELEVATION_COUNT;
+            for (Object* critter = obj_find_first_at(elevation); critter != NULL; critter = obj_find_next_at()) {
+                if (FID_TYPE(critter->fid) != OBJ_TYPE_CRITTER || critter == obj_dude || critter_is_dead(critter)
+                    || rt_is_hostile(critter) || isPartyMember(critter)) {
+                    continue;
+                }
+                seen++;
+                if (!obj_action_can_talk_to(critter)) {
+                    continue;
+                }
+                talkers++;
+                bool tried = false;
+                for (int index = 0; index < at_dlg_tries && index < 8; index++) {
+                    tried = tried || at_dlg_tried[index] == critter;
+                }
+                if (tried) {
+                    continue;
+                }
+                if (best == NULL || obj_dist(obj_dude, critter) < obj_dist(obj_dude, best)) {
+                    best = critter;
+                }
+            }
+        }
+        if (best != NULL && at_dlg_tries < 8) {
+            at_dlg_tried[at_dlg_tries] = best;
+        }
+        at_dlg_tries++;
+        if (best == NULL) {
+            at_check(C_DIALOGUE_NAV, false, "no NPC left to talk to on %s (%d calm critters, %d who talk, %d tried)", map_data.name, seen, talkers, at_dlg_tries - 1);
+            return true;
+        }
+        int tile = -1;
+        for (int rotation = 0; rotation < ROTATION_COUNT && tile == -1; rotation++) {
+            int candidate = tile_num_in_direction(best->tile, rotation, 1);
+            if (obj_blocking_at(NULL, candidate, best->elevation) == NULL) {
+                tile = candidate;
+            }
+        }
+        if (tile == -1) {
+            at_dlg_npc = best;
+            talkAt = SDL_GetTicks() - 5000;
+            return false;
+        }
+        Rect rect;
+        obj_move_to_tile(obj_dude, tile, best->elevation, &rect);
+        if (map_elevation != best->elevation) {
+            map_set_elevation(best->elevation);
+        }
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        obj_set_rotation(obj_dude, tile_dir(obj_dude->tile, best->tile), &rect);
+        at_dlg_npc = best;
+        at_log("dialogue: trying %s at tile %d", critter_name(best), best->tile);
+        at_mn_next(0);
+        at_expect_menu(NULL, at_menu_dialogue_script);
+        talkAt = 0;
+        return false;
+    }
+
+    if (talkAt == 0) {
+        // A acts on the highlighted object within reach; another NPC is
+        // tried if this one isn't highlighted.
+        if (rt_get_interact_target() == at_dlg_npc) {
+            // A held (not tapped) through the dialogue opening: it must not
+            // choose an option.
+            at_dlg_choices = gdialog_rt_choice_count();
+            at_dlg_hold_until = SDL_GetTicks() + 1800;
+            at_dlg_sub = 0;
+            at_pad.buttons[GAMEPAD_BUTTON_A] = true;
+            talkAt = SDL_GetTicks();
+        } else if (SDL_GetTicks() - at_mn_time > 6000) {
+            talkAt = SDL_GetTicks() - 5000;
+        } else if (SDL_GetTicks() - at_mn_time > 600 && rt_get_interact_candidate_count() > 1
+            && SDL_GetTicks() - at_nav_last > 400 && at_mn_tries < 8) {
+            // Left/Right step through what is within reach.
+            at_press(GAMEPAD_BUTTON_DPAD_RIGHT);
+            at_nav_last = SDL_GetTicks();
+            at_mn_tries++;
+        }
+        return false;
+    }
+
+    if (at_menu_done || (at_menu_seen && !dialog_active() && at_mn_phase >= 6)) {
+        // The last A may end the conversation before the script sees it.
+        if (at_mn_phase >= 6 && at_mn_tries >= 1 && !dialog_active()) {
+            at_mn_flags[3] = true;
+            if (at_mn_tries == 1) {
+                at_mn_flags[7] = true;
+            }
+        }
+        at_check(C_DIALOGUE_NO_PRESELECT, at_mn_flags[0] && at_mn_flags[4] && at_mn_flags[5] && at_mn_flags[7],
+            "%s: opened with nothing selected (no frame, cursor off the options)=%d; A held from the talk press chose nothing=%d; A with nothing selected chose nothing=%d; the next reply started with nothing selected=%d",
+            critter_name(at_dlg_npc), at_mn_flags[0], at_mn_flags[5], at_mn_flags[4], at_mn_flags[7]);
+        at_check(C_DIALOGUE_NAV, at_mn_flags[1] && at_mn_flags[6] && at_mn_flags[8] && at_mn_flags[2] && at_mn_flags[3],
+            "%s: the D-pad selected the first option=%d, moved the frame=%d, back on the first option=%d, B kept the conversation=%d, D-pad + A on options ended it=%d",
+            critter_name(at_dlg_npc), at_mn_flags[1], at_mn_flags[6], at_mn_flags[8], at_mn_flags[2], at_mn_flags[3]);
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+// -----------------------------------------------------------------------------
+// Replaced traits
+// -----------------------------------------------------------------------------
+
+static int at_tr_saved[2] = { -1, -1 };
+static int at_tr_saved_endurance = -1;
+static int at_tr_saved_ac_bonus = 0;
+static int at_tr_saved_crit_bonus = 0;
+static Object* at_tr_own_armor = NULL;
+static Object* at_tr_armor = NULL;
+
+static void at_tr_set(int trait1, int trait2)
+{
+    trait_set(trait1, trait2);
+    stat_recalc_derived(obj_dude);
+}
+
+static int at_tr_endurance_raw()
+{
+    Proto* proto;
+    proto_ptr(obj_dude->pid, &proto);
+    return proto->critter.data.baseStats[STAT_ENDURANCE];
+}
+
+static void at_tr_set_endurance_raw(int value)
+{
+    Proto* proto;
+    proto_ptr(obj_dude->pid, &proto);
+    proto->critter.data.baseStats[STAT_ENDURANCE] = value;
+    stat_recalc_derived(obj_dude);
+}
+
+// Armor `pid` on the player the way the inventory puts it on (its AC, DT and
+// DR go into the bonus stats), replacing the test armor; -1 takes it off.
+static Object* at_tr_wear(int pid)
+{
+    Rect rect;
+    if (at_tr_armor != NULL) {
+        adjust_ac(obj_dude, at_tr_armor, NULL);
+        at_tr_armor->flags &= ~OBJECT_WORN;
+        item_remove_mult(obj_dude, at_tr_armor, 1);
+        obj_erase_object(at_tr_armor, &rect);
+        at_tr_armor = NULL;
+    }
+    if (pid == -1) {
+        return NULL;
+    }
+
+    Object* armor;
+    if (obj_pid_new(&armor, pid) == -1) {
+        return NULL;
+    }
+    if (item_add_force(obj_dude, armor, 1) != 0) {
+        obj_erase_object(armor, &rect);
+        return NULL;
+    }
+    obj_disconnect(armor, &rect);
+    armor->flags |= OBJECT_WORN;
+    adjust_ac(obj_dude, NULL, armor);
+    at_tr_armor = armor;
+    return armor;
+}
+
+// Saves the traits and what the trait tests change; the player's own armor
+// comes off for the test.
+static void at_tr_begin()
+{
+    trait_get(&at_tr_saved[0], &at_tr_saved[1]);
+    at_tr_saved_endurance = at_tr_endurance_raw();
+    at_tr_saved_ac_bonus = stat_get_bonus(obj_dude, STAT_ARMOR_CLASS);
+    at_tr_saved_crit_bonus = stat_get_bonus(obj_dude, STAT_CRITICAL_CHANCE);
+    at_tr_own_armor = inven_worn(obj_dude);
+    if (at_tr_own_armor != NULL) {
+        adjust_ac(obj_dude, at_tr_own_armor, NULL);
+        at_tr_own_armor->flags &= ~OBJECT_WORN;
+    }
+}
+
+static void at_tr_end()
+{
+    at_tr_wear(-1);
+    if (at_tr_own_armor != NULL) {
+        at_tr_own_armor->flags |= OBJECT_WORN;
+        adjust_ac(obj_dude, NULL, at_tr_own_armor);
+        at_tr_own_armor = NULL;
+    }
+    stat_set_bonus(obj_dude, STAT_ARMOR_CLASS, at_tr_saved_ac_bonus);
+    stat_set_bonus(obj_dude, STAT_CRITICAL_CHANCE, at_tr_saved_crit_bonus);
+    at_tr_set_endurance_raw(at_tr_saved_endurance);
+    at_tr_set(at_tr_saved[0], at_tr_saved[1]);
+    rt_debug_set_ai_paused(false);
+}
+
+static bool step_traits_kamikaze(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        at_clear_hostiles();
+        at_tr_begin();
+
+        // Armor class and the other derived values, without and with
+        // Kamikaze, for several armors, Endurance values and AC bonuses.
+        static const char* armorNames[] = { "Leather Jacket", "Leather Armor", "Metal Armor", "Combat Armor", "Power Armor" };
+        int cases = 0;
+        int failures = 0;
+        char detail[220] = "";
+        bool derivedOk = true;
+        // AC bonuses the player has besides armor (perks, drugs).
+        int baseBonus = stat_get_bonus(obj_dude, STAT_ARMOR_CLASS);
+        for (int endurance : { 3, 8 }) {
+            for (int extra : { 0, 7 }) {
+                for (int armorIndex = -1; armorIndex < (int)(sizeof(armorNames) / sizeof(armorNames[0])); armorIndex++) {
+                    int pid = armorIndex == -1 ? -1 : at_item_pid_by_name(armorNames[armorIndex]);
+                    if (armorIndex != -1 && pid == -1) {
+                        continue;
+                    }
+                    at_tr_set(-1, -1);
+                    at_tr_set_endurance_raw(endurance);
+                    Object* armor = at_tr_wear(pid);
+                    int armorAc = item_ar_ac(armor);
+                    stat_set_bonus(obj_dude, STAT_ARMOR_CLASS, stat_get_bonus(obj_dude, STAT_ARMOR_CLASS) + extra);
+
+                    int plainAc = stat_level(obj_dude, STAT_ARMOR_CLASS);
+                    int plainSequence = stat_level(obj_dude, STAT_SEQUENCE);
+                    int plainDt[DAMAGE_TYPE_COUNT];
+                    int plainDr[DAMAGE_TYPE_COUNT];
+                    for (int type = 0; type < DAMAGE_TYPE_COUNT; type++) {
+                        plainDt[type] = stat_level(obj_dude, STAT_DAMAGE_THRESHOLD + type);
+                        plainDr[type] = stat_level(obj_dude, STAT_DAMAGE_RESISTANCE + type);
+                    }
+
+                    at_tr_set(TRAIT_KAMIKAZE, -1);
+                    int kamikazeAc = stat_level(obj_dude, STAT_ARMOR_CLASS);
+                    for (int type = 0; type < DAMAGE_TYPE_COUNT; type++) {
+                        if (stat_level(obj_dude, STAT_DAMAGE_THRESHOLD + type) != plainDt[type]
+                            || stat_level(obj_dude, STAT_DAMAGE_RESISTANCE + type) != plainDr[type]) {
+                            derivedOk = false;
+                        }
+                    }
+                    if (stat_level(obj_dude, STAT_SEQUENCE) != plainSequence) {
+                        derivedOk = false;
+                    }
+
+                    int expectedPlain = endurance + baseBonus + extra + armorAc;
+                    // Kamikaze: no natural (Endurance) AC; worn armor counts half.
+                    int expectedKamikaze = std::max(0, baseBonus + extra + armorAc / 2);
+                    cases++;
+                    if (plainAc != expectedPlain || kamikazeAc != expectedKamikaze) {
+                        failures++;
+                        if (detail[0] == '\0') {
+                            snprintf(detail, sizeof(detail), "; first mismatch: EN %d, +%d, armor AC %d: %d/%d (expected %d/%d)",
+                                endurance, extra, armorAc, plainAc, kamikazeAc, expectedPlain, expectedKamikaze);
+                        }
+                    }
+                    if (endurance == 8 && extra == 7 && armorIndex == 1) {
+                        snprintf(at_mn_note, sizeof(at_mn_note), "EN 8, +7 bonus, %s (AC %d): %d without, %d with Kamikaze",
+                            armorNames[armorIndex], armorAc, plainAc, kamikazeAc);
+                    }
+                    stat_set_bonus(obj_dude, STAT_ARMOR_CLASS, stat_get_bonus(obj_dude, STAT_ARMOR_CLASS) - extra);
+                    at_tr_wear(-1);
+                }
+            }
+        }
+        at_check(C_KAMIKAZE_AC, cases >= 12 && failures == 0 && derivedOk,
+            "%d cases, %d mismatches (without: EN + bonuses + armor AC; Kamikaze: no EN part, bonuses + floor(armor AC / 2)); DT, DR and Sequence unchanged=%d; %s%s",
+            cases, failures, derivedOk, at_mn_note, detail);
+        at_tr_set_endurance_raw(at_tr_saved_endurance);
+
+        // Maximum AP; current AP isn't topped up by recalculating.
+        at_tr_set(-1, -1);
+        at_vw_values[0] = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+        rt_debug_set_ap(2.0f);
+        at_tr_set(TRAIT_KAMIKAZE, -1);
+        for (int index = 0; index < 3; index++) {
+            stat_recalc_derived(obj_dude);
+            at_tr_set(TRAIT_KAMIKAZE, -1);
+        }
+        at_vw_values[1] = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_KAMIKAZE_AP, false, "timed out in phase %d", at_vw_phase);
+        at_tr_end();
+        return true;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0:
+        // A frame later: only regeneration added anything.
+        if (since < 50) {
+            break;
+        }
+        at_vw_floats[0] = rt_get_dude_ap();
+        // Regenerates past the old maximum, up to the new one.
+        rt_debug_set_ap((float)at_vw_values[0] - 0.4f);
+        at_vw_next(elapsed);
+        break;
+    case 1: {
+        if (since < 200) {
+            break;
+        }
+        float ap = rt_get_dude_ap();
+        if (ap < (float)at_vw_values[1] && since < 15000) {
+            break;
+        }
+        at_vw_floats[1] = ap;
+        at_vw_values[2] = obj_dude->data.critter.combat.ap;
+        at_screenshot("71_kamikaze_ap");
+        bool maxOk = at_vw_values[1] == at_vw_values[0] + 10;
+        bool notGranted = at_vw_floats[0] < 2.5f;
+        bool regenerated = at_vw_floats[1] >= (float)at_vw_values[1] && at_vw_values[2] == at_vw_values[1];
+        at_check(C_KAMIKAZE_AP, maxOk && notGranted && regenerated,
+            "maximum AP %d -> %d (+10=%d); AP 2 stayed %.2f after 4 recalculations (not topped up=%d); regenerated to %.2f, HUD value %d (=%d)",
+            at_vw_values[0], at_vw_values[1], maxOk, at_vw_floats[0], notGranted, at_vw_floats[1], at_vw_values[2], regenerated);
+        at_tr_end();
+        rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+        return true;
+    }
+    }
+    return false;
+}
+
+// A rotation with the two hexes ahead free and in the line of fire, and the
+// hexes beside the front arc free (the trait tests' attacks), or -1. The
+// player is moved to clear spots until one is found.
+static int at_tr_open_rotation()
+{
+    at_move_to_clear_spot();
+    for (int distance = 0; distance <= 10; distance++) {
+        for (int side = 0; side < ROTATION_COUNT; side++) {
+            int corner = distance == 0 ? obj_dude->tile : tile_num_in_direction(obj_dude->tile, side, distance);
+            int steps = distance == 0 ? 1 : distance;
+            for (int step = 0; step < steps && corner != -1; step++) {
+                int tile = distance == 0 ? corner : tile_num_in_direction(corner, (side + 2) % ROTATION_COUNT, step);
+                if (tile == -1 || (tile != obj_dude->tile && !at_tile_free(tile))) {
+                    continue;
+                }
+                for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+                    int ahead = tile_num_in_direction(tile, rotation, 1);
+                    int further = tile_num_in_direction(tile, rotation, 2);
+                    if (at_tile_free(ahead) && at_tile_free(further)
+                        && !combat_is_shot_blocked(obj_dude, tile, further, NULL, NULL)) {
+                        if (tile != obj_dude->tile) {
+                            Rect rect;
+                            obj_move_to_tile(obj_dude, tile, obj_dude->elevation, &rect);
+                            tile_set_center(tile, TILE_SET_CENTER_REFRESH_WINDOW);
+                            at_log("harness: player moved %d tiles to open ground", distance);
+                        }
+                        return rotation;
+                    }
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+// Attack rate: RT every 120 ms (a press during the cooldown is buffered,
+// so each attack starts as soon as it may) and the intervals between the
+// player's attack starts.
+// The intervals measured (the median is used: a miss and a hit cause
+// reactions of different lengths).
+static int at_tr_intervals[64];
+
+static void at_tr_rate_begin()
+{
+    at_vw_values[10] = 0;
+    at_vw_values[11] = 0;
+    at_vw_values[12] = (int)rt_get_stats()->lastPlayerAttackAt;
+    at_vw_values[13] = 0;
+    at_vw_values[14] = 0;
+}
+
+static void at_tr_rate_tick(unsigned int since)
+{
+    const RtStats* stats = rt_get_stats();
+    if ((int)stats->lastPlayerAttackAt != at_vw_values[12]) {
+        // The first attack's interval reaches back before the measurement.
+        if (at_vw_values[13] > 0) {
+            at_vw_values[10] += (int)stats->lastPlayerAttackInterval;
+            if (at_vw_values[11] < 64) {
+                at_tr_intervals[at_vw_values[11]] = (int)stats->lastPlayerAttackInterval;
+            }
+            at_vw_values[11]++;
+        }
+        at_vw_values[13]++;
+        at_vw_values[12] = (int)stats->lastPlayerAttackAt;
+    }
+    if (since - (unsigned int)at_vw_values[14] >= 120) {
+        at_vw_values[14] = (int)since;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+    }
+}
+
+static float at_tr_rate_average()
+{
+    int count = std::min(at_vw_values[11], 64);
+    if (count == 0) {
+        return 0.0f;
+    }
+    std::vector<int> sorted(at_tr_intervals, at_tr_intervals + count);
+    std::sort(sorted.begin(), sorted.end());
+    return count % 2 == 1 ? (float)sorted[count / 2] : (sorted[count / 2 - 1] + sorted[count / 2]) / 2.0f;
+}
+
+// Fast Shot measurements: [plain, fast] average interval per case.
+static float at_fs_avg[3][2];
+static Object* at_fs_target = NULL;
+static int at_fs_mismatches = 0;
+static Object* at_fs_knife = NULL;
+// The target's maximum hit point bonus before the test (it is shared by every
+// critter of its kind).
+static int at_fs_hp_bonus = INT_MIN;
+
+// The knife the Fast Shot test swings (always the same animation, where
+// unarmed attacks are sometimes kicks); NULL removes it.
+static Object* at_fs_set_knife(bool present)
+{
+    if (!present) {
+        if (at_fs_knife != NULL && obj_top_environment(at_fs_knife) == obj_dude) {
+            at_unarmed();
+            item_remove_mult(obj_dude, at_fs_knife, 1);
+            Rect rect;
+            obj_erase_object(at_fs_knife, &rect);
+        }
+        at_fs_knife = NULL;
+        return NULL;
+    }
+    if (at_fs_knife == NULL) {
+        int pid = at_item_pid_by_name("Knife");
+        Object* knife;
+        if (pid != -1 && obj_pid_new(&knife, pid) != -1) {
+            Rect rect;
+            if (item_add_force(obj_dude, knife, 1) == 0) {
+                obj_disconnect(knife, &rect);
+                at_fs_knife = knife;
+            } else {
+                obj_erase_object(knife, &rect);
+            }
+        }
+    }
+    return at_fs_knife;
+}
+
+// The target keeps plenty of hit points (refilled only between hits, so
+// each hit's damage is still checked).
+// Erases the target and gives its kind back its maximum hit points.
+static void at_fs_drop_target()
+{
+    if (at_fs_target != NULL) {
+        if (at_fs_hp_bonus != INT_MIN) {
+            stat_set_bonus(at_fs_target, STAT_MAXIMUM_HIT_POINTS, at_fs_hp_bonus);
+        }
+        at_erase(at_fs_target);
+        at_fs_target = NULL;
+    }
+    at_fs_hp_bonus = INT_MIN;
+}
+
+static void at_fs_keep_target()
+{
+    if (at_fs_target != NULL && at_fs_hp_bonus == INT_MIN) {
+        // Within its maximum, or damage would clamp to it.
+        at_fs_hp_bonus = stat_get_bonus(at_fs_target, STAT_MAXIMUM_HIT_POINTS);
+        stat_set_bonus(at_fs_target, STAT_MAXIMUM_HIT_POINTS, 5000);
+    }
+    if (at_fs_target != NULL && rt_get_pending_count() == 0 && critter_get_hits(at_fs_target) < 2000) {
+        at_fs_target->data.critter.hp = 5000;
+    }
+    if (at_fs_target != NULL && rt_get_lock() != at_fs_target) {
+        rt_debug_set_lock(at_fs_target);
+    }
+}
+
+static bool step_traits_fast_shot(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    // Melee costs AP now; the AP is kept full so the attack rate rule itself
+    // is measured (not the AP regeneration).
+    rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_tr_begin();
+        at_unarmed();
+        at_fs_target = NULL;
+        memset(at_fs_avg, 0, sizeof(at_fs_avg));
+        at_fs_mismatches = stats->damageMismatches;
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_FAST_RATE, false, "timed out in phase %d", at_vw_phase);
+        rt_debug_set_lock(NULL);
+        at_fs_drop_target();
+        at_release_test_pistol();
+        at_fs_set_knife(false);
+        at_tr_end();
+        return true;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 400 || anim_busy(obj_dude) || !at_wield(at_fs_set_knife(true))) {
+            break;
+        }
+        at_vw_home();
+        at_move_to_clear_spot();
+        at_clear_rats_near(6);
+        at_vw_values[0] = at_tr_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_check(C_FAST_RATE, false, "no open hexes around the player");
+            at_tr_end();
+            return true;
+        }
+        at_vw_face(at_vw_values[0]);
+        at_tr_set(-1, -1);
+        at_tr_rate_begin();
+        at_vw_next(elapsed);
+        break;
+    case 1:
+    case 2:
+        // Knife swings at the air: without, then with Fast Shot.
+        at_vw_face(at_vw_values[0]);
+        at_tr_rate_tick(since);
+        if (since < 10000) {
+            break;
+        }
+        at_fs_avg[0][at_vw_phase - 1] = at_tr_rate_average();
+        at_log("fast shot: swings %s Fast Shot: %d intervals, median %.0f ms", at_vw_phase == 1 ? "without" : "with", at_vw_values[11], at_tr_rate_average());
+        at_tr_set(at_vw_phase == 1 ? TRAIT_FAST_SHOT : -1, -1);
+        at_tr_rate_begin();
+        if (at_vw_phase == 2) {
+            // A calm target ahead with plenty of hit points, locked.
+            at_fs_target = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, at_vw_values[0], 1), false);
+            if (at_fs_target != NULL) {
+                at_fs_keep_target();
+            }
+        }
+        at_vw_next(elapsed);
+        break;
+    case 3:
+    case 4:
+        // Knife attacks on the target: the next one waits for its reaction too.
+        if (at_fs_target == NULL) {
+            at_check(C_FAST_RATE, false, "no target");
+            at_fs_set_knife(false);
+            at_tr_end();
+            return true;
+        }
+        at_fs_keep_target();
+        at_tr_rate_tick(since);
+        if (since < 10000) {
+            break;
+        }
+        at_fs_avg[1][at_vw_phase - 3] = at_tr_rate_average();
+        at_log("fast shot: knife on the target %s Fast Shot: %d intervals, median %.0f ms", at_vw_phase == 3 ? "without" : "with", at_vw_values[11], at_tr_rate_average());
+        at_tr_set(at_vw_phase == 3 ? TRAIT_FAST_SHOT : -1, -1);
+        at_tr_rate_begin();
+        if (at_vw_phase == 4) {
+            at_fs_set_knife(false);
+            at_wield(at_test_pistol());
+        }
+        at_vw_next(elapsed);
+        break;
+    case 5: {
+        // The pistol: AP cost and aiming without and with Fast Shot.
+        Object* pistol = at_test_pistol();
+        if (since < 600 || anim_busy(obj_dude) || !at_wield(pistol)) {
+            break;
+        }
+        int hitMode = HIT_MODE_RIGHT_WEAPON_PRIMARY;
+        if (!intface_is_item_right_hand()) {
+            hitMode = HIT_MODE_LEFT_WEAPON_PRIMARY;
+        }
+        at_tr_set(-1, -1);
+        at_vw_values[1] = item_w_mp_cost(obj_dude, hitMode, false);
+        at_vw_values[2] = item_w_called_shot(obj_dude, hitMode);
+        at_tr_set(TRAIT_FAST_SHOT, -1);
+        at_vw_values[3] = item_w_mp_cost(obj_dude, hitMode, false);
+        at_vw_values[4] = item_w_called_shot(obj_dude, hitMode);
+        at_vw_values[5] = rt_aimed_get_state()->opens;
+        at_vw_values[6] = rt_aimed_get_state()->refusals;
+        // LB: refused with a reason.
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        if (since < 600) {
+            break;
+        }
+        at_vw_flags[0] = rt_aimed_get_state()->opens == at_vw_values[5] && rt_aimed_get_state()->refusals == at_vw_values[6] + 1
+            && !rt_aimed_get_state()->selecting;
+        // LT: an ordinary lock still works.
+        rt_debug_set_lock(NULL);
+        at_press(GAMEPAD_BUTTON_LEFT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        if (since < 500) {
+            break;
+        }
+        at_vw_flags[1] = rt_get_lock() == at_fs_target && at_fs_target != NULL;
+        at_check(C_FAST_RULES, at_vw_values[1] == at_vw_values[3] && at_vw_values[2] != 0 && at_vw_values[4] == 0 && at_vw_flags[0] && at_vw_flags[1],
+            "pistol AP cost %d without, %d with Fast Shot (no reduction); aimed shots allowed %d -> %d; LB refused (no window)=%d; LT locked the target=%d",
+            at_vw_values[1], at_vw_values[3], at_vw_values[2], at_vw_values[4], at_vw_flags[0], at_vw_flags[1]);
+        rt_debug_set_lock(at_fs_target);
+        at_tr_set(-1, -1);
+        at_tr_rate_begin();
+        at_vw_next(elapsed);
+        break;
+    case 8:
+    case 9:
+        // Pistol shots on the target.
+        if (at_fs_target == NULL) {
+            at_check(C_FAST_RATE, false, "no target for the pistol");
+            at_tr_end();
+            return true;
+        }
+        at_fs_keep_target();
+        {
+            // The magazine stays full (no reloads in the measurement).
+            Object* pistol = at_test_pistol();
+            if (pistol != NULL && item_w_curr_ammo(pistol) < 3) {
+                item_w_set_curr_ammo(pistol, item_w_max_ammo(pistol));
+            }
+        }
+        at_tr_rate_tick(since);
+        if (since < 10000) {
+            break;
+        }
+        at_fs_avg[2][at_vw_phase - 8] = at_tr_rate_average();
+        at_log("fast shot: pistol %s Fast Shot: %d intervals, median %.0f ms", at_vw_phase == 8 ? "without" : "with", at_vw_values[11], at_tr_rate_average());
+        if (at_vw_phase == 8) {
+            at_tr_set(TRAIT_FAST_SHOT, -1);
+            at_tr_rate_begin();
+            at_vw_next(elapsed);
+            break;
+        }
+        at_vw_values[7] = stats->playerAttacks;
+        at_vw_values[8] = stats->freeSwings;
+        at_vw_next(elapsed);
+        break;
+    case 10:
+        // One press, one shot (a single-fire pistol doesn't repeat).
+        if (since < 1500 || rt_aim_player_in_attack()) {
+            break;
+        }
+        at_vw_values[7] = stats->playerAttacks;
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+        at_vw_next(elapsed);
+        break;
+    case 11: {
+        if (since < 2500) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        int heldShots = stats->playerAttacks - at_vw_values[7];
+
+        float ratios[3];
+        bool rateOk = true;
+        char line[200] = "";
+        static const char* names[3] = { "knife swing", "knife on a target", "pistol" };
+        for (int index = 0; index < 3; index++) {
+            ratios[index] = at_fs_avg[index][1] > 0.0f ? at_fs_avg[index][0] / at_fs_avg[index][1] : 0.0f;
+            if (ratios[index] < 1.15f || ratios[index] > 1.35f) {
+                rateOk = false;
+            }
+            char part[64];
+            snprintf(part, sizeof(part), "%s%s %.0f -> %.0f ms (x%.2f)", index > 0 ? ", " : "", names[index], at_fs_avg[index][0], at_fs_avg[index][1], ratios[index]);
+            SDL_strlcat(line, part, sizeof(line));
+        }
+        at_check(C_FAST_RATE, rateOk, "%s; expected x1.25 (1.15-1.35)", line);
+
+        // The frame time of each kind of animation.
+        bool framesOk = true;
+        static const int attackAnims[] = { ANIM_THROW_PUNCH, ANIM_KICK_LEG, ANIM_THROW_ANIM, ANIM_THRUST_ANIM, ANIM_SWING_ANIM, ANIM_FIRE_SINGLE, ANIM_FIRE_BURST, ANIM_FIRE_CONTINUOUS };
+        static const int otherAnims[] = { ANIM_WALK, ANIM_RUNNING, ANIM_TAKE_OUT, ANIM_PUT_AWAY, ANIM_FALL_BACK, ANIM_MAGIC_HANDS_MIDDLE };
+        for (int anim : attackAnims) {
+            framesOk = framesOk && rt_anim_frame_time(obj_dude, anim, 100) == 80;
+        }
+        for (int anim : otherAnims) {
+            framesOk = framesOk && rt_anim_frame_time(obj_dude, anim, 100) == 100;
+        }
+        bool once = stats->damageMismatches == at_fs_mismatches;
+        at_check(C_FAST_SYNC, heldShots == 1 && framesOk && once,
+            "RT held 2.5 s with the pistol: %d shot(s) (expected 1); attack frames 100 -> 80 ms, walk/run/draw/holster/death/use unchanged=%d; damage applied once (mismatches +%d)",
+            heldShots, framesOk, stats->damageMismatches - at_fs_mismatches);
+
+        rt_debug_set_lock(NULL);
+        at_fs_drop_target();
+        at_release_test_pistol();
+        at_tr_end();
+        return true;
+    }
+    }
+    return false;
+}
+
+// Bloody Mess: a humanoid with gory death art.
+static int at_bm_pid = -1;
+static int at_bm_armor_pid = -1;
+static int at_bm_spare_pid = -1;
+static int at_bm_loot_pid = -1;
+static Object* at_bm_victim = NULL;
+static int at_bm_case = 0;
+static bool at_bm_results[6];
+static char at_bm_notes[6][120];
+
+static int at_bm_find_pid()
+{
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        Object* critter;
+        if (pid == obj_dude->pid || proto_ptr(pid, &proto) == -1 || obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+        bool usable = critter_body_type(critter) == BODY_TYPE_BIPED
+            && critter->data.inventory.length == 0
+            && art_exists(art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_BIG_HOLE, 0, 1))
+            && art_exists(art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, ANIM_FALL_BACK, 0, 1));
+        Rect rect;
+        obj_erase_object(critter, &rect);
+        if (usable) {
+            return pid;
+        }
+    }
+    return -1;
+}
+
+static void at_bm_give(Object* critter, int pid, bool worn)
+{
+    Object* item;
+    if (pid == -1 || obj_pid_new(&item, pid) == -1) {
+        return;
+    }
+    Rect rect;
+    if (item_add_force(critter, item, 1) != 0) {
+        obj_erase_object(item, &rect);
+        return;
+    }
+    obj_disconnect(item, &rect);
+    if (worn) {
+        item->flags |= OBJECT_WORN;
+    }
+}
+
+// Case setup: 0 Bloody Mess + critical (gory), 1 no critical, 2 minimal
+// violence (plain fall), 3 without the trait, 4 a creature (natural armor).
+static void at_bm_setup(int index)
+{
+    bool bloodyMess = index != 3;
+    bool critical = index != 1;
+    at_tr_set(bloodyMess ? TRAIT_BLOODY_MESS : -1, -1);
+    stat_set_bonus(obj_dude, STAT_CRITICAL_CHANCE, at_tr_saved_crit_bonus + (critical ? 100 : -200));
+    config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY,
+        index == 2 ? VIOLENCE_LEVEL_MINIMAL : VIOLENCE_LEVEL_MAXIMUM_BLOOD);
+
+    int tile = tile_num_in_direction(obj_dude->tile, at_vw_values[0], 1);
+    if (index == 4) {
+        at_bm_victim = at_spawn_rat_at(tile, false);
+    } else {
+        Object* critter = NULL;
+        if (obj_pid_new(&critter, at_bm_pid) != -1) {
+            if (critter->sid != -1) {
+                scr_remove(critter->sid);
+                critter->sid = -1;
+            }
+            Rect rect;
+            obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+            tile_refresh_rect(&rect, obj_dude->elevation);
+            critter->data.critter.combat.team = at_rat_team;
+            at_bm_give(critter, at_bm_armor_pid, true);
+            at_bm_give(critter, at_bm_spare_pid, false);
+            at_bm_give(critter, at_bm_loot_pid, false);
+        }
+        at_bm_victim = critter;
+    }
+    if (at_bm_victim != NULL) {
+        at_bm_victim->data.critter.hp = 1;
+        rt_debug_set_lock(at_bm_victim);
+    }
+    at_vw_values[1] = rt_get_stats()->armorDestroyed;
+    at_vw_values[2] = rt_get_stats()->goryDeathsNoted;
+    at_vw_values[3] = 0;
+}
+
+static void at_bm_evaluate(int index)
+{
+    Object* victim = at_bm_victim;
+    const RtStats* stats = rt_get_stats();
+    int destroyed = stats->armorDestroyed - at_vw_values[1];
+    int gory = stats->goryDeathsNoted - at_vw_values[2];
+    bool dead = victim != NULL && critter_is_dead(victim);
+    if (index == 4) {
+        at_bm_results[index] = dead && destroyed == 0;
+        snprintf(at_bm_notes[index], sizeof(at_bm_notes[index]), "creature: dead %d, gory %d, nothing destroyed=%d", dead, gory, destroyed == 0);
+        return;
+    }
+
+    Object* worn = victim != NULL ? inven_worn(victim) : NULL;
+    int armors = victim != NULL ? at_count_pid_in(victim, at_bm_armor_pid) : 0;
+    int spares = victim != NULL ? at_count_pid_in(victim, at_bm_spare_pid) : 0;
+    int loot = victim != NULL ? at_count_pid_in(victim, at_bm_loot_pid) : 0;
+    int expectedSpares = at_bm_spare_pid == at_bm_armor_pid ? 1 : 1;
+    if (index == 0) {
+        // The worn armor is gone; the spare one and the loot are there.
+        int remainingArmor = at_bm_spare_pid == at_bm_armor_pid ? armors : armors + 1;
+        at_bm_results[index] = dead && gory == 1 && destroyed == 1 && worn == NULL && remainingArmor == 1 && spares >= expectedSpares && loot == 1;
+        snprintf(at_bm_notes[index], sizeof(at_bm_notes[index]), "gory critical kill: dead %d, gory %d, destroyed %d, still worn %d, spare %d, loot %d",
+            dead, gory, destroyed, worn != NULL, spares, loot);
+    } else {
+        at_bm_results[index] = dead && destroyed == 0 && worn != NULL && loot == 1;
+        static const char* names[] = { "", "non-critical", "minimal violence", "no trait" };
+        snprintf(at_bm_notes[index], sizeof(at_bm_notes[index]), "%s kill: dead %d, gory %d, destroyed %d, armor still worn %d, loot %d",
+            names[index], dead, gory, destroyed, worn != NULL, loot);
+    }
+}
+
+static bool step_traits_bloody_mess(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        at_clear_hostiles();
+        rt_debug_set_lock(NULL);
+        at_tr_begin();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        at_bm_case = 0;
+        at_bm_victim = NULL;
+        memset(at_bm_results, 0, sizeof(at_bm_results));
+        memset(at_bm_notes, 0, sizeof(at_bm_notes));
+        config_get_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY, &(at_vw_values[9]));
+        // The original rolls no critical hits on the first day (see
+        // `roll_check_critical`).
+        at_vw_values[8] = game_time();
+        if (game_time() < GAME_TIME_TICKS_PER_DAY + 10) {
+            set_game_time(game_time() + GAME_TIME_TICKS_PER_DAY);
+        }
+
+        // Critical chance.
+        at_tr_set(-1, -1);
+        int plain = stat_level(obj_dude, STAT_CRITICAL_CHANCE);
+        at_tr_set(TRAIT_BLOODY_MESS, -1);
+        int bloody = stat_level(obj_dude, STAT_CRITICAL_CHANCE);
+        stat_set_bonus(obj_dude, STAT_CRITICAL_CHANCE, at_tr_saved_crit_bonus + 99);
+        int capped = stat_level(obj_dude, STAT_CRITICAL_CHANCE);
+        stat_set_bonus(obj_dude, STAT_CRITICAL_CHANCE, at_tr_saved_crit_bonus);
+        at_check(C_BLOODY_CRIT, bloody == plain + 3 && capped == 100,
+            "critical chance %d%% without, %d%% with Bloody Mess; with +99 more: %d%% (cap 100)", plain, bloody, capped);
+
+        at_bm_pid = at_bm_find_pid();
+        at_bm_armor_pid = at_item_pid_by_name("Leather Armor");
+        at_bm_spare_pid = at_item_pid_by_name("Leather Jacket");
+        at_bm_loot_pid = at_item_pid_by_name("Stimpak");
+        if (at_bm_pid == -1 || at_bm_armor_pid == -1 || at_bm_spare_pid == -1 || at_bm_loot_pid == -1) {
+            at_check(C_BLOODY_ARMOR, false, "fixtures missing (humanoid %d, armor %d, spare %d, loot %d)",
+                at_bm_pid, at_bm_armor_pid, at_bm_spare_pid, at_bm_loot_pid);
+            at_tr_end();
+            return true;
+        }
+        at_log("harness: Bloody Mess victims are %s", proto_name(at_bm_pid));
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_BLOODY_ARMOR, false, "timed out in case %d phase %d", at_bm_case, at_vw_phase);
+        set_game_time(at_vw_values[8]);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY, at_vw_values[9]);
+        rt_debug_set_lock(NULL);
+        at_tr_end();
+        return true;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 400 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_vw_home();
+        at_move_to_clear_spot();
+        at_clear_rats_near(6);
+        at_vw_values[0] = at_tr_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_check(C_BLOODY_ARMOR, false, "no open hexes around the player");
+            at_tr_end();
+            return true;
+        }
+        at_vw_face(at_vw_values[0]);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // Next case: a victim ahead with 1 hit point, locked.
+        at_bm_setup(at_bm_case);
+        if (at_bm_victim == NULL) {
+            at_check(C_BLOODY_ARMOR, false, "no victim for case %d", at_bm_case);
+            at_tr_end();
+            return true;
+        }
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        // Punch until the victim dies (a miss is retried).
+        if (critter_is_dead(at_bm_victim)) {
+            at_vw_next(elapsed);
+            break;
+        }
+        if (since > 1300 * (unsigned int)(at_vw_values[3] + 1) || at_vw_values[3] == 0) {
+            if (at_vw_values[3] >= 10) {
+                at_vw_next(elapsed);
+                break;
+            }
+            at_bm_victim->data.critter.hp = 1;
+            rt_debug_set_lock(at_bm_victim);
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[3]++;
+        }
+        break;
+    case 3:
+        // The death animation is over and the hit has landed.
+        if (since < 600 || anim_busy(at_bm_victim) || rt_get_pending_count() > 0) {
+            if (since < 8000) {
+                break;
+            }
+        }
+        if (at_bm_case == 0) {
+            at_screenshot("72_bloody_mess");
+        }
+        at_bm_evaluate(at_bm_case);
+        at_log("bloody mess case %d: %s", at_bm_case, at_bm_notes[at_bm_case]);
+        at_erase(at_bm_victim);
+        at_bm_victim = NULL;
+        rt_debug_set_lock(NULL);
+        at_bm_case++;
+        if (at_bm_case < 5) {
+            at_vw_phase = 1;
+            at_vw_time = elapsed;
+            break;
+        }
+        set_game_time(at_vw_values[8]);
+        config_set_value(&game_config, GAME_CONFIG_PREFERENCES_KEY, GAME_CONFIG_VIOLENCE_LEVEL_KEY, at_vw_values[9]);
+        at_check(C_BLOODY_ARMOR, at_bm_results[0], "%s", at_bm_notes[0]);
+        at_check(C_BLOODY_KEEP, at_bm_results[1] && at_bm_results[2] && at_bm_results[3] && at_bm_results[4],
+            "%s; %s; %s; %s", at_bm_notes[1], at_bm_notes[2], at_bm_notes[3], at_bm_notes[4]);
+        at_tr_end();
+        return true;
+    }
+    return false;
+}
+
+// Skilled: skills, experience, perks (no waiting involved).
+static bool step_traits_skilled(unsigned int elapsed, bool first, bool timedOut)
+{
+    at_tr_begin();
+
+    // Skills: +10 each, the same however often traits are applied.
+    int plain[SKILL_COUNT];
+    int skilled[SKILL_COUNT];
+    at_tr_set(-1, -1);
+    for (int skill = 0; skill < SKILL_COUNT; skill++) {
+        plain[skill] = skill_level(obj_dude, skill);
+    }
+    for (int index = 0; index < 3; index++) {
+        at_tr_set(TRAIT_SKILLED, -1);
+        stat_recalc_derived(obj_dude);
+    }
+    bool skillsOk = true;
+    int differing = -1;
+    for (int skill = 0; skill < SKILL_COUNT; skill++) {
+        skilled[skill] = skill_level(obj_dude, skill);
+        if (skilled[skill] - plain[skill] != rt_rules()->skilledSkillBonus && skilled[skill] < 300) {
+            skillsOk = false;
+            differing = skill;
+        }
+    }
+    at_check(C_SKILLED_SKILLS, skillsOk,
+        "every skill +%d with Skilled (applied 3 times); Small Guns %d -> %d, Speech %d -> %d%s",
+        rt_rules()->skilledSkillBonus, plain[SKILL_SMALL_GUNS], skilled[SKILL_SMALL_GUNS], plain[SKILL_SPEECH], skilled[SKILL_SPEECH],
+        differing != -1 ? "; a skill differs" : "");
+
+    // Experience.
+    int savedXp = stat_pc_get(PC_STAT_EXPERIENCE);
+    int savedRemainder = rt_skilled_xp_remainder();
+    int savedSwift = perk_level(PERK_SWIFT_LEARNER);
+    bool room = stat_pc_min_exp() - savedXp > 200;
+    int gains[7] = { 0 };
+    if (room) {
+        rt_skilled_xp_set_remainder(0);
+        perk_rt_debug_set_rank(PERK_SWIFT_LEARNER, 0);
+        int xp = stat_pc_get(PC_STAT_EXPERIENCE);
+        // Toggling the trait leaves earned XP alone.
+        at_tr_set(-1, -1);
+        at_tr_set(TRAIT_SKILLED, -1);
+        gains[0] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        stat_pc_add_experience(10);
+        gains[1] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        stat_pc_add_experience(10);
+        gains[2] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        for (int index = 0; index < 20; index++) {
+            stat_pc_add_experience(1);
+        }
+        gains[3] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        stat_pc_add_experience(-5);
+        gains[4] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        at_tr_set(-1, -1);
+        stat_pc_add_experience(10);
+        gains[5] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        at_tr_set(TRAIT_SKILLED, -1);
+        perk_rt_debug_set_rank(PERK_SWIFT_LEARNER, 1);
+        stat_pc_add_experience(100);
+        gains[6] = stat_pc_get(PC_STAT_EXPERIENCE) - xp;
+        perk_rt_debug_set_rank(PERK_SWIFT_LEARNER, savedSwift);
+    }
+    int remainder = rt_skilled_xp_remainder();
+    // 10 -> 8 (8.5), 10 -> 9 (8.5 + .5), 20 x 1 -> 17, -5 -> -5, 10 without
+    // the trait -> 10, 100 with Swift Learner -> 105 x 0.85 = 89.25 -> 89.
+    bool xpOk = room && gains[0] == 0 && gains[1] == 8 && gains[2] == 17 && gains[3] == 34 && gains[4] == 29 && gains[5] == 39
+        && gains[6] == 128 && remainder == 25;
+    at_check(C_SKILLED_XP, xpOk,
+        "room for the test %d; total gained after toggling 0=%d, +10: %d, +10: %d, 20x +1: %d, -5: %d, +10 without Skilled: %d, +100 with Swift Learner: %d, fraction %d/100 (expected 0, 8, 17, 34, 29, 39, 128, 25)",
+        room, gains[0], gains[1], gains[2], gains[3], gains[4], gains[5], gains[6], remainder);
+    stat_pc_set(PC_STAT_EXPERIENCE, savedXp);
+    rt_skilled_xp_set_remainder(savedRemainder);
+
+    // Perks with Skilled: at 2 and 4.
+    int savedLevel = stat_pc_get(PC_STAT_LEVEL);
+    int savedSp = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+    int savedLastLevel;
+    int savedFree;
+    editor_rt_debug_get(&savedLastLevel, &savedFree);
+    at_tr_set(TRAIT_SKILLED, -1);
+    int awarded[5] = { 0 };
+    editor_rt_debug_set(1, 0);
+    for (int level = 1; level <= 4; level++) {
+        stat_pc_set(PC_STAT_LEVEL, level);
+        editor_rt_update_level();
+        awarded[level] = editor_rt_free_perks();
+    }
+    editor_rt_debug_set(savedLastLevel, savedFree);
+    stat_pc_set(PC_STAT_LEVEL, savedLevel);
+    stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, savedSp);
+    at_check(C_SKILLED_PERKS, awarded[1] == 0 && awarded[2] == 1 && awarded[3] == 1 && awarded[4] == 2,
+        "pending selections with Skilled after levels 1-4: %d %d %d %d (expected 0 1 1 2)", awarded[1], awarded[2], awarded[3], awarded[4]);
+
+    // Descriptions.
+    const char* kamikaze = trait_description(TRAIT_KAMIKAZE);
+    const char* fastShot = trait_description(TRAIT_FAST_SHOT);
+    const char* bloodyMess = trait_description(TRAIT_BLOODY_MESS);
+    const char* skilledText = trait_description(TRAIT_SKILLED);
+    bool textOk = kamikaze != NULL && strstr(kamikaze, "+10 maximum Action Points") != NULL && strstr(kamikaze, "half") != NULL
+        && fastShot != NULL && strstr(fastShot, "25%") != NULL && strstr(fastShot, "AIMED SHOT") != NULL
+        && bloodyMess != NULL && strstr(bloodyMess, "+3%") != NULL && strstr(bloodyMess, "armor") != NULL
+        && skilledText != NULL && strstr(skilledText, "+10%") != NULL && strstr(skilledText, "15%") != NULL;
+    at_check(C_TRAITS_TEXT, textOk, "Kamikaze: '%.60s...'; Fast Shot: '%.60s...'", kamikaze != NULL ? kamikaze : "", fastShot != NULL ? fastShot : "");
+
+    at_tr_end();
+    return true;
+}
+
+// Traits kept for the save: Kamikaze and Skilled, and what they give.
+static int at_trs_ac = -1;
+static int at_trs_max_ap = -1;
+static int at_trs_skills[SKILL_COUNT];
+static int at_trs_remainder = -1;
+static int at_trs_xp = -1;
+
+static void at_trs_record(int* ac, int* maxAp, int* skills)
+{
+    *ac = stat_level(obj_dude, STAT_ARMOR_CLASS);
+    *maxAp = stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS);
+    for (int skill = 0; skill < SKILL_COUNT; skill++) {
+        skills[skill] = skill_level(obj_dude, skill);
+    }
+}
+
+static bool step_traits_before_save(unsigned int elapsed, bool first, bool timedOut)
+{
+    trait_set(TRAIT_KAMIKAZE, TRAIT_SKILLED);
+    stat_recalc_derived(obj_dude);
+    rt_skilled_xp_set_remainder(37);
+    at_trs_record(&at_trs_ac, &at_trs_max_ap, at_trs_skills);
+    at_trs_remainder = rt_skilled_xp_remainder();
+    at_trs_xp = stat_pc_get(PC_STAT_EXPERIENCE);
+    at_log("traits for the save: Kamikaze + Skilled, AC %d, max AP %d, Small Guns %d, XP %d, fraction %d",
+        at_trs_ac, at_trs_max_ap, at_trs_skills[SKILL_SMALL_GUNS], at_trs_xp, at_trs_remainder);
+    return true;
+}
+
+static bool step_traits_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    int ac;
+    int maxAp;
+    int skills[SKILL_COUNT];
+    at_trs_record(&ac, &maxAp, skills);
+    // Recalculating again changes nothing.
+    for (int index = 0; index < 3; index++) {
+        stat_recalc_derived(obj_dude);
+    }
+    int ac2;
+    int maxAp2;
+    int skills2[SKILL_COUNT];
+    at_trs_record(&ac2, &maxAp2, skills2);
+    bool skillsSame = memcmp(skills, at_trs_skills, sizeof(skills)) == 0 && memcmp(skills2, skills, sizeof(skills)) == 0;
+    bool ok = trait_level(TRAIT_KAMIKAZE) && trait_level(TRAIT_SKILLED)
+        && ac == at_trs_ac && ac2 == ac && maxAp == at_trs_max_ap && maxAp2 == maxAp && skillsSame
+        && rt_skilled_xp_remainder() == at_trs_remainder && stat_pc_get(PC_STAT_EXPERIENCE) == at_trs_xp
+        && rt_get_dude_ap() <= (float)maxAp + 0.01f;
+    at_check(C_TRAITS_LOAD, ok,
+        "traits kept %d; AC %d (saved %d, after 3 recalculations %d); max AP %d (%d, %d); skills same %d; XP %d (%d); fraction %d (%d); AP %.1f within max",
+        trait_level(TRAIT_KAMIKAZE) && trait_level(TRAIT_SKILLED), ac, at_trs_ac, ac2, maxAp, at_trs_max_ap, maxAp2, skillsSame,
+        stat_pc_get(PC_STAT_EXPERIENCE), at_trs_xp, rt_skilled_xp_remainder(), at_trs_remainder, rt_get_dude_ap());
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Pip-Boy: LT/RT main tabs, left stick subcategories
+// -----------------------------------------------------------------------------
+
+static int at_pbs_pid = -1;
+static Object* at_pbs_stack = NULL;
+static bool at_pbs_flags[12];
+static int at_pbs_values[12];
+
+static bool at_menu_pb_stick_script(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+    if (at_pb_phase > 0 && at_pb_phase < 30 && SDL_GetTicks() - at_pb_phase_time > 9000) {
+        at_log("pipboy stick script: phase %d timed out (tab %d page %d mode %d)", at_pb_phase, state->tab, state->page, state->mode);
+        at_pad.leftX = 0.0f;
+        at_pad.leftY = 0.0f;
+        at_pad.buttons[GAMEPAD_BUTTON_LEFT_TRIGGER] = false;
+        at_pb_next(30);
+    }
+
+    unsigned int inPhase = SDL_GetTicks() - at_pb_phase_time;
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 600) {
+            at_pbs_values[0] = state->tab;
+            at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        if (inPhase < 400) {
+            break;
+        }
+        // RT: the next tab.
+        at_pbs_flags[0] = state->tab == (at_pbs_values[0] + 1) % RT_PIPBOY_TAB_COUNT;
+        at_pbs_values[1] = state->tab;
+        at_pad.buttons[GAMEPAD_BUTTON_LEFT_TRIGGER] = true;
+        at_pb_next(2);
+        break;
+    case 2:
+        // LT held: one tab back, no repeat.
+        if (inPhase < 1100) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_LEFT_TRIGGER] = false;
+        at_pbs_flags[1] = state->tab == (at_pbs_values[1] + RT_PIPBOY_TAB_COUNT - 1) % RT_PIPBOY_TAB_COUNT;
+        at_pbs_values[2] = state->tab;
+        at_pbs_values[3] = state->page;
+        at_lstick_pulse(1.0f, 0.0f);
+        at_pb_next(3);
+        break;
+    case 3:
+        if (inPhase < 400) {
+            break;
+        }
+        // A left stick push: the next subcategory, same tab.
+        at_pbs_flags[2] = state->tab == at_pbs_values[2] && state->page != at_pbs_values[3];
+        at_pbs_values[4] = state->page;
+        at_pad.leftX = -1.0f;
+        at_pb_next(4);
+        break;
+    case 4:
+        // Held: one subcategory back, no repeat.
+        if (inPhase < 1100) {
+            break;
+        }
+        at_pad.leftX = 0.0f;
+        at_pbs_flags[3] = state->tab == at_pbs_values[2] && state->page == at_pbs_values[3];
+        at_pbs_values[5] = state->page;
+        at_pb_tap(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        at_pb_next(5);
+        break;
+    case 5:
+        if (inPhase < 400) {
+            break;
+        }
+        // RB and LB: no longer change pages or tabs.
+        at_pbs_flags[4] = state->tab == at_pbs_values[2] && state->page == at_pbs_values[5];
+        at_pb_tap(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_pb_next(6);
+        break;
+    case 6:
+        if (inPhase < 400) {
+            break;
+        }
+        at_pbs_flags[4] = at_pbs_flags[4] && state->tab == at_pbs_values[2] && state->page == at_pbs_values[5];
+        // Diagonal.
+        at_pad.leftX = 0.75f;
+        at_pad.leftY = -0.75f;
+        at_pb_next(7);
+        break;
+    case 7:
+        if (inPhase < 500) {
+            break;
+        }
+        at_pad.leftX = 0.0f;
+        at_pad.leftY = 0.0f;
+        at_pbs_flags[5] = state->tab == at_pbs_values[2] && state->page == at_pbs_values[5];
+        at_pb_next(8);
+        break;
+    case 8:
+        // To the inventory's "All" page, where the test stack is listed.
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_INVENTORY) && at_pb_goto_page(0)) {
+            at_pb_next(9);
+        }
+        break;
+    case 9:
+        if (inPhase < 300) {
+            break;
+        }
+        at_pbs_values[6] = state->cursor;
+        // Scrolling down, then drifting sideways while still pushed.
+        at_pad.leftY = 1.0f;
+        at_pb_next(10);
+        break;
+    case 10:
+        if (inPhase < 250) {
+            break;
+        }
+        at_pad.leftX = 0.95f;
+        at_pad.leftY = 0.4f;
+        at_pb_next(11);
+        break;
+    case 11:
+        if (inPhase < 400) {
+            break;
+        }
+        at_pad.leftX = 0.0f;
+        at_pad.leftY = 0.0f;
+        at_pbs_flags[6] = state->tab == RT_PIPBOY_TAB_INVENTORY && state->page == 0 && state->cursor != at_pbs_values[6];
+        at_pb_next(12);
+        break;
+    case 12:
+        // The quantity selector for the test stack.
+        if (inPhase < 300) {
+            break;
+        }
+        if (at_pb_goto_item(at_pbs_stack)) {
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(13);
+        }
+        break;
+    case 13:
+        if (inPhase < 400) {
+            break;
+        }
+        if (state->mode != RT_PIPBOY_MODE_QUANTITY) {
+            at_log("pipboy stick script: no quantity selector (mode %d)", state->mode);
+            at_pb_next(16);
+            break;
+        }
+        at_pbs_values[7] = state->quantity;
+        at_lstick_pulse(state->quantity > 1 ? -1.0f : 1.0f, 0.0f);
+        at_pb_next(14);
+        break;
+    case 14:
+        if (inPhase < 400) {
+            break;
+        }
+        at_pbs_flags[7] = state->mode == RT_PIPBOY_MODE_QUANTITY && state->tab == RT_PIPBOY_TAB_INVENTORY && state->page == 0
+            && abs(state->quantity - at_pbs_values[7]) == 1;
+        at_pbs_values[8] = state->quantity;
+        at_screenshot("73_pipboy_quantity");
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        at_pb_next(15);
+        break;
+    case 15:
+        if (inPhase < 400) {
+            break;
+        }
+        at_pb_next(16);
+        break;
+    case 16:
+        // The world map (a small local map may fit the screen and not
+        // pan): the D-pad pans it and the subcategory stays.
+        // X zooms in first, so there is room to pan.
+        if (at_pb_goto_tab(RT_PIPBOY_TAB_MAP) && at_pb_goto_page(2) && at_pb_ready(600)) {
+            at_pb_tap(GAMEPAD_BUTTON_X);
+            at_pb_next(19);
+        }
+        break;
+    case 19:
+        if (inPhase < 500) {
+            break;
+        }
+        at_pbs_values[9] = state->worldX;
+        at_pbs_values[10] = state->worldY;
+        at_pb_tap(GAMEPAD_BUTTON_DPAD_RIGHT);
+        at_pb_next(17);
+        break;
+    case 17:
+        if (inPhase < 300) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+        at_pb_next(18);
+        break;
+    case 18:
+        if (inPhase < 400) {
+            break;
+        }
+        at_pbs_flags[8] = state->tab == RT_PIPBOY_TAB_MAP && state->page == 2
+            && (state->worldX != at_pbs_values[9] || state->worldY != at_pbs_values[10]);
+        at_screenshot("74_pipboy_map_pan");
+        // Zoom back out.
+        at_pb_tap(GAMEPAD_BUTTON_X);
+        at_pb_next(30);
+        break;
+    case 30:
+        if (inPhase < 400) {
+            break;
+        }
+        if (state->mode != RT_PIPBOY_MODE_NONE) {
+            at_pb_tap(GAMEPAD_BUTTON_B);
+            at_pb_next(30);
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        return true;
+    }
+    return false;
+}
+
+static bool step_pipboy_stick(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        memset(at_pbs_flags, 0, sizeof(at_pbs_flags));
+        memset(at_pbs_values, 0, sizeof(at_pbs_values));
+        // A stack of 5 for the quantity selector.
+        at_pbs_pid = at_item_pid_by_name("Rock");
+        if (at_pbs_pid == -1) {
+            at_pbs_pid = at_item_pid_by_name("Flare");
+        }
+        at_pbs_stack = NULL;
+        if (at_pbs_pid != -1) {
+            for (int index = 0; index < 5; index++) {
+                at_bm_give(obj_dude, at_pbs_pid, false);
+            }
+            at_pbs_stack = at_pb_find_stack(at_pbs_pid);
+        }
+        at_pb_next(0);
+        at_expect_menu(NULL, at_menu_pb_stick_script);
+        at_count_a = 0;
+        // Triggers in the Pip-Boy must not attack or lock on.
+        at_count_b = rt_get_stats()->playerAttacks + rt_get_stats()->freeSwings;
+        rt_debug_set_lock(NULL);
+        return false;
+    }
+
+    // B opens the Pip-Boy (again after 2.5 s if it didn't).
+    if (!at_menu_seen && elapsed > 800 + 2500 * (unsigned int)at_count_a && at_count_a < 4) {
+        at_count_a++;
+        at_press(GAMEPAD_BUTTON_B);
+    }
+
+    bool closed = at_menu_done && !rt_pipboy_is_open();
+    if (closed || timedOut) {
+        at_pad.leftX = 0.0f;
+        at_pad.leftY = 0.0f;
+        at_pad.buttons[GAMEPAD_BUTTON_LEFT_TRIGGER] = false;
+        bool noCombat = rt_get_stats()->playerAttacks + rt_get_stats()->freeSwings == at_count_b && rt_get_lock() == NULL;
+        at_check(C_PB_STICK_ONE, at_pbs_flags[0] && at_pbs_flags[1] && noCombat,
+            "RT: next tab=%d; LT held 1.1 s: one tab back, no repeat=%d; no attack or lock-on from the triggers=%d",
+            at_pbs_flags[0], at_pbs_flags[1], noCombat);
+        at_check(C_PB_STICK_DIAG, at_pbs_flags[2] && at_pbs_flags[3] && at_pbs_flags[4] && at_pbs_flags[5] && at_pbs_flags[6],
+            "left stick right: next subcategory, same tab=%d; held left: one back, no repeat=%d; LB/RB change nothing=%d; diagonal push changes nothing=%d; down then drifting sideways scrolls the list and keeps the subcategory=%d",
+            at_pbs_flags[2], at_pbs_flags[3], at_pbs_flags[4], at_pbs_flags[5], at_pbs_flags[6]);
+        at_check(C_PB_STICK_NESTED, at_pbs_flags[7] && at_pbs_flags[8],
+            "quantity selector: a sideways push changed the amount %d -> %d, not the subcategory=%d; world map: the D-pad panned it and the subcategory stayed=%d",
+            at_pbs_values[7], at_pbs_values[8], at_pbs_flags[7], at_pbs_flags[8]);
+        if (at_pbs_pid != -1) {
+            Object* stack = at_pb_find_stack(at_pbs_pid);
+            int quantity = at_count_pid_in(obj_dude, at_pbs_pid);
+            if (stack != NULL && quantity > 0) {
+                item_remove_mult(obj_dude, stack, std::min(quantity, 5));
+            }
+        }
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Pip-Boy: perk artwork
+// -----------------------------------------------------------------------------
+
+static int at_pa_levels[PERK_COUNT];
+static int at_pa_last_level;
+static int at_pa_free;
+static int at_pa_pc_level;
+static int at_pa_owned;
+static int at_pa_visited;
+static int at_pa_art_ok;
+static int at_pa_overlaps;
+static int at_pa_bad[4];
+static int at_pa_bad_count;
+static bool at_pa_flags[8];
+static int at_pa_nested;
+static int at_pa_confirm_perk;
+
+// The card shows `perk` with its artwork inside the screen, above the
+// footer, and no text over the artwork.
+static bool at_pa_card_ok(const RtPipboyState* state, int perk)
+{
+    return state->perkCard == perk && state->perkArtFid != -1 && state->perkTextOverlaps == 0
+        && state->perkTextLines >= 3
+        && state->perkArtX >= PIPBOY_RT_SCREEN_X && state->perkArtX + state->perkArtWidth <= PIPBOY_RT_SCREEN_X + PIPBOY_RT_SCREEN_WIDTH
+        && state->perkArtY >= PIPBOY_RT_SCREEN_Y && state->perkArtY + state->perkArtHeight <= PIPBOY_RT_SCREEN_Y + PIPBOY_RT_SCREEN_HEIGHT - 30;
+}
+
+static bool at_menu_pb_perk_art(unsigned int elapsed)
+{
+    const RtPipboyState* state = at_pb();
+    if (!state->open) {
+        return false;
+    }
+    if (at_pb_phase > 0 && at_pb_phase < 20 && SDL_GetTicks() - at_pb_phase_time > 20000) {
+        at_log("perk art script: phase %d timed out (tab %d page %d mode %d)", at_pb_phase, state->tab, state->page, state->mode);
+        at_pb_next(20);
+    }
+
+    switch (at_pb_phase) {
+    case 0:
+        if (elapsed > 600 && at_pb_goto_tab(RT_PIPBOY_TAB_STATS) && at_pb_goto_page(3) && at_pb_ready(300)) {
+            at_pb_next(1);
+        }
+        break;
+    case 1:
+        // Row 1 is the perk owned: its card.
+        if (!at_pb_ready(300)) {
+            break;
+        }
+        if (state->cursor != 1 && at_pb_tries++ < 10) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+            break;
+        }
+        at_pa_flags[0] = at_pa_card_ok(state, at_pa_owned);
+        at_log("perk art: owned %s card=%d art fid %d at %d,%d %dx%d, overlaps %d", perk_name(at_pa_owned), state->perkCard,
+            state->perkArtFid, state->perkArtX, state->perkArtY, state->perkArtWidth, state->perkArtHeight, state->perkTextOverlaps);
+        at_screenshot("pb_perk_owned");
+        at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+        at_pb_next(2);
+        break;
+    case 2:
+        if (!at_pb_ready(300)) {
+            break;
+        }
+        if (state->cursor != 0) {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_UP);
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(3);
+        break;
+    case 3: {
+        // Every perk on offer, highlighted in turn, shows its card.
+        if (state->mode != RT_PIPBOY_MODE_CHOOSE_PERK || !at_pb_ready(250)) {
+            break;
+        }
+        if (at_pa_visited == 0) {
+            at_screenshot("pb_perk_art");
+        }
+        int perk = state->choices[state->choiceCursor];
+        if (at_pa_card_ok(state, perk)) {
+            at_pa_art_ok++;
+        } else if (at_pa_bad_count < 4) {
+            at_pa_bad[at_pa_bad_count++] = perk;
+        }
+        at_pa_overlaps += state->perkTextOverlaps;
+        at_pa_visited++;
+        if (at_pa_visited >= state->choiceCount) {
+            at_pa_nested = state->nestedIgnored;
+            at_lstick_pulse(1.0f, 0.0f);
+            at_pb_next(4);
+        } else {
+            at_pb_tap(GAMEPAD_BUTTON_DPAD_DOWN);
+        }
+        break;
+    }
+    case 4:
+        // A sideways push inside the chooser changes nothing.
+        if (!at_pb_ready(400)) {
+            break;
+        }
+        at_pa_flags[1] = state->mode == RT_PIPBOY_MODE_CHOOSE_PERK && state->nestedIgnored > at_pa_nested && state->tab == RT_PIPBOY_TAB_STATS;
+        at_pa_confirm_perk = state->choices[state->choiceCursor];
+        at_pb_tap(GAMEPAD_BUTTON_A);
+        at_pb_next(5);
+        break;
+    case 5:
+        if (state->mode != RT_PIPBOY_MODE_CONFIRM_PERK || !at_pb_ready(300)) {
+            break;
+        }
+        at_pa_flags[2] = at_pa_card_ok(state, at_pa_confirm_perk);
+        at_screenshot("pb_perk_confirm");
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        at_pb_next(6);
+        break;
+    case 6:
+        if (!at_pb_ready(300)) {
+            break;
+        }
+        at_pa_flags[3] = state->mode == RT_PIPBOY_MODE_CHOOSE_PERK;
+        at_pb_tap(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_pb_next(7);
+        break;
+    case 7:
+        if (!at_pb_ready(300)) {
+            break;
+        }
+        at_pa_flags[4] = state->mode == RT_PIPBOY_MODE_NONE && state->tab == RT_PIPBOY_TAB_INVENTORY;
+        at_pb_next(20);
+        break;
+    case 20:
+        if (!at_pb_ready(400)) {
+            break;
+        }
+        at_pb_tap(GAMEPAD_BUTTON_B);
+        if (state->mode != RT_PIPBOY_MODE_NONE) {
+            at_pb_next(20);
+            break;
+        }
+        return true;
+    }
+    return false;
+}
+
+static bool step_pb_perk_art(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        at_pb_next(0);
+        at_pa_visited = 0;
+        at_pa_art_ok = 0;
+        at_pa_overlaps = 0;
+        at_pa_bad_count = 0;
+        memset(at_pa_flags, 0, sizeof(at_pa_flags));
+
+        // The mapping: every perk that can be chosen, its skilldex.lst entry.
+        int listed = 0;
+        int missing = 0;
+        char missingNames[240] = "";
+        for (int perk = 0; perk < PERK_COUNT; perk++) {
+            if (perk_max_rank(perk) == -1) {
+                continue;
+            }
+            listed++;
+            int pic = perk_rt_pic(perk);
+            int fid = art_id(OBJ_TYPE_SKILLDEX, pic, 0, 0, 0);
+            bool exists = pic == perk + 72 && art_exists(fid);
+            char* name = art_get_name(fid);
+            at_log("perk art: %2d %-24s skilldex %3d %s%s", perk, perk_name(perk), pic, name != NULL ? name : "?", exists ? "" : "  MISSING");
+            if (!exists) {
+                missing++;
+                SDL_strlcat(missingNames, " ", sizeof(missingNames));
+                SDL_strlcat(missingNames, perk_name(perk), sizeof(missingNames));
+            }
+        }
+        at_check(C_PB_PERK_MAP, missing == 0 && listed > 0,
+            "%d selectable perks, artwork found for %d (skilldex.lst entry perk + 72, the original character screen's mapping); missing:%s",
+            listed, listed - missing, missing > 0 ? missingNames : " none");
+
+        // A perk due at level 8, and one perk owned.
+        for (int perk = 0; perk < PERK_COUNT; perk++) {
+            at_pa_levels[perk] = perk_level(perk);
+        }
+        editor_rt_debug_get(&at_pa_last_level, &at_pa_free);
+        at_pa_pc_level = stat_pc_get(PC_STAT_LEVEL);
+        at_pa_owned = PERK_AWARENESS;
+        perk_rt_debug_set_rank(at_pa_owned, std::max(1, at_pa_levels[at_pa_owned]));
+        stat_pc_set(PC_STAT_LEVEL, 8);
+        editor_rt_debug_set(8, 1);
+        at_expect_menu(NULL, at_menu_pb_perk_art);
+        at_count_a = 0;
+        return false;
+    }
+
+    if (!at_menu_seen && elapsed > 800 + 2500 * (unsigned int)at_count_a && at_count_a < 4) {
+        at_count_a++;
+        at_press(GAMEPAD_BUTTON_B);
+    }
+
+    bool closed = at_menu_done && !rt_pipboy_is_open();
+    if (closed || timedOut) {
+        bool nothingTaken = editor_rt_free_perks() == 1;
+        for (int perk = 0; perk < PERK_COUNT; perk++) {
+            int expected = perk == at_pa_owned ? std::max(1, at_pa_levels[perk]) : at_pa_levels[perk];
+            if (perk_level(perk) != expected) {
+                nothingTaken = false;
+                at_log("perk art: %s changed to rank %d", perk_name(perk), perk_level(perk));
+            }
+        }
+        char bad[120] = "";
+        for (int index = 0; index < at_pa_bad_count; index++) {
+            SDL_strlcat(bad, " ", sizeof(bad));
+            SDL_strlcat(bad, perk_name(at_pa_bad[index]), sizeof(bad));
+        }
+        at_check(C_PB_PERK_ART, at_pa_visited > 0 && at_pa_art_ok == at_pa_visited && at_pa_flags[0] && at_pa_flags[2],
+            "perks highlighted %d, card with artwork and no text over it or the footer %d (overlapping lines %d; bad:%s); owned perk card=%d; confirmation card=%d",
+            at_pa_visited, at_pa_art_ok, at_pa_overlaps, at_pa_bad_count > 0 ? bad : " none", at_pa_flags[0], at_pa_flags[2]);
+        at_check(C_PB_PERK_PREVIEW, nothingTaken && at_pa_flags[1] && at_pa_flags[3] && at_pa_flags[4],
+            "nothing taken by highlighting, confirming with B or switching tabs=%d; sideways push ignored in the chooser=%d; B back to the list=%d; RT left for Inventory=%d",
+            nothingTaken, at_pa_flags[1], at_pa_flags[3], at_pa_flags[4]);
+
+        for (int perk = 0; perk < PERK_COUNT; perk++) {
+            perk_rt_debug_set_rank(perk, at_pa_levels[perk]);
+        }
+        stat_pc_set(PC_STAT_LEVEL, at_pa_pc_level);
+        editor_rt_debug_set(at_pa_last_level, at_pa_free);
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Quick Pockets
+// -----------------------------------------------------------------------------
+
+static Object* at_qp_rat;
+static int at_qp_stack_pid;
+static int at_qp_phase;
+static int at_qp_step;
+static unsigned int at_qp_time;
+static int at_qp_values[24];
+static bool at_qp_flags[16];
+static int at_qp_points;
+static int at_qp_unspent;
+static int at_qp_rank;
+static int at_qp_checks_before;
+// A record kept for the save (object id, elapsed ms).
+static int at_qp_saved_id = -1;
+static int at_qp_saved_elapsed = -1;
+
+// The chance shown for `item` (with `check` the steal roll's percentage),
+// and the same without Quick Pockets.
+static int at_qp_odds(Object* item, int* check)
+{
+    return skill_rt_steal_odds(obj_dude, at_qp_rat, item, check, NULL);
+}
+
+static int at_qp_base_odds(Object* item, int* check)
+{
+    int rank = perk_level(PERK_QUICK_POCKETS);
+    perk_rt_debug_set_rank(PERK_QUICK_POCKETS, 0);
+    int odds = skill_rt_steal_odds(obj_dude, at_qp_rat, item, check, NULL);
+    perk_rt_debug_set_rank(PERK_QUICK_POCKETS, rank);
+    return odds;
+}
+
+// First session: the bonus fresh, part way and expired.
+static bool at_menu_qp_decay(unsigned int elapsed)
+{
+    const InvenRtLootState* state = inven_rt_loot_state();
+    const RtQuickPocketsState* qp = rt_quick_pockets_state();
+    if (!state->open || state->selectedItem == NULL) {
+        return false;
+    }
+
+    switch (at_qp_phase) {
+    case 0:
+        if (elapsed < 500) {
+            break;
+        }
+        at_qp_flags[0] = qp->active && qp->target == at_qp_rat && !qp->resumed;
+        at_qp_values[0] = qp->bonus;
+        at_qp_values[1] = qp->elapsedMs;
+        at_qp_values[2] = at_qp_odds(state->selectedItem, &at_qp_values[3]);
+        at_qp_values[4] = at_qp_base_odds(state->selectedItem, &at_qp_values[5]);
+        at_screenshot("qp_01_fresh");
+        at_qp_phase = 1;
+        break;
+    case 1:
+        if (qp->elapsedMs < 4500) {
+            break;
+        }
+        at_qp_values[6] = qp->bonus;
+        at_qp_values[7] = at_qp_odds(state->selectedItem, NULL);
+        at_qp_phase = 2;
+        break;
+    case 2:
+        if (qp->elapsedMs < 10300) {
+            break;
+        }
+        at_qp_values[8] = qp->bonus;
+        at_qp_values[9] = at_qp_odds(state->selectedItem, NULL);
+        at_qp_values[10] = at_qp_base_odds(state->selectedItem, NULL);
+        at_qp_values[11] = state->stealOdds;
+        at_screenshot("qp_02_expired");
+        at_press(GAMEPAD_BUTTON_B);
+        at_qp_phase = 3;
+        return true;
+    }
+    return false;
+}
+
+// Second session: a stack through the quantity selector.
+static bool at_menu_qp_quantity(unsigned int elapsed)
+{
+    const InvenRtLootState* state = inven_rt_loot_state();
+    const RtQuickPocketsState* qp = rt_quick_pockets_state();
+    if (!state->open) {
+        return false;
+    }
+
+    switch (at_qp_phase) {
+    case 0:
+        if (elapsed < 400) {
+            break;
+        }
+        at_qp_flags[1] = qp->active && !qp->resumed && qp->bonus == rt_quick_pockets_bonus_at(0);
+        at_qp_time = elapsed;
+        at_qp_phase = 1;
+        break;
+    case 1:
+        if (state->selectedItem != NULL && state->selectedItem->pid == at_qp_stack_pid && state->side == INVEN_RT_LOOT_SIDE_LOOT) {
+            at_press(GAMEPAD_BUTTON_A);
+            at_qp_time = elapsed;
+            at_qp_phase = 2;
+        } else if (elapsed - at_qp_time > 250) {
+            at_qp_time = elapsed;
+            at_press(GAMEPAD_BUTTON_DPAD_DOWN);
+        }
+        break;
+    case 2:
+        if (state->quantityOpen && elapsed - at_qp_time > 200) {
+            at_qp_values[12] = qp->elapsedMs;
+            at_qp_time = elapsed;
+            at_qp_phase = 3;
+        } else if (elapsed - at_qp_time > 3000) {
+            at_log("quick pockets: no quantity selector");
+            at_press(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    case 3:
+        if (elapsed - at_qp_time < 1600) {
+            break;
+        }
+        at_qp_values[13] = qp->elapsedMs;
+        at_qp_checks_before = qp->checks;
+        at_screenshot("qp_03_quantity");
+        at_press(GAMEPAD_BUTTON_A);
+        at_qp_time = elapsed;
+        at_qp_phase = 4;
+        break;
+    case 4:
+        if (!state->quantityOpen && elapsed - at_qp_time > 400) {
+            at_press(GAMEPAD_BUTTON_B);
+            return true;
+        }
+        break;
+    }
+    return false;
+}
+
+static bool step_qp(unsigned int elapsed, bool first, bool timedOut)
+{
+    unsigned int now = SDL_GetTicks();
+    const RtQuickPocketsState* qp = rt_quick_pockets_state();
+    if (first) {
+        at_release_all();
+        at_clear_hostiles();
+        at_move_to_open_spot(2);
+        tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+        memset(at_qp_values, 0, sizeof(at_qp_values));
+        memset(at_qp_flags, 0, sizeof(at_qp_flags));
+        at_qp_phase = 0;
+        at_qp_step = 0;
+        at_qp_rank = perk_level(PERK_QUICK_POCKETS);
+
+        // The bonus curve at ranks 0, 1 and 3 (5 per rank, full for 2 s,
+        // then down to 0 over 8 s).
+        perk_rt_debug_set_rank(PERK_QUICK_POCKETS, 0);
+        int rank0 = rt_quick_pockets_bonus_at(0);
+        perk_rt_debug_set_rank(PERK_QUICK_POCKETS, 3);
+        int rank3[2] = { rt_quick_pockets_bonus_at(0), rt_quick_pockets_bonus_at(6000) };
+        perk_rt_debug_set_rank(PERK_QUICK_POCKETS, 1);
+        int curve[6] = {
+            rt_quick_pockets_bonus_at(0),
+            rt_quick_pockets_bonus_at(2000),
+            rt_quick_pockets_bonus_at(6000),
+            rt_quick_pockets_bonus_at(9999),
+            rt_quick_pockets_bonus_at(10000),
+            rt_quick_pockets_bonus_at(60000),
+        };
+        at_qp_flags[8] = rank0 == 0 && rank3[0] == 15 && rank3[1] == 7
+            && curve[0] == 5 && curve[1] == 5 && curve[2] == 2 && curve[3] == 0 && curve[4] == 0 && curve[5] == 0;
+        at_log("quick pockets: curve rank 0 %d; rank 3 %d/%d; rank 1 %d %d %d %d %d %d",
+            rank0, rank3[0], rank3[1], curve[0], curve[1], curve[2], curve[3], curve[4], curve[5]);
+
+        // The description and the requirements (unchanged: level 2,
+        // Agility 5, three ranks).
+        char requirements[160];
+        perk_rt_requirements(PERK_QUICK_POCKETS, requirements, sizeof(requirements));
+        const char* text = perk_description(PERK_QUICK_POCKETS);
+        bool textOk = text != NULL && strstr(text, "5 points") != NULL && strstr(text, "2.0 seconds") != NULL
+            && strstr(text, "8.0 seconds") != NULL && strstr(text, "60 seconds") != NULL && strstr(text, "Action Point") == NULL;
+        at_check(C_QP_TEXT, textOk && perk_min_level(PERK_QUICK_POCKETS) == 2 && perk_max_rank(PERK_QUICK_POCKETS) == 3
+                && strcmp(requirements, "Level 2, Agility 5") == 0,
+            "description updated=%d; requirements '%s', ranks %d (level %d); the inventory AP saving is gone (the cost is a flat 4)",
+            textOk, requirements, perk_max_rank(PERK_QUICK_POCKETS), perk_min_level(PERK_QUICK_POCKETS));
+
+        // Fixtures: a calm rat facing away (no face-to-face penalty) with a
+        // Stimpak and a stack of 5; the player's Steal raised so the test
+        // isn't spoiled by getting caught.
+        at_qp_rat = at_spawn_rat_at(at_adjacent_free_tile(), false);
+        int stimpak = at_item_pid_by_name("Stimpak");
+        at_qp_stack_pid = at_item_pid_by_name("Rock");
+        if (at_qp_stack_pid == -1) {
+            at_qp_stack_pid = at_item_pid_by_name("Flare");
+        }
+        if (at_qp_rat == NULL || stimpak == -1 || at_qp_stack_pid == -1) {
+            at_check(C_QP_DECAY, false, "fixtures missing");
+            at_erase(at_qp_rat);
+            perk_rt_debug_set_rank(PERK_QUICK_POCKETS, at_qp_rank);
+            return true;
+        }
+        at_bm_give(at_qp_rat, stimpak, false);
+        for (int index = 0; index < 5; index++) {
+            at_bm_give(at_qp_rat, at_qp_stack_pid, false);
+        }
+        Rect rect;
+        obj_set_rotation(at_qp_rat, tile_dir(obj_dude->tile, at_qp_rat->tile), &rect);
+        at_vw_face(tile_dir(obj_dude->tile, at_qp_rat->tile));
+        at_qp_unspent = stat_pc_get(PC_STAT_UNSPENT_SKILL_POINTS);
+        stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, 200);
+        at_qp_points = 0;
+        while (at_qp_points < 100 && skill_level(obj_dude, SKILL_STEAL) < 150 && skill_inc_point(obj_dude, SKILL_STEAL) == 0) {
+            at_qp_points++;
+        }
+
+        // Every session starts fresh here (the reopening rule is tested
+        // separately below).
+        RtRules rules = *rt_rules();
+        rules.quickPocketsResetS = 0;
+        rt_rules_set(&rules);
+
+        if (!is_pc_flag(PC_FLAG_SNEAKING)) {
+            rt_toggle_sneak();
+        }
+        at_qp_values[20] = qp->sessions;
+        at_qp_step = 0;
+        at_qp_time = now;
+        at_count_a = 0;
+        return false;
+    }
+
+    if (timedOut) {
+        at_qp_step = 99;
+    }
+
+    switch (at_qp_step) {
+    case 0:
+        // Steal once the player stands still (the steal animation must be
+        // able to start).
+        if (now - at_qp_time < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_expect_menu(NULL, at_menu_qp_decay);
+        rt_context_interact(at_qp_rat);
+        at_qp_step = 1;
+        at_qp_time = now;
+        break;
+    case 1:
+        if (!at_menu_seen && now - at_qp_time > 4000 && at_count_a < 3 && !anim_busy(obj_dude)) {
+            at_count_a++;
+            at_log("quick pockets: steal screen not open yet, trying again");
+            rt_context_interact(at_qp_rat);
+            at_qp_time = now;
+            break;
+        }
+        // The steal screen opens after the steal animation; wait for the
+        // script to finish and the screen to close.
+        if ((!at_menu_done || inven_rt_loot_state()->open || now - at_qp_time < 800) && now - at_qp_time < 25000) {
+            break;
+        }
+        at_menu_expected = false;
+        at_qp_phase = 0;
+        at_expect_menu(NULL, at_menu_qp_quantity);
+        rt_context_interact(at_qp_rat);
+        at_qp_step = 2;
+        at_qp_time = now;
+        break;
+    case 2: {
+        if (!at_menu_seen && now - at_qp_time > 4000 && at_count_a < 6 && !anim_busy(obj_dude)) {
+            at_count_a++;
+            rt_context_interact(at_qp_rat);
+            at_qp_time = now;
+            break;
+        }
+        if ((!at_menu_done || inven_rt_loot_state()->open || now - at_qp_time < 800) && now - at_qp_time < 15000) {
+            break;
+        }
+        at_menu_expected = false;
+        int expected = rt_quick_pockets_bonus_at(qp->lastCheckElapsedMs);
+        at_qp_flags[2] = qp->checks == at_qp_checks_before + 1 && qp->lastCheckElapsedMs >= at_qp_values[13]
+            && qp->lastCheckBonus == expected;
+        at_qp_values[14] = qp->lastCheckBonus;
+        at_qp_values[15] = qp->lastCheckElapsedMs;
+        at_qp_values[16] = at_count_pid_in(obj_dude, at_qp_stack_pid);
+
+        // Reopening within the reset time resumes the timer.
+        RtRules rules = *rt_rules();
+        rules.quickPocketsResetS = 60;
+        rt_rules_set(&rules);
+        rt_quick_pockets_begin(at_qp_rat);
+        at_qp_step = 3;
+        at_qp_time = now;
+        break;
+    }
+    case 3:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 600) {
+            break;
+        }
+        at_qp_values[17] = qp->elapsedMs;
+        rt_quick_pockets_end();
+        rt_quick_pockets_begin(at_qp_rat);
+        at_qp_flags[3] = qp->resumed && qp->elapsedMs >= at_qp_values[17] && qp->bonus == rt_quick_pockets_bonus_at(qp->elapsedMs);
+        rt_quick_pockets_end();
+        {
+            RtRules rules = *rt_rules();
+            rules.quickPocketsResetS = 1;
+            rt_rules_set(&rules);
+        }
+        at_qp_step = 4;
+        at_qp_time = now;
+        break;
+    case 4:
+        // After the reset time (world time) a fresh bonus.
+        if (now - at_qp_time < 1500) {
+            break;
+        }
+        rt_quick_pockets_begin(at_qp_rat);
+        at_qp_flags[4] = !qp->resumed && qp->elapsedMs < 200 && qp->bonus == rt_quick_pockets_bonus_at(0);
+        at_qp_step = 5;
+        at_qp_time = now;
+        break;
+    case 5:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 300) {
+            break;
+        }
+        at_qp_values[18] = qp->elapsedMs;
+        gamepad_set_focus(false);
+        at_qp_step = 6;
+        at_qp_time = now;
+        break;
+    case 6:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 800) {
+            break;
+        }
+        at_qp_values[19] = qp->elapsedMs - at_qp_values[18];
+        gamepad_set_focus(true);
+        at_qp_step = 7;
+        at_qp_time = now;
+        break;
+    case 7:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 300) {
+            break;
+        }
+        at_qp_values[21] = qp->elapsedMs;
+        at_pad.connected = false;
+        at_qp_step = 8;
+        at_qp_time = now;
+        break;
+    case 8:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 800) {
+            break;
+        }
+        at_qp_values[22] = qp->elapsedMs - at_qp_values[21];
+        at_pad.connected = true;
+        at_qp_step = 9;
+        at_qp_time = now;
+        break;
+    case 9:
+        rt_quick_pockets_tick();
+        if (now - at_qp_time < 300) {
+            break;
+        }
+        at_qp_values[23] = qp->elapsedMs;
+        rt_quick_pockets_end();
+        at_qp_step = 99;
+        break;
+    }
+
+    if (at_qp_step != 99) {
+        return false;
+    }
+
+    bool decayOk = at_qp_flags[8] && at_qp_flags[0] && at_qp_values[0] == 5
+        && at_qp_values[3] == std::min(95, at_qp_values[5] + 5) && at_qp_values[2] >= at_qp_values[4]
+        && at_qp_values[6] >= 1 && at_qp_values[6] <= 4 && at_qp_values[7] <= at_qp_values[2] && at_qp_values[7] >= at_qp_values[4]
+        && at_qp_values[8] == 0 && at_qp_values[9] == at_qp_values[10] && at_qp_values[11] == at_qp_values[10];
+    at_check(C_QP_DECAY, decayOk,
+        "curve (5/rank: 5 at 0-2 s, 2 at 6 s, 0 from 10 s; 15 and 7 at rank 3)=%d; fresh session=%d bonus %d; steal roll %d%% = base %d%% + 5 (cap 95); chance unnoticed %d%% fresh, %d%% at 4.5 s (bonus %d), %d%% expired (bonus %d) = normal %d%%, shown %d%%",
+        at_qp_flags[8], at_qp_flags[0], at_qp_values[0], at_qp_values[3], at_qp_values[5], at_qp_values[2], at_qp_values[7], at_qp_values[6],
+        at_qp_values[9], at_qp_values[8], at_qp_values[10], at_qp_values[11]);
+    at_check(C_QP_CONFIRM, at_qp_flags[1] && at_qp_values[13] - at_qp_values[12] >= 1400 && at_qp_flags[2],
+        "second session fresh=%d; the timer ran in the quantity selector (%d -> %d ms); confirming the amount made one steal check (%d) with the bonus of that moment (%d at %d ms)=%d; stack taken now %d",
+        at_qp_flags[1], at_qp_values[12], at_qp_values[13], qp->checks - at_qp_checks_before, at_qp_values[14], at_qp_values[15], at_qp_flags[2], at_qp_values[16]);
+    bool suspended = at_qp_values[19] <= 150 && at_qp_values[22] <= 150 && at_qp_values[23] > at_qp_values[21] + at_qp_values[22] + 150;
+    at_check(C_QP_REOPEN, at_qp_flags[3] && at_qp_flags[4] && suspended,
+        "reopened within 60 s: timer resumed, no fresh bonus=%d; after the reset time: fresh=%d; while unfocused it ran %d ms of 800, disconnected %d ms of 800, and runs again after=%d",
+        at_qp_flags[3], at_qp_flags[4], at_qp_values[19], at_qp_values[22], at_qp_values[23] > at_qp_values[21] + at_qp_values[22] + 150);
+    int loots = at_qp_sessions_before_loot >= 0 && at_qp_sessions_after_barter >= 0 ? at_qp_sessions_after_barter - at_qp_sessions_before_loot : -1;
+    bool outside = rt_quick_pockets_bonus(at_qp_rat) == 0 && rt_quick_pockets_bonus(obj_dude) == 0;
+    at_check(C_QP_SCOPE, loots == 0 && outside,
+        "sessions started by the loot and barter steps %d (none: looting and trading never time a bonus); no bonus outside a steal session=%d",
+        loots, outside);
+
+    // Cleanup.
+    rt_rules_set(NULL);
+    gamepad_set_focus(true);
+    at_pad.connected = true;
+    while (at_qp_points > 0 && skill_dec_point(obj_dude, SKILL_STEAL) == 0) {
+        at_qp_points--;
+    }
+    stat_pc_set(PC_STAT_UNSPENT_SKILL_POINTS, at_qp_unspent);
+    perk_rt_debug_set_rank(PERK_QUICK_POCKETS, at_qp_rank);
+    if (is_pc_flag(PC_FLAG_SNEAKING)) {
+        rt_toggle_sneak();
+    }
+    at_menu_expected = false;
+    at_erase(at_qp_rat);
+    at_qp_rat = NULL;
+    at_clear_hostiles();
+    return true;
+}
+
+// -----------------------------------------------------------------------------
+// Close combat: AP, counterattacks, two-handed sweeps
+// -----------------------------------------------------------------------------
+
+static float at_cc_floats[8];
+
+static int at_cc_hit_mode()
+{
+    int hitMode = HIT_MODE_PUNCH;
+    bool aiming;
+    intface_get_attack(&hitMode, &aiming);
+    return hitMode;
+}
+
+static void at_cc_full_ap()
+{
+    rt_debug_set_ap((float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS));
+}
+
+// The test rat at `tile`, alive and at full health (a new one if it died).
+static void at_cc_keep(Object** rat, int tile, bool hostile)
+{
+    if (*rat == NULL || critter_is_dead(*rat)) {
+        if (*rat != NULL) {
+            at_erase(*rat);
+        }
+        *rat = at_spawn_rat_at(tile, hostile);
+        return;
+    }
+    int missing = stat_level(*rat, STAT_MAXIMUM_HIT_POINTS) - critter_get_hits(*rat);
+    if (missing > 0) {
+        critter_adjust_hits(*rat, missing);
+    }
+    // Back in place (a hit can knock it away).
+    if ((*rat)->tile != tile && at_tile_free(tile)) {
+        Rect rect;
+        obj_move_to_tile(*rat, tile, obj_dude->elevation, &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+}
+
+static Object* at_cc_give(const char* name)
+{
+    int pid = at_item_pid_by_name(name);
+    Object* item = NULL;
+    if (pid != -1 && obj_pid_new(&item, pid) != -1) {
+        Rect rect;
+        if (item_add_force(obj_dude, item, 1) == 0) {
+            obj_disconnect(item, &rect);
+        } else {
+            item = NULL;
+        }
+    }
+    return item;
+}
+
+static bool step_cc_ap(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_MELEE_AP, false, "timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[0];
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(6);
+        at_vw_values[0] = at_vw_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_check(C_MELEE_AP, false, "no open hexes around the player");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_face(at_vw_values[0]);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, at_vw_values[0], 1), true);
+        at_cc_full_ap();
+        at_vw_values[1] = stats->meleeApCharges;
+        at_cc_floats[0] = stats->meleeApSpent;
+        at_vw_values[2] = stats->freeSwings;
+        at_cc_floats[1] = rt_get_dude_ap();
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // A swing at the rat: its AP once.
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        // Fists: half a point.
+        at_vw_flags[0] = stats->meleeApCharges == at_vw_values[1] + 1 && fabsf(stats->meleeApSpent - at_cc_floats[0] - 0.5f) < 0.001f
+            && stats->lastMeleeApCost == (float)rt_attack_ap_cost(obj_dude, HIT_MODE_PUNCH, false) && stats->lastMeleeApCost == 0.5f
+            && stats->freeSwings == at_vw_values[2] + 1;
+        at_cc_floats[4] = stats->lastMeleeApCost;
+        // Empty space: behind the player.
+        at_vw_face((rotation + 3) % ROTATION_COUNT);
+        at_cc_full_ap();
+        at_vw_values[1] = stats->meleeApCharges;
+        at_vw_values[4] = stats->freeSwingWhiffs;
+        at_vw_values[5] = stats->counterRequests;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[1] = stats->meleeApCharges == at_vw_values[1] + 1 && stats->freeSwingWhiffs == at_vw_values[4] + 1
+            && stats->counterRequests == at_vw_values[5];
+        // Not enough AP: less than half a point.
+        at_vw_face(rotation);
+        rt_debug_set_ap(0.25f);
+        at_vw_values[1] = stats->meleeApCharges;
+        at_vw_values[2] = stats->freeSwings;
+        at_vw_values[6] = stats->meleeApRefused;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 3:
+        // AP held at 0.25 until the press (waiting out the previous swing's
+        // cooldown, up to 1.2 s) has been decided.
+        if (since < 1600) {
+            rt_debug_set_ap(0.25f);
+            break;
+        }
+        at_vw_flags[2] = stats->meleeApRefused >= at_vw_values[6] + 1 && stats->freeSwings == at_vw_values[2]
+            && stats->meleeApCharges == at_vw_values[1] && rt_get_dude_ap() < 0.5f;
+        at_cc_floats[2] = rt_get_dude_ap();
+        at_vw_objs[1] = at_cc_give("Knife");
+        at_vw_next(elapsed);
+        break;
+    case 4:
+        // A knife with the lock on the rat: the lock-on path.
+        if (since < 400 || !at_wield(at_vw_objs[1]) || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_cc_keep(&at_vw_objs[0], tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_cc_full_ap();
+        at_vw_values[1] = stats->meleeApCharges;
+        at_vw_values[7] = stats->playerAttacks;
+        at_vw_values[8] = stats->freeSwings;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 5:
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[3] = stats->meleeApCharges == at_vw_values[1] + 1 && stats->playerAttacks == at_vw_values[7] + 1
+            && stats->freeSwings == at_vw_values[8] && stats->lastMeleeApCost == (float)rt_attack_ap_cost(obj_dude, at_cc_hit_mode(), false)
+            && stats->lastMeleeApCost == 1.0f;
+        at_cc_floats[5] = stats->lastMeleeApCost;
+        // Aimed: the knife's 1 AP + 1.
+        at_cc_floats[6] = (float)rt_attack_ap_cost(obj_dude, at_cc_hit_mode(), true);
+        at_vw_values[1] = stats->meleeApCharges;
+        at_vw_next(elapsed);
+        break;
+    case 6: {
+        // AIMED SHOT with the knife: its own cost only.
+        if (at_vw_values[11] == 0) {
+            at_vw_values[11] = 1;
+            at_cc_keep(&at_vw_objs[0], tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+            rt_debug_set_lock(at_vw_objs[0]);
+            break;
+        }
+        at_cc_full_ap();
+        float before = rt_get_dude_ap();
+        int rc = rt_aim_attack(at_vw_objs[0], at_cc_hit_mode(), HIT_LOCATION_HEAD, at_cc_floats[6]);
+        if (rc == RT_AIM_ATTACK_STARTED) {
+            at_cc_floats[3] = before - rt_get_dude_ap();
+            at_vw_flags[4] = at_cc_floats[3] == at_cc_floats[6] && at_cc_floats[6] == 2.0f && stats->meleeApCharges == at_vw_values[1];
+            at_vw_next(elapsed);
+        } else if (rc == RT_AIM_ATTACK_FAILED || since > 4000) {
+            at_log("close combat: aimed attack rc %d", rc);
+            at_vw_next(elapsed);
+        }
+        break;
+    }
+    case 7:
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[5] = stats->meleeApCharges == at_vw_values[1];
+        at_vw_phase = 99;
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    at_check(C_MELEE_AP, at_vw_flags[0] && at_vw_flags[3],
+        "unarmed swing at a target: one charge of %.1f AP (0.5)=%d; knife with the lock: one charge of %.1f AP (1), the lock-on attack path=%d",
+        at_cc_floats[4], at_vw_flags[0], at_cc_floats[5], at_vw_flags[3]);
+    at_check(C_MELEE_AP_EMPTY, at_vw_flags[1],
+        "a swing at empty space costs its AP once and asks for no counterattack=%d", at_vw_flags[1]);
+    at_check(C_MELEE_AP_REFUSE, at_vw_flags[2],
+        "0.25 AP for a 0.5 AP punch: refused with a message, no swing, nothing spent (AP %.2f)=%d", at_cc_floats[2], at_vw_flags[2]);
+    at_check(C_MELEE_AP_AIMED, at_vw_flags[4] && at_vw_flags[5],
+        "AIMED SHOT with the knife spent its own %.1f AP (1 + 1; %.1f taken) and no ordinary attack cost on top=%d; still no extra charge after it landed=%d",
+        at_cc_floats[6], at_cc_floats[3], at_vw_flags[4], at_vw_flags[5]);
+
+    rt_debug_set_lock(NULL);
+    rt_debug_set_ai_paused(false);
+    // The knife leaves the inventory before the fixtures are erased (it
+    // would stay listed there as an erased object).
+    at_unarmed();
+    if (at_vw_objs[1] != NULL) {
+        Object* knife = at_find_inventory("Knife");
+        if (knife != NULL) {
+            item_remove_mult(obj_dude, knife, 1);
+        }
+        if (obj_top_environment(at_vw_objs[1]) == obj_dude) {
+            at_vw_objs[1] = NULL;
+        }
+    }
+    at_vw_cleanup();
+    at_clear_hostiles();
+    return true;
+}
+
+static bool step_cc_counter(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+        rt_debug_set_ai_paused(false);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("close combat: counter test timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[0];
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(8);
+        at_vw_values[0] = at_vw_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_log("close combat: no open hexes");
+            at_vw_phase = 99;
+            break;
+        }
+        rotation = at_vw_values[0];
+        at_vw_face(rotation);
+        // Three enemies next to the player; the lock on the one ahead.
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        at_vw_objs[1] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 1), true);
+        at_vw_objs[2] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 2) % ROTATION_COUNT, 1), true);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // The punch misses the rat ahead.
+        if (since < 700 || anim_busy(obj_dude) || rt_aim_player_in_attack()) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_cc_full_ap();
+        rt_debug_force_player_misses(1);
+        at_vw_values[1] = stats->counterRequests;
+        at_vw_values[2] = stats->counterAttacks;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (stats->counterRequests > at_vw_values[1]) {
+            at_vw_values[3] = stats->counterRequests - at_vw_values[1];
+            // Owed now, or already taken (it can attack in the same tick).
+            at_vw_flags[0] = rt_debug_counter_count() == 1 || stats->counterAttacks > at_vw_values[2];
+            at_vw_next(elapsed);
+        } else if (since > 4000) {
+            at_log("close combat: no counterattack asked for");
+            at_vw_next(elapsed);
+        }
+        break;
+    case 3:
+        // The rat that was missed attacks next.
+        if (stats->counterAttacks > at_vw_values[2] || since > 3500) {
+            at_vw_flags[1] = stats->counterAttacks == at_vw_values[2] + 1 && stats->lastCounterCritter == at_vw_objs[0];
+            at_vw_values[4] = stats->lastCounterStartGrants - stats->lastCounterRequestGrants;
+            at_vw_values[5] = (int)stats->lastCounterDelayMs;
+            at_vw_values[6] = stats->counterRequests - at_vw_values[1];
+            rt_debug_set_lock(NULL);
+            at_vw_next(elapsed);
+        }
+        break;
+    case 4: {
+        // The rules, through the same request: one per enemy, one per
+        // swing, only enemies that can still fight.
+        rt_debug_force_player_misses(0);
+        int requests = stats->counterRequests;
+        int duplicates = stats->counterDuplicates;
+        int repeats = stats->counterSwingRepeats;
+        int ineligible = stats->counterIneligible;
+        rt_debug_counter_request(at_vw_objs[1], 900001);
+        rt_debug_counter_request(at_vw_objs[1], 900002);
+        rt_debug_counter_request(at_vw_objs[2], 900001);
+        Object* calm = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 3) % ROTATION_COUNT, 2), false);
+        rt_debug_counter_request(calm, 900003);
+        at_vw_objs[3] = calm;
+        at_vw_flags[2] = stats->counterRequests == requests + 1 && stats->counterDuplicates == duplicates + 1
+            && stats->counterSwingRepeats == repeats + 1 && stats->counterIneligible == ineligible + 1;
+        at_vw_values[7] = stats->counterRequests - requests;
+        at_vw_values[8] = stats->counterDuplicates - duplicates;
+        at_vw_values[9] = stats->counterSwingRepeats - repeats;
+        at_vw_values[10] = stats->counterIneligible - ineligible;
+        // A knocked down enemy loses its counterattack.
+        at_vw_values[11] = stats->counterExpired;
+        at_vw_objs[1]->data.critter.combat.results |= DAM_KNOCKED_DOWN;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 5:
+        if (since < 300) {
+            break;
+        }
+        at_vw_flags[3] = stats->counterExpired == at_vw_values[11] + 1;
+        at_vw_objs[1]->data.critter.combat.results &= ~DAM_KNOCKED_DOWN;
+        // A counterattack that can't happen in time expires and blocks
+        // nobody: a far enemy owed one, a short window.
+        {
+            RtRules rules = *rt_rules();
+            rules.counterWindowMs = 600;
+            rt_rules_set(&rules);
+        }
+        at_vw_objs[4] = at_spawn_rat_at(at_free_tile(9, 12), true);
+        at_vw_next(elapsed);
+        break;
+    case 6:
+        // Once it is fighting.
+        if (since < 400) {
+            break;
+        }
+        at_vw_values[12] = stats->counterExpired;
+        at_vw_values[13] = stats->playerSlotGrants;
+        at_vw_values[15] = stats->counterRequests;
+        rt_debug_counter_request(at_vw_objs[4], 900004);
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        if (since < 2500) {
+            break;
+        }
+        at_vw_flags[4] = stats->counterRequests == at_vw_values[15] + 1 && stats->counterExpired >= at_vw_values[12] + 1 && rt_debug_counter_count() == 0;
+        at_vw_values[14] = stats->playerSlotGrants - at_vw_values[13];
+        at_vw_phase = 99;
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    at_check(C_COUNTER_FIRST, at_vw_values[3] == 1 && at_vw_flags[0] && at_vw_flags[1] && at_vw_values[4] >= 1 && at_vw_values[4] <= 2,
+        "one missed punch next to 3 enemies: %d counterattack asked for (only the one missed)=%d; that rat attacked next=%d, %d ms after the miss, grants since the request %d (its own included; 2 = one attack that was ready first)",
+        at_vw_values[3], at_vw_flags[0], at_vw_flags[1], at_vw_values[5], at_vw_values[4]);
+    at_check(C_COUNTER_RULES, at_vw_flags[2] && at_vw_flags[3],
+        "new %d, same enemy again %d, same swing again %d, calm/unengaged %d (1 each)=%d; a knocked down enemy lost its counterattack=%d",
+        at_vw_values[7], at_vw_values[8], at_vw_values[9], at_vw_values[10], at_vw_flags[2], at_vw_flags[3]);
+    at_check(C_COUNTER_EXPIRE, at_vw_flags[4],
+        "a far enemy's counterattack expired after the window and left the queue=%d; enemy attacks granted meanwhile %d",
+        at_vw_flags[4], at_vw_values[14]);
+
+    rt_rules_set(NULL);
+    rt_debug_force_player_misses(0);
+    rt_debug_set_lock(NULL);
+    at_vw_cleanup();
+    at_clear_hostiles();
+    return true;
+}
+
+// A wall object between the player and `tile` (`middle` must be free); NULL
+// when no wall prototype blocks there.
+static Object* at_cc_wall(int middle, int tile)
+{
+    if (combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+        return NULL;
+    }
+    for (int index = 1; index < 300; index++) {
+        Object* wall;
+        if (obj_pid_new(&wall, (OBJ_TYPE_WALL << 24) | index) != -1) {
+            Rect rect;
+            obj_move_to_tile(wall, middle, obj_dude->elevation, &rect);
+            if (combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                return wall;
+            }
+            obj_erase_object(wall, &rect);
+        }
+    }
+    return NULL;
+}
+
+static Object* at_cc_sweep_weapon = NULL;
+static Object* at_cc_sweep_wall = NULL;
+
+static bool at_cc_swept(Object* obj)
+{
+    const RtStats* stats = rt_get_stats();
+    for (int index = 0; index < stats->lastSweepCount && index < 8; index++) {
+        if (stats->lastSweepTargets[index] == obj) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool step_cc_sweep(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 1);
+        rt_debug_set_ai_paused(true);
+        at_cc_sweep_weapon = NULL;
+        at_cc_sweep_wall = NULL;
+
+        // The weapon data: which weapons sweep.
+        char sweeping[240] = "";
+        int pick = -1;
+        bool knife = false;
+        bool rifle = false;
+        bool spearThrow = false;
+        bool unarmed = false;
+        bool sledge = false;
+        for (int index = 1; index < 600; index++) {
+            int pid = (OBJ_TYPE_ITEM << 24) | index;
+            Proto* proto;
+            if (proto_ptr(pid, &proto) == -1 || proto->item.type != ITEM_TYPE_WEAPON) {
+                continue;
+            }
+            Object* weapon;
+            if (obj_pid_new(&weapon, pid) == -1) {
+                continue;
+            }
+            bool primary = rt_weapon_sweeps(weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+            bool secondary = rt_weapon_sweeps(weapon, HIT_MODE_RIGHT_WEAPON_SECONDARY);
+            const char* name = object_name(weapon);
+            at_log("sweep data: %-22s two-handed %d, attack types %d/%d, sweeps %d/%d", name, item_w_is_2handed(weapon),
+                item_w_subtype(weapon, HIT_MODE_RIGHT_WEAPON_PRIMARY), item_w_subtype(weapon, HIT_MODE_RIGHT_WEAPON_SECONDARY), primary, secondary);
+            if (primary || secondary) {
+                SDL_strlcat(sweeping, " ", sizeof(sweeping));
+                SDL_strlcat(sweeping, name, sizeof(sweeping));
+            }
+            if (SDL_strcasecmp(name, "Knife") == 0) {
+                knife = !primary && !secondary;
+            } else if (SDL_strcasecmp(name, "Hunting Rifle") == 0) {
+                rifle = item_w_is_2handed(weapon) && !primary && !secondary;
+            } else if (SDL_strcasecmp(name, "Spear") == 0) {
+                spearThrow = !secondary;
+            } else if (SDL_strcasecmp(name, "Power Fist") == 0) {
+                unarmed = !primary && !secondary;
+            } else if (SDL_strcasecmp(name, "Sledgehammer") == 0) {
+                sledge = primary;
+                pick = pid;
+            }
+            Rect rect;
+            obj_erase_object(weapon, &rect);
+        }
+        at_check(C_SWEEP_DATA, sledge && knife && rifle && spearThrow && unarmed,
+            "two-handed flag + melee attack: sweeping weapons:%s; Sledgehammer sweeps=%d; Knife (one-handed) doesn't=%d; Hunting Rifle (two-handed gun) doesn't=%d; Spear's throw doesn't=%d; Power Fist (unarmed) doesn't=%d",
+            sweeping, sledge, knife, rifle, spearThrow, unarmed);
+        if (pick != -1 && obj_pid_new(&at_cc_sweep_weapon, pick) != -1) {
+            Rect rect;
+            if (item_add_force(obj_dude, at_cc_sweep_weapon, 1) == 0) {
+                obj_disconnect(at_cc_sweep_weapon, &rect);
+            } else {
+                at_cc_sweep_weapon = NULL;
+            }
+        }
+        if (at_cc_sweep_weapon == NULL) {
+            at_check(C_SWEEP_TARGETS, false, "no Sledgehammer");
+            perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("sweep test timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[0];
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 400 || !at_wield(at_cc_sweep_weapon) || anim_busy(obj_dude)) {
+            break;
+        }
+        // Around the player (the weapon's reach + 1.5 with Bonus HtH Attacks): A
+        // ahead, B 60 degrees right (both hit); C 60 degrees left two hexes
+        // away behind a wall; D behind; E four hexes ahead (out of reach);
+        // F a bystander 60 degrees right two hexes away (in the arc and in
+        // reach, but neither an enemy, locked, nor straight ahead).
+        at_move_to_clear_spot();
+        at_clear_rats_near(8);
+        int chosen = -1;
+        for (int r = 0; r < ROTATION_COUNT && chosen == -1; r++) {
+            int tiles[] = {
+                tile_num_in_direction(obj_dude->tile, r, 1),
+                tile_num_in_direction(obj_dude->tile, (r + 1) % ROTATION_COUNT, 1),
+                tile_num_in_direction(obj_dude->tile, (r + 5) % ROTATION_COUNT, 1),
+                tile_num_in_direction(obj_dude->tile, (r + 5) % ROTATION_COUNT, 2),
+                tile_num_in_direction(obj_dude->tile, (r + 3) % ROTATION_COUNT, 1),
+                tile_num_in_direction(obj_dude->tile, r, 2),
+                tile_num_in_direction(obj_dude->tile, r, 4),
+                tile_num_in_direction(obj_dude->tile, (r + 1) % ROTATION_COUNT, 2),
+            };
+            bool usable = true;
+            for (int tile : tiles) {
+                if (!at_tile_free(tile) || combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                    usable = false;
+                }
+            }
+            if (usable) {
+                chosen = r;
+            }
+        }
+        if (chosen == -1) {
+            at_check(C_SWEEP_TARGETS, false, "no open hexes around the player");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_values[0] = chosen;
+        rotation = chosen;
+        at_vw_face(rotation);
+        int left1 = tile_num_in_direction(obj_dude->tile, (rotation + 5) % ROTATION_COUNT, 1);
+        int left2 = tile_num_in_direction(obj_dude->tile, (rotation + 5) % ROTATION_COUNT, 2);
+        at_cc_sweep_wall = at_cc_wall(left1, left2);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        at_vw_objs[1] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 1), true);
+        at_vw_objs[2] = at_cc_sweep_wall != NULL ? at_spawn_rat_at(left2, true) : NULL;
+        at_vw_objs[3] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 3) % ROTATION_COUNT, 1), true);
+        at_vw_objs[4] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 4), true);
+        at_vw_objs[5] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 1) % ROTATION_COUNT, 2), false);
+        if (at_vw_objs[5] != NULL) {
+            // Its own team: the rats' team joins in when its members are hit.
+            at_vw_objs[5]->data.critter.combat.team = 99;
+        }
+        for (int index = 0; index < 6; index++) {
+            at_vw_values[1 + index] = at_vw_objs[index] != NULL ? critter_get_hits(at_vw_objs[index]) : -1;
+        }
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1: {
+        if (since < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_cc_full_ap();
+        at_vw_values[7] = stats->attacksStarted;
+        at_vw_values[8] = stats->sweeps;
+        at_vw_values[9] = stats->meleeApCharges;
+        at_cc_floats[0] = stats->meleeApSpent;
+        at_cc_floats[7] = (float)rt_attack_ap_cost(obj_dude, at_cc_hit_mode(), false);
+        at_vw_values[11] = stats->sweepRepeats;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 2: {
+        if (at_vw_values[15] == 0 && since > 350) {
+            at_vw_values[15] = 1;
+            at_screenshot("sweep_impact");
+        }
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        bool hitAB = stats->lastSweepCount == 2 && at_cc_swept(at_vw_objs[0]) && at_cc_swept(at_vw_objs[1]);
+        bool spared = true;
+        for (int index = 2; index < 6; index++) {
+            Object* obj = at_vw_objs[index];
+            if (obj != NULL && (at_cc_swept(obj) || critter_get_hits(obj) != at_vw_values[1 + index])) {
+                spared = false;
+                at_log("sweep: %d was reached", index);
+            }
+        }
+        at_vw_flags[0] = hitAB && spared && stats->sweeps == at_vw_values[8] + 1 && stats->attacksStarted == at_vw_values[7] + 2
+            && stats->sweepRepeats == at_vw_values[11];
+        at_vw_flags[1] = stats->meleeApCharges == at_vw_values[9] + 1 && fabsf(stats->meleeApSpent - at_cc_floats[0] - at_cc_floats[7]) < 0.001f && at_cc_floats[7] == 2.0f;
+        at_vw_values[12] = stats->lastSweepCount;
+        at_vw_values[13] = stats->attacksStarted - at_vw_values[7];
+
+        // Two misses in one sweep: one counterattack. Only the two enemies
+        // stay, back in their places (a hit can knock one away); the other
+        // fixtures could stand straight ahead of the new swing.
+        at_vw_flags[3] = at_vw_objs[2] != NULL;
+        for (int index = 2; index < 6; index++) {
+            if (at_vw_objs[index] != NULL) {
+                at_erase(at_vw_objs[index]);
+                at_vw_objs[index] = NULL;
+            }
+        }
+        for (int index = 0; index < 2; index++) {
+            int tile = tile_num_in_direction(obj_dude->tile, (rotation + index) % ROTATION_COUNT, 1);
+            at_cc_keep(&at_vw_objs[index], tile, true);
+        }
+        at_vw_next(elapsed);
+        break;
+    }
+    case 3:
+        if (since < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_cc_full_ap();
+        rt_debug_force_player_misses(2);
+        at_vw_values[13 + 1] = stats->counterRequests;
+        at_cc_floats[1] = (float)stats->counterSwingRepeats;
+        at_vw_values[8] = stats->sweeps;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 4:
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        for (int index = 0; index < 6; index++) {
+            if (at_vw_objs[index] != NULL) {
+                at_log("sweep: fixture %d at tile %d, swept %d", index, at_vw_objs[index]->tile, at_cc_swept(at_vw_objs[index]));
+            }
+        }
+        at_vw_flags[2] = stats->sweeps == at_vw_values[8] + 1 && stats->lastSweepCount == 2
+            && stats->counterRequests == at_vw_values[14] + 1 && (float)stats->counterSwingRepeats == at_cc_floats[1] + 1.0f;
+        at_vw_phase = 99;
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    at_check(C_SWEEP_TARGETS, at_vw_flags[0] && at_vw_flags[1] && at_vw_flags[3],
+        "Sledgehammer (reach %d + 1.5 with Bonus HtH Attacks, 120 degree arc): reached %d targets, the two in the arc and in reach=%d, each with its own attack (%d started); wall-blocked (%s), behind, out of reach and bystander beside untouched=%d; one AP charge of %.1f (2) for the swing=%d",
+        item_w_range(obj_dude, at_cc_hit_mode()), at_vw_values[12], at_vw_flags[0], at_vw_values[13], at_vw_flags[3] ? "placed" : "no wall could be placed",
+        at_vw_flags[0], at_cc_floats[7], at_vw_flags[1]);
+    at_check(C_SWEEP_COUNTER, at_vw_flags[2],
+        "a sweep missing two enemies asked for one counterattack, the second miss refused as the same swing=%d", at_vw_flags[2]);
+
+    rt_debug_force_player_misses(0);
+    perk_rt_debug_set_rank(PERK_BONUS_HTH_ATTACKS, 0);
+    rt_debug_set_ai_paused(false);
+    at_vw_cleanup();
+    if (at_cc_sweep_wall != NULL) {
+        at_erase(at_cc_sweep_wall);
+        at_cc_sweep_wall = NULL;
+    }
+    at_unarmed();
+    if (at_cc_sweep_weapon != NULL) {
+        item_remove_mult(obj_dude, at_cc_sweep_weapon, 1);
+        at_cc_sweep_weapon = NULL;
+    }
+    at_clear_hostiles();
+    return true;
+}
+
+// Save/load: a Quick Pockets record kept, nothing owed, no menu input mode
+// left on.
+// -----------------------------------------------------------------------------
+// Attack AP costs, RB throws, ranged counterattacks
+// -----------------------------------------------------------------------------
+
+typedef struct AtApCase {
+    const char* name;
+    // Primary attack: ordinary and aimed cost; secondary attack (-1: none
+    // checked).
+    float ordinary;
+    float aimed;
+    float secondary;
+    RtWeaponClass weaponClass;
+} AtApCase;
+
+static const AtApCase at_ap_cases[] = {
+    { "Brass Knuckles", 1.0f, 2.0f, -1.0f, RT_WEAPON_CLASS_UNARMED },
+    { "Spiked Knuckles", 1.0f, 2.0f, -1.0f, RT_WEAPON_CLASS_UNARMED },
+    { "Power Fist", 1.0f, 2.0f, -1.0f, RT_WEAPON_CLASS_UNARMED },
+    { "Knife", 1.0f, 2.0f, 1.0f, RT_WEAPON_CLASS_LIGHT_MELEE },
+    { "Combat Knife", 1.0f, 2.0f, 1.0f, RT_WEAPON_CLASS_LIGHT_MELEE },
+    { "Club", 1.0f, 2.0f, -1.0f, RT_WEAPON_CLASS_LIGHT_MELEE },
+    { "Crowbar", 2.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    // The Spear's secondary attack is a throw.
+    { "Spear", 2.0f, 3.0f, 3.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    { "Cattle Prod", 2.0f, 3.0f, 2.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    { "Ripper", 2.0f, 3.0f, 2.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    { "Sledgehammer", 2.0f, 3.0f, 2.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    { "Super Sledge", 2.0f, 3.0f, 2.0f, RT_WEAPON_CLASS_HEAVY_MELEE },
+    { "10mm Pistol", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "14mm Pistol", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { ".223 Pistol", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "Desert Eagle .44", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "9mm Mauser", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "Laser Pistol", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "Plasma Pistol", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "Alien Blaster", 0.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_PISTOL },
+    { "10mm SMG", 0.0f, 4.0f, 0.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Hunting Rifle", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Assault Rifle", 0.0f, 4.0f, 0.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Sniper Rifle", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Shotgun", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Combat Shotgun", 0.0f, 4.0f, 0.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Laser Rifle", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Plasma Rifle", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Turbo Plasma Rifle", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Red Ryder BB Gun", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Red Ryder LE BB Gun", 0.0f, 4.0f, -1.0f, RT_WEAPON_CLASS_RIFLE },
+    { "Flamer", 0.0f, 5.0f, -1.0f, RT_WEAPON_CLASS_BIG_GUN },
+    { "Minigun", 0.0f, 5.0f, -1.0f, RT_WEAPON_CLASS_BIG_GUN },
+    { "Rocket Launcher", 0.0f, 5.0f, -1.0f, RT_WEAPON_CLASS_BIG_GUN },
+    { "Gatling Laser", 0.0f, 5.0f, -1.0f, RT_WEAPON_CLASS_BIG_GUN },
+    // Thrown weapons: 3 AP, never aimed (the aimed figure is the same 3).
+    // The Rock's punch and the Throwing Knife's swing cost as knuckles and a
+    // knife do.
+    { "Rock", 3.0f, 3.0f, 1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Throwing Knife", 3.0f, 3.0f, 1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Grenade (Frag)", 3.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Grenade (Plasma)", 3.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Grenade (Pulse)", 3.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Molotov Cocktail", 3.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_THROWN },
+    { "Flare", 3.0f, 3.0f, -1.0f, RT_WEAPON_CLASS_THROWN },
+};
+
+// The player's items of `pid` not in a hand or worn.
+static Object* at_unheld_of(int pid)
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if (item->pid == pid && (item->flags & OBJECT_EQUIPPED) == 0) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+// Every weapon's AP, from the hand it goes in (thrown weapons: the right
+// one), plus fists and kicks; thrown weapons are refused in the left hand.
+static bool step_ap_table(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_AP_TABLE, false, "timed out in phase %d", at_vw_phase);
+        return true;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 400 || anim_busy(obj_dude) || rt_is_reloading() || !at_unarmed()) {
+            break;
+        }
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+
+        int cases = 0;
+        int failures = 0;
+        int missing = 0;
+        char detail[400] = "";
+        auto fail = [&](const char* format, const char* name, float got, float expected) {
+            failures++;
+            size_t length = strlen(detail);
+            if (length < sizeof(detail) - 80) {
+                snprintf(detail + length, sizeof(detail) - length, format, name, got, expected);
+            }
+        };
+
+        // Fists and kicks: half a point, aimed 1.5.
+        float punch = (float)rt_attack_ap_cost(obj_dude, HIT_MODE_PUNCH, false);
+        float kick = (float)rt_attack_ap_cost(obj_dude, HIT_MODE_KICK, false);
+        float punchAimed = (float)rt_attack_ap_cost(obj_dude, HIT_MODE_PUNCH, true);
+        cases++;
+        if (punch != 0.5f || kick != 0.5f || punchAimed != 1.5f) {
+            fail(" %s %.1f (exp %.1f)", "fists/kicks", punch + kick + punchAimed, 2.5f);
+        }
+
+        for (const AtApCase& entry : at_ap_cases) {
+            int pid = at_item_pid_by_name(entry.name);
+            at_log("ap table: %s (pid %d)", entry.name, pid);
+            Object* item = NULL;
+            if (pid == -1 || obj_pid_new(&item, pid) == -1) {
+                missing++;
+                at_log("ap table: no %s", entry.name);
+                continue;
+            }
+            Rect rect;
+            if (item_add_force(obj_dude, item, 1) != 0) {
+                obj_erase_object(item, &rect);
+                missing++;
+                continue;
+            }
+            obj_disconnect(item, &rect);
+            // An identical item already carried absorbs the new one.
+            item = at_unheld_of(pid);
+            if (item == NULL) {
+                missing++;
+                continue;
+            }
+
+            bool thrown = entry.weaponClass == RT_WEAPON_CLASS_THROWN;
+            if (thrown && inven_rt_equip(item, INVEN_RT_SLOT_LEFT_HAND) != -1) {
+                fail(" %s went in the left hand%.0f%.0f", entry.name, 0.0f, 0.0f);
+            }
+            if (inven_rt_equip(item, thrown ? INVEN_RT_SLOT_RIGHT_HAND : INVEN_RT_SLOT_LEFT_HAND) != 0) {
+                fail(" %s could not be equipped%.0f%.0f", entry.name, 0.0f, 0.0f);
+            } else {
+                Object* held = thrown ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
+                int primary = thrown ? HIT_MODE_RIGHT_WEAPON_PRIMARY : HIT_MODE_LEFT_WEAPON_PRIMARY;
+                int secondary = thrown ? HIT_MODE_RIGHT_WEAPON_SECONDARY : HIT_MODE_LEFT_WEAPON_SECONDARY;
+                float ordinary = (float)rt_attack_ap_cost(obj_dude, primary, false);
+                float aimed = (float)rt_attack_ap_cost(obj_dude, primary, true);
+                cases++;
+                if (ordinary != entry.ordinary) {
+                    fail(" %s %.1f (exp %.1f)", entry.name, ordinary, entry.ordinary);
+                }
+                if (aimed != entry.aimed) {
+                    fail(" %s aimed %.1f (exp %.1f)", entry.name, aimed, entry.aimed);
+                }
+                if (entry.secondary >= 0.0f) {
+                    float second = (float)rt_attack_ap_cost(obj_dude, secondary, false);
+                    if (second != entry.secondary) {
+                        fail(" %s second %.1f (exp %.1f)", entry.name, second, entry.secondary);
+                    }
+                }
+                if (rt_weapon_class(held) != entry.weaponClass || rt_is_thrown_weapon(held) != thrown) {
+                    fail(" %s class %.0f (exp %.0f)", entry.name, (float)rt_weapon_class(held), (float)entry.weaponClass);
+                }
+                inven_rt_unequip(held);
+            }
+
+            Object* stack = at_unheld_of(pid);
+            if (stack != NULL) {
+                item_remove_mult(obj_dude, stack, 1);
+            }
+        }
+
+        at_vw_values[0] = cases;
+        at_vw_values[1] = failures;
+        at_vw_values[2] = missing;
+        at_vw_floats[0] = punch;
+        SDL_strlcpy(at_mn_note, detail, sizeof(at_mn_note));
+        at_unarmed();
+        intface_update_items(false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1:
+        // The HUD's item slot with fists: "AP 0.5".
+        if (since < 500) {
+            break;
+        }
+        at_screenshot("ap_hud_fists");
+        at_check(C_AP_TABLE, at_vw_values[0] >= 43 && at_vw_values[1] == 0 && at_vw_values[2] == 0,
+            "%d weapons/modes checked (fists %.1f), %d mismatches, %d missing;%s",
+            at_vw_values[0], at_vw_floats[0], at_vw_values[1], at_vw_values[2], at_mn_note);
+        return true;
+    }
+    return false;
+}
+
+static int at_rb_rock_pid = -1;
+static Object* at_rb_pistol = NULL;
+static Object* at_rb_spear = NULL;
+
+// The rocks not in a hand.
+static Object* at_rb_stack()
+{
+    Inventory* inventory = &(obj_dude->data.inventory);
+    for (int index = 0; index < inventory->length; index++) {
+        Object* item = inventory->items[index].item;
+        if (item->pid == at_rb_rock_pid && (item->flags & OBJECT_IN_ANY_HAND) == 0) {
+            return item;
+        }
+    }
+    return NULL;
+}
+
+static Object* at_rb_right_rock()
+{
+    Object* right = inven_right_hand(obj_dude);
+    return right != NULL && right->pid == at_rb_rock_pid ? right : NULL;
+}
+
+// RB throws the right hand's thrown weapon while the left hand's pistol
+// stays the active item; too little AP refuses; the hands rule; the
+// Spear's throw can't be aimed.
+static bool step_rb_throw(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        at_rb_rock_pid = at_item_pid_by_name("Rock");
+        at_rb_pistol = NULL;
+        at_rb_spear = NULL;
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("rb throw: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[0];
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(8);
+        at_vw_values[0] = at_vw_open_rotation();
+        if (at_vw_values[0] == -1 || at_rb_rock_pid == -1) {
+            at_log("rb throw: no open hexes or no rocks");
+            at_vw_phase = 99;
+            break;
+        }
+        for (int index = 0; index < 3; index++) {
+            at_bm_give(obj_dude, at_rb_rock_pid, false);
+        }
+        inven_rt_equip(at_rb_stack(), INVEN_RT_SLOT_RIGHT_HAND);
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        // The pistol in the left (active) hand, a hostile rat 3 hexes ahead.
+        if (since < 400 || anim_busy(obj_dude) || !at_wield(at_test_pistol())) {
+            break;
+        }
+        at_rb_pistol = at_test_pistol();
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 3), true);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_next(elapsed);
+        break;
+    case 2: {
+        if (since < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        Object* active = NULL;
+        intface_get_current_item(&active);
+        at_vw_flags[0] = active == at_rb_pistol && !intface_is_item_right_hand() && at_rb_right_rock() != NULL;
+        at_cc_full_ap();
+        at_vw_values[1] = stats->playerThrow;
+        at_vw_values[2] = stats->rbThrows;
+        at_vw_values[3] = at_count_pid_in(obj_dude, at_rb_rock_pid);
+        at_vw_values[4] = stats->counterRangedRequests;
+        at_vw_values[5] = stats->playerSingle;
+        at_vw_floats[0] = stats->throwApSpent;
+        // The throw misses: the rat may counterattack.
+        rt_debug_force_player_misses(1);
+        at_screenshot("rb_throw_before");
+        at_press(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 3: {
+        if (since < 2500 || ((rt_get_pending_count() > 0 || anim_busy(obj_dude)) && since < 6000)) {
+            break;
+        }
+        rt_debug_force_player_misses(0);
+        Object* active = NULL;
+        intface_get_current_item(&active);
+        int code = (obj_dude->fid & 0xF000) >> 12;
+        at_vw_flags[1] = stats->playerThrow == at_vw_values[1] + 1 && stats->rbThrows == at_vw_values[2] + 1
+            && stats->playerSingle == at_vw_values[5];
+        at_vw_flags[2] = active == at_rb_pistol && !intface_is_item_right_hand() && code == item_w_anim_code(at_rb_pistol)
+            && stats->lastRbThrowActiveItem == at_rb_pistol && stats->lastRbThrowPid == at_rb_rock_pid;
+        at_vw_floats[1] = stats->throwApSpent - at_vw_floats[0];
+        at_vw_flags[3] = fabsf(at_vw_floats[1] - 3.0f) < 0.001f;
+        at_vw_values[6] = at_count_pid_in(obj_dude, at_rb_rock_pid);
+        at_vw_values[7] = code;
+        // The next rock of the stack is in the hand.
+        at_vw_flags[4] = at_vw_values[6] == at_vw_values[3] - 1 && at_rb_right_rock() != NULL;
+        at_vw_flags[5] = stats->counterRangedRequests == at_vw_values[4] + 1;
+        at_screenshot("rb_throw_after");
+        at_vw_next(elapsed);
+        break;
+    }
+    case 4:
+        // Too little AP (2 of 3): refused, nothing thrown.
+        if (since < 300) {
+            break;
+        }
+        rt_debug_set_ap(2.0f);
+        at_vw_values[8] = stats->playerThrow;
+        at_vw_values[9] = stats->rbThrowRefused;
+        at_press(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        at_vw_next(elapsed);
+        break;
+    case 5: {
+        if (since < 1600) {
+            rt_debug_set_ap(2.0f);
+            break;
+        }
+        at_vw_flags[6] = stats->playerThrow == at_vw_values[8] && stats->rbThrowRefused >= at_vw_values[9] + 1;
+        at_cc_full_ap();
+
+        // The left hand refuses a thrown weapon.
+        Object* stack = at_rb_stack();
+        at_vw_flags[7] = stack != NULL && inven_rt_equip(stack, INVEN_RT_SLOT_LEFT_HAND) == -1
+            && inven_left_hand(obj_dude) == at_rb_pistol;
+
+        // A rock in the left hand anyway (as an old save could have it):
+        // both hands emptied, then one rock flagged for the left hand.
+        Object* right = at_rb_right_rock();
+        if (right != NULL) {
+            inven_rt_unequip(right);
+        }
+        inven_rt_unequip(at_rb_pistol);
+        stack = at_rb_stack();
+        if (stack != NULL && item_remove_mult(obj_dude, stack, 1) == 0) {
+            stack->flags |= OBJECT_IN_LEFT_HAND;
+            item_add_force(obj_dude, stack, 1);
+        }
+        intface_update_items(false);
+        at_vw_flags[12] = rt_is_thrown_weapon(inven_left_hand(obj_dude));
+        at_vw_values[10] = stats->thrownHandFixes;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        if (since < 800) {
+            break;
+        }
+        at_vw_flags[8] = at_vw_flags[12] && !rt_is_thrown_weapon(inven_left_hand(obj_dude)) && at_rb_right_rock() != NULL
+            && stats->thrownHandFixes >= at_vw_values[10] + 1;
+        // The active hand made the right one, which holds a rock: the turn
+        // goes back to the left.
+        intface_toggle_items(false);
+        at_vw_values[11] = intface_is_item_right_hand();
+        at_vw_values[10] = stats->thrownHandFixes;
+        at_vw_next(elapsed);
+        break;
+    case 7: {
+        if (since < 800) {
+            break;
+        }
+        at_vw_flags[9] = at_vw_values[11] == 1 && !intface_is_item_right_hand() && stats->thrownHandFixes >= at_vw_values[10] + 1;
+        // RB without a thrown weapon in the right hand switches hands.
+        Object* right = at_rb_right_rock();
+        if (right != NULL) {
+            inven_rt_unequip(right);
+        }
+        at_vw_values[12] = intface_is_item_right_hand();
+        at_vw_values[13] = stats->playerThrow;
+        at_press(GAMEPAD_BUTTON_RIGHT_SHOULDER);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 8:
+        if (since < 800) {
+            break;
+        }
+        at_vw_flags[10] = intface_is_item_right_hand() != at_vw_values[12] && stats->playerThrow == at_vw_values[13];
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+        // The Spear in the left hand, in its throw mode.
+        at_rb_spear = at_cc_give("Spear");
+        at_vw_values[14] = 0;
+        at_vw_next(elapsed);
+        break;
+    case 9:
+        if (since < 400 || anim_busy(obj_dude) || at_rb_spear == NULL || !at_wield(at_rb_spear)) {
+            if (since > 5000) {
+                at_log("rb throw: no spear");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        if (at_current_anim() != ANIM_THROW_ANIM) {
+            // Y cycles the attack mode (thrust -> throw).
+            if (since > 700u * (unsigned int)(at_vw_values[14] + 1) && at_vw_values[14] < 5) {
+                at_vw_values[14]++;
+                at_press(GAMEPAD_BUTTON_Y);
+            }
+            break;
+        }
+        at_vw_values[15] = rt_aimed_get_state()->refusals;
+        at_vw_floats[2] = (float)rt_attack_ap_cost(obj_dude, at_current_hit_mode(), false);
+        at_press(GAMEPAD_BUTTON_LEFT_SHOULDER);
+        at_vw_next(elapsed);
+        break;
+    case 10:
+        if (since < 700) {
+            break;
+        }
+        at_vw_flags[11] = rt_aimed_get_state()->refusals == at_vw_values[15] + 1 && !rt_aimed_get_state()->selecting
+            && strstr(rt_aimed_get_state()->message, "can't be aimed") != NULL && at_vw_floats[2] == 3.0f;
+        at_vw_phase = 99;
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    at_check(C_THROW_RB, at_vw_flags[0] && at_vw_flags[1] && at_vw_flags[2] && at_vw_flags[3] && at_vw_flags[4] && at_vw_flags[5],
+        "pistol active in the left hand, rock in the right=%d; RB -> one throw, no shot=%d; pistol still active, sprite code %d back to the pistol's=%d; %.1f AP spent (3)=%d; the next rock in the hand (%d -> %d)=%d; the missed throw asked for a ranged counterattack=%d",
+        at_vw_flags[0], at_vw_flags[1], at_vw_values[7], at_vw_flags[2], at_vw_floats[1], at_vw_flags[3],
+        at_vw_values[3], at_vw_values[6], at_vw_flags[4], at_vw_flags[5]);
+    at_check(C_THROW_RB_AP, at_vw_flags[6], "2 AP for a 3 AP throw: RB refused, nothing thrown=%d", at_vw_flags[6]);
+    at_check(C_THROW_HANDS, at_vw_flags[7] && at_vw_flags[8] && at_vw_flags[9] && at_vw_flags[10],
+        "left hand refuses a rock=%d; a rock found in the left hand moved to the empty right hand=%d; an active right hand holding a rock gave the turn to the left=%d; RB with no thrown weapon in the right hand switched hands=%d",
+        at_vw_flags[7], at_vw_flags[8], at_vw_flags[9], at_vw_flags[10]);
+    at_check(C_THROW_NO_AIM, at_vw_flags[11],
+        "Spear in its throw mode (%.1f AP): LB refused with '%s'=%d", at_vw_floats[2], rt_aimed_get_state()->message, at_vw_flags[11]);
+
+    rt_debug_force_player_misses(0);
+    rt_debug_set_lock(NULL);
+    rt_debug_set_ai_paused(false);
+    at_vw_cleanup();
+    at_unarmed();
+    if (intface_is_item_right_hand()) {
+        intface_toggle_items(false);
+    }
+    for (int tries = 0; tries < 4; tries++) {
+        Object* rocks = inven_pid_is_carried_ptr(obj_dude, at_rb_rock_pid);
+        if (rocks == NULL || item_remove_mult(obj_dude, rocks, item_count(obj_dude, rocks)) != 0) {
+            break;
+        }
+    }
+    if (at_rb_spear != NULL && obj_top_environment(at_rb_spear) == obj_dude) {
+        item_remove_mult(obj_dude, at_rb_spear, 1);
+    }
+    at_release_test_pistol();
+    at_clear_hostiles();
+    return true;
+}
+
+// A hostile critter holding a loaded 10mm pistol (a prototype with pistol
+// firing art), the script removed.
+static Object* at_spawn_gunman(int tile)
+{
+    int pistolPid = at_item_pid_by_name("10mm Pistol");
+    if (tile == -1 || pistolPid == -1) {
+        return NULL;
+    }
+    for (int index = 1; index < 600; index++) {
+        int pid = (OBJ_TYPE_CRITTER << 24) | index;
+        Proto* proto;
+        if (pid == obj_dude->pid || proto_ptr(pid, &proto) == -1) {
+            continue;
+        }
+        int base = proto->fid & 0xFFF;
+        if (!art_exists(art_id(OBJ_TYPE_CRITTER, base, ANIM_FIRE_SINGLE, WEAPON_ANIMATION_PISTOL, 1))
+            || !art_exists(art_id(OBJ_TYPE_CRITTER, base, ANIM_STAND, WEAPON_ANIMATION_PISTOL, 1))) {
+            continue;
+        }
+        Object* critter;
+        if (obj_pid_new(&critter, pid) == -1) {
+            continue;
+        }
+        if (critter->sid != -1) {
+            scr_remove(critter->sid);
+            critter->sid = -1;
+        }
+        Object* pistol;
+        Rect rect;
+        if (obj_pid_new(&pistol, pistolPid) == -1) {
+            at_erase(critter);
+            return NULL;
+        }
+        pistol->flags |= OBJECT_IN_RIGHT_HAND;
+        if (item_add_force(critter, pistol, 1) != 0) {
+            obj_erase_object(pistol, &rect);
+            at_erase(critter);
+            return NULL;
+        }
+        obj_disconnect(pistol, &rect);
+        item_w_set_curr_ammo(pistol, item_w_max_ammo(pistol));
+
+        obj_move_to_tile(critter, tile, obj_dude->elevation, &rect);
+        obj_change_fid(critter, art_id(OBJ_TYPE_CRITTER, base, ANIM_STAND, WEAPON_ANIMATION_PISTOL, critter->rotation + 1), &rect);
+        tile_refresh_rect(&rect, obj_dude->elevation);
+        critter->data.critter.combat.team = at_rat_team;
+
+        STRUCT_664980 request;
+        memset(&request, 0, sizeof(request));
+        request.attacker = critter;
+        request.defender = obj_dude;
+        rt_combat_request(&request);
+        at_log("harness: spawned a gunman (%s) at %d tiles", critter_name(critter), obj_dist(obj_dude, critter));
+        return critter;
+    }
+    return NULL;
+}
+
+// A missed shot gives the enemy the counterattack: a rat closes in and
+// bites, a gunman in range shoots back from where it stands. Ordinary
+// gunfire costs no AP.
+static bool step_ranged_counter(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("ranged counter: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[0];
+    if (at_vw_phase >= 3 && at_vw_phase < 99) {
+        at_heal();
+    }
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(10);
+        at_vw_values[0] = at_vw_open_rotation();
+        if (at_vw_values[0] == -1) {
+            at_log("ranged counter: no open hexes");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_next(elapsed);
+        break;
+    case 1:
+        if (since < 300 || anim_busy(obj_dude) || !at_wield(at_test_pistol())) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 4), true);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        // The shot misses the rat 4 hexes away.
+        if (since < 600 || anim_busy(obj_dude) || at_vw_objs[0] == NULL) {
+            break;
+        }
+        rt_debug_set_ap(5.0f);
+        at_vw_floats[0] = rt_get_dude_ap();
+        at_vw_values[1] = stats->playerSingle;
+        at_vw_values[2] = stats->meleeApCharges + stats->throwApCharges;
+        at_vw_values[3] = stats->counterRangedRequests;
+        at_vw_values[4] = stats->counterRangedAttacks;
+        at_vw_values[5] = obj_dist(obj_dude, at_vw_objs[0]);
+        rt_debug_force_player_misses(1);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 3:
+        // The shot started: no AP taken (it only regenerates).
+        if (stats->playerSingle > at_vw_values[1] && at_vw_floats[1] == 0.0f) {
+            at_vw_floats[1] = rt_get_dude_ap();
+            at_vw_flags[0] = at_vw_floats[1] >= at_vw_floats[0] - 0.001f
+                && stats->meleeApCharges + stats->throwApCharges == at_vw_values[2];
+        }
+        if (stats->counterRangedRequests > at_vw_values[3]) {
+            // The rat may act now.
+            rt_debug_set_ai_paused(false);
+            at_vw_next(elapsed);
+        } else if (since > 4000) {
+            at_log("ranged counter: no counterattack asked for after the missed shot");
+            at_vw_next(elapsed);
+        }
+        break;
+    case 4:
+        // It closes in and attacks: its attack is the counterattack.
+        if (stats->counterRangedAttacks > at_vw_values[4] || since > 7000) {
+            at_vw_flags[1] = stats->counterRangedAttacks == at_vw_values[4] + 1 && stats->lastCounterCritter == at_vw_objs[0]
+                && stats->lastCounterRanged && at_vw_values[5] > 1 && at_vw_objs[0] != NULL && obj_dist(obj_dude, at_vw_objs[0]) <= 1;
+            at_vw_values[6] = at_vw_objs[0] != NULL ? obj_dist(obj_dude, at_vw_objs[0]) : -1;
+            at_vw_values[7] = (int)stats->lastCounterDelayMs;
+            rt_debug_set_ai_paused(true);
+            rt_debug_set_lock(NULL);
+            at_erase(at_vw_objs[0]);
+            at_vw_objs[0] = NULL;
+            at_vw_next(elapsed);
+        }
+        break;
+    case 5:
+        // A gunman 4 hexes away.
+        if (since < 1500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_face(rotation);
+        at_vw_objs[1] = at_spawn_gunman(tile_num_in_direction(obj_dude->tile, rotation, 4));
+        if (at_vw_objs[1] == NULL) {
+            at_log("ranged counter: no gunman could be placed");
+            at_vw_phase = 99;
+            break;
+        }
+        rt_debug_set_lock(at_vw_objs[1]);
+        at_vw_next(elapsed);
+        break;
+    case 6:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_values[8] = at_vw_objs[1]->tile;
+        at_vw_values[3] = stats->counterRangedRequests;
+        at_vw_values[4] = stats->counterRangedAttacks;
+        rt_debug_set_ap(5.0f);
+        rt_debug_force_player_misses(1);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        if (stats->counterRangedRequests > at_vw_values[3]) {
+            rt_debug_set_ai_paused(false);
+            at_vw_next(elapsed);
+        } else if (since > 4000) {
+            at_log("ranged counter: no counterattack asked for after missing the gunman");
+            at_vw_next(elapsed);
+        }
+        break;
+    case 8:
+        // It shoots back from where it stands.
+        if (stats->counterRangedAttacks > at_vw_values[4] || since > 7000) {
+            Object* gunman = at_vw_objs[1];
+            int hitMode = stats->lastCounterHitMode;
+            Object* weapon = gunman != NULL ? item_hit_with(gunman, hitMode) : NULL;
+            at_vw_values[9] = weapon != NULL ? item_w_subtype(weapon, hitMode) : -1;
+            at_vw_flags[2] = stats->counterRangedAttacks == at_vw_values[4] + 1 && stats->lastCounterCritter == gunman
+                && stats->lastCounterRanged && at_vw_values[9] == ATTACK_TYPE_RANGED && gunman != NULL && gunman->tile == at_vw_values[8];
+            at_screenshot("ranged_counter_gunman");
+            at_vw_phase = 99;
+        }
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    at_check(C_AP_GUNS_FREE, at_vw_flags[0], "ordinary pistol shot: AP %.2f before, %.2f when it started, no AP charge=%d",
+        at_vw_floats[0], at_vw_floats[1], at_vw_flags[0]);
+    at_check(C_COUNTER_RANGED_CLOSE, at_vw_flags[1],
+        "missed shot at a rat %d hexes away: it got the counterattack, closed in (now %d) and attacked (%d ms after the miss)=%d",
+        at_vw_values[5], at_vw_values[6], at_vw_values[7], at_vw_flags[1]);
+    at_check(C_COUNTER_RANGED_SHOOT, at_vw_flags[2],
+        "missed shot at a gunman 4 hexes away: its counterattack was a shot (attack type %d), from the same hex=%d",
+        at_vw_values[9], at_vw_flags[2]);
+
+    rt_debug_force_player_misses(0);
+    rt_debug_set_lock(NULL);
+    rt_debug_set_ai_paused(false);
+    at_vw_cleanup();
+    at_release_test_pistol();
+    at_clear_hostiles();
+    at_heal();
+    return true;
+}
+
+// An animation's original length (frames at the art's fps).
+static int at_anim_length_ms(Object* critter, int anim)
+{
+    int fid = art_id(OBJ_TYPE_CRITTER, critter->fid & 0xFFF, anim, (critter->fid & 0xF000) >> 12, critter->rotation + 1);
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art == NULL) {
+        return -1;
+    }
+    int frames = art_frame_max_frame(art);
+    int fps = art_frame_fps(art);
+    art_ptr_unlock(handle);
+    return fps > 0 ? frames * (1000 / fps) : -1;
+}
+
+static void at_play_anim(Object* critter, int anim)
+{
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_object_animate(critter, anim, 0);
+    register_end();
+}
+
+static void at_full_hp(Object* critter)
+{
+    critter_adjust_hits(critter, stat_level(critter, STAT_MAXIMUM_HIT_POINTS) - critter_get_hits(critter));
+}
+
+// Enemy hit reactions: ordinary ones play at `hit_reaction_speed` (nothing
+// else does), a hit enemy moves again as soon as its reaction is over,
+// repeated hits never queue reactions, and deaths and knockdowns are as
+// before.
+static bool step_reactions(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("reactions: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    int rotation = at_vw_values[15];
+    Object* rat = at_vw_objs[0];
+    if (at_vw_phase >= 1 && at_vw_phase < 99) {
+        at_heal();
+        rt_debug_set_ap(10.0f);
+    }
+
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(12);
+        at_vw_values[15] = at_vw_open_rotation();
+        if (at_vw_values[15] == -1) {
+            at_log("reactions: no open hexes");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_face(at_vw_values[15]);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, at_vw_values[15], 1), false);
+        at_vw_next(elapsed);
+        break;
+    case 1: {
+        if (since < 400 || rat == NULL || anim_busy(rat)) {
+            if (rat == NULL) {
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        // Only an NPC's ordinary hit reactions are faster.
+        at_vw_flags[0] = rt_anim_frame_time(rat, ANIM_HIT_FROM_FRONT, 100) == 50
+            && rt_anim_frame_time(rat, ANIM_HIT_FROM_BACK, 100) == 50
+            && rt_anim_frame_time(rat, ANIM_DODGE_ANIM, 100) == 100
+            && rt_anim_frame_time(rat, ANIM_WALK, 100) == 100
+            && rt_anim_frame_time(rat, ANIM_RUNNING, 100) == 100
+            && rt_anim_frame_time(rat, ANIM_FALL_BACK, 100) == 100
+            && rt_anim_frame_time(rat, ANIM_FALL_FRONT, 100) == 100
+            && rt_anim_frame_time(rat, ANIM_THROW_PUNCH, 100) == 100
+            && rt_anim_frame_time(obj_dude, ANIM_HIT_FROM_FRONT, 100) == 100;
+        at_vw_values[0] = at_anim_length_ms(rat, ANIM_HIT_FROM_FRONT);
+        at_vw_values[1] = SDL_GetTicks();
+        at_play_anim(rat, ANIM_HIT_FROM_FRONT);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 2:
+        if (anim_busy(rat) && since < 3000) {
+            break;
+        }
+        at_vw_values[2] = SDL_GetTicks() - at_vw_values[1];
+        at_vw_values[3] = at_anim_length_ms(rat, ANIM_DODGE_ANIM);
+        at_vw_values[4] = SDL_GetTicks();
+        at_play_anim(rat, ANIM_DODGE_ANIM);
+        at_vw_next(elapsed);
+        break;
+    case 3:
+        if (anim_busy(rat) && since < 3000) {
+            break;
+        }
+        at_vw_values[5] = SDL_GetTicks() - at_vw_values[4];
+        at_check(C_REACTION_SPEED,
+            at_vw_flags[0] && at_vw_values[0] > 0
+                && at_vw_values[2] >= at_vw_values[0] * 3 / 10 && at_vw_values[2] <= at_vw_values[0] * 3 / 4
+                && (at_vw_values[3] <= 0 || at_vw_values[5] >= at_vw_values[3] * 8 / 10),
+            "only NPC hit reactions are faster (dodge, walk, run, falls, attacks and the player's reaction keep their frame time)=%d; rat hit reaction %d ms (originally %d), dodge %d ms (originally %d)",
+            at_vw_flags[0], at_vw_values[2], at_vw_values[0], at_vw_values[5], at_vw_values[3]);
+        at_erase(rat);
+        at_vw_objs[0] = NULL;
+        at_vw_next(elapsed);
+        break;
+    case 4:
+        // Repeated punches at a rat: every hit an ordinary reaction.
+        if (since < 400 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        if (at_vw_objs[0] == NULL) {
+            at_vw_phase = 99;
+            break;
+        }
+        at_full_hp(at_vw_objs[0]);
+        rt_debug_set_lock(at_vw_objs[0]);
+        rt_debug_force_player_hits(8, 0);
+        at_vw_values[6] = stats->playerHits;
+        at_vw_values[7] = 0;
+        at_vw_values[8] = 0;
+        at_vw_values[9] = 0;
+        at_vw_values[10] = stats->damageMismatches;
+        at_vw_values[11] = stats->reactionReleases;
+        at_vw_values[12] = stats->fastReactionAnims;
+        at_vw_values[14] = stats->attacksResolved;
+        at_vw_next(elapsed);
+        break;
+    case 5:
+        at_vw_values[8] = std::max(at_vw_values[8], rt_debug_attacks_on(rat));
+        at_vw_values[9] = std::max(at_vw_values[9], anim_rt_sequence_count(rat));
+        if (stats->attacksResolved != at_vw_values[14]) {
+            at_vw_values[14] = stats->attacksResolved;
+            at_vw_floats[0] = (float)SDL_GetTicks();
+        }
+        if (since < 5000) {
+            // RT pressed again and again, faster than the attacks can go.
+            if (since - (unsigned int)at_vw_values[7] >= 120) {
+                at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+                at_vw_values[7] = since;
+            }
+            break;
+        }
+        at_vw_values[13] = SDL_GetTicks();
+        at_vw_next(elapsed);
+        break;
+    case 6: {
+        at_vw_values[8] = std::max(at_vw_values[8], rt_debug_attacks_on(rat));
+        at_vw_values[9] = std::max(at_vw_values[9], anim_rt_sequence_count(rat));
+        if (stats->attacksResolved != at_vw_values[14]) {
+            at_vw_values[14] = stats->attacksResolved;
+            at_vw_floats[0] = (float)SDL_GetTicks();
+        }
+        bool idle = rt_debug_attacks_on(rat) == 0 && !anim_busy(rat);
+        if (!idle && since < 3000) {
+            break;
+        }
+        int hits = stats->playerHits - at_vw_values[6];
+        // Idle as soon as the last attack landed (nothing queued behind it).
+        int idleMs = at_vw_floats[0] > 0.0f ? (int)(SDL_GetTicks() - (unsigned int)at_vw_floats[0]) : -1;
+        int releases = stats->reactionReleases - at_vw_values[11];
+        at_check(C_REACTION_QUEUE,
+            hits >= 3 && at_vw_values[8] <= 1 && at_vw_values[9] <= 1 && idle && idleMs >= 0 && idleMs <= 300
+                && stats->damageMismatches == at_vw_values[10],
+            "%d hits from RT pressed every 120 ms for 5 s: attacks pending on the rat at most %d, animation sequences at most %d, idle %d ms after the last attack landed, damage mismatches %d",
+            hits, at_vw_values[8], at_vw_values[9], idleMs, stats->damageMismatches - at_vw_values[10]);
+        at_check(C_REACTION_RELEASE,
+            releases >= 1 && stats->lastReleaseCritter == rat && stats->fastReactionAnims > at_vw_values[12],
+            "the rat was let move again before the punch was over %d times (last %u ms after the attack started); faster reactions played %d",
+            releases, stats->lastReleaseDelayMs, stats->fastReactionAnims - at_vw_values[12]);
+        rt_debug_force_player_hits(0, 0);
+        rt_debug_set_lock(NULL);
+        at_erase(rat);
+        at_vw_objs[0] = NULL;
+        at_vw_next(elapsed);
+        break;
+    }
+    case 7:
+        // A distant rat chasing the player is shot.
+        if (since < 500 || anim_busy(obj_dude) || !at_wield(at_test_pistol())) {
+            break;
+        }
+        for (int distance = 7; distance >= 4 && at_vw_objs[0] == NULL; distance--) {
+            int tile = tile_num_in_direction(obj_dude->tile, rotation, distance);
+            if (at_tile_free(tile) && !combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                at_vw_objs[0] = at_spawn_rat_at(tile, true);
+            }
+        }
+        if (at_vw_objs[0] == NULL) {
+            at_log("reactions: no tile for the distant rat");
+            at_vw_phase = 10;
+            break;
+        }
+        at_full_hp(at_vw_objs[0]);
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_values[5] = 0;
+        at_vw_values[6] = 0;
+        at_vw_values[14] = 0;
+        at_vw_next(elapsed);
+        break;
+    case 8:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        if (at_vw_values[14] == 0) {
+            at_vw_values[14] = 1;
+            at_vw_values[0] = (int)rt_get_time();
+            rt_debug_set_ai_paused(false);
+        }
+        if (stats->lastAiMoveCritter == rat && stats->lastAiMoveAt >= (unsigned int)at_vw_values[0]) {
+            // It is on its way: shoot.
+            at_vw_values[1] = stats->attacksResolved;
+            at_vw_values[2] = stats->playerHits;
+            at_vw_values[3] = obj_dist(obj_dude, rat);
+            at_vw_values[13] = stats->reactionReleases;
+            at_vw_values[9] = (int)rt_get_time();
+            at_vw_values[11] = 0;
+            at_vw_values[12] = stats->fastReactionAnims;
+            rt_debug_force_player_hits(1, 1);
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[4] = SDL_GetTicks();
+            at_vw_next(elapsed);
+        } else if (since > 4000) {
+            at_log("reactions: the distant rat never moved");
+            at_vw_phase = 10;
+        }
+        break;
+    case 9:
+        // The first walk it starts after the shot.
+        if (at_vw_values[11] == 0 && stats->lastAiMoveCritter == rat && stats->lastAiMoveAt > (unsigned int)at_vw_values[9]) {
+            at_vw_values[11] = (int)stats->lastAiMoveAt;
+        }
+        if (at_vw_values[5] == 0) {
+            if (stats->attacksResolved > at_vw_values[1] && stats->playerHits > at_vw_values[2]) {
+                at_vw_values[5] = SDL_GetTicks();
+                at_vw_values[6] = (int)rt_get_time();
+            } else if (since > 5000) {
+                at_log("reactions: the shot never landed");
+                at_vw_phase = 10;
+            }
+            break;
+        }
+        {
+            // From the end of its reaction (it may walk on before the shot
+            // lands, while the player still lowers the gun), or from the hit
+            // landing if it was not kept waiting.
+            bool released = stats->reactionReleases > at_vw_values[13] && stats->lastReleaseCritter == rat;
+            unsigned int from = released ? stats->lastReleaseAt : (unsigned int)at_vw_values[6];
+            bool moved = at_vw_values[11] != 0 && (unsigned int)at_vw_values[11] >= from;
+            if (!moved && since < 6000) {
+                break;
+            }
+            int resumeMs = moved ? (int)((unsigned int)at_vw_values[11] - from) : -1;
+            int earlyMs = released && moved ? at_vw_values[6] - at_vw_values[11] : 0;
+            at_check(C_REACTION_PURSUIT, moved && resumeMs <= 300 && stats->fastReactionAnims > at_vw_values[12],
+                "rat shot %d hexes away while chasing: it walked on %d ms after its reaction (let go before the hit landed=%d, %d ms before), its reaction was faster=%d",
+                at_vw_values[3], resumeMs, released, earlyMs, stats->fastReactionAnims > at_vw_values[12]);
+            at_vw_next(elapsed);
+        }
+        break;
+    case 10:
+        // A killing punch and a knockdown: as before.
+        rt_debug_set_ai_paused(true);
+        rt_debug_force_player_hits(0, 0);
+        rt_debug_set_lock(NULL);
+        at_vw_cleanup();
+        at_release_test_pistol();
+        at_vw_next(elapsed);
+        break;
+    case 11:
+        if (since < 600 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        if (at_vw_objs[0] == NULL) {
+            at_vw_phase = 99;
+            break;
+        }
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_vw_values[0] = stats->kills;
+        at_vw_values[1] = stats->damageMismatches;
+        rt_debug_force_player_hits(1, 99);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 12:
+        if ((rat != NULL && !critter_is_dead(rat)) && since < 4000) {
+            break;
+        }
+        at_vw_flags[1] = rat != NULL && critter_is_dead(rat) && stats->kills == at_vw_values[0] + 1
+            && stats->damageMismatches == at_vw_values[1];
+        at_vw_next(elapsed);
+        break;
+    case 13:
+        if (since < 1500 || anim_busy(obj_dude) || (rat != NULL && anim_busy(rat))) {
+            break;
+        }
+        at_erase(rat);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        if (at_vw_objs[0] == NULL) {
+            at_vw_phase = 99;
+            break;
+        }
+        rt_debug_set_lock(at_vw_objs[0]);
+        at_full_hp(at_vw_objs[0]);
+        at_vw_values[2] = stats->reactionReleases;
+        at_vw_values[4] = 0;
+        at_vw_values[3] = stats->attacksResolved;
+        rt_debug_force_player_hits(1, 1, DAM_KNOCKED_DOWN);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 14:
+        // Knocked down when the hit lands, never let go before.
+        if (at_vw_values[4] == 0 && stats->attacksResolved > at_vw_values[3]) {
+            at_vw_values[4] = 1;
+            at_vw_flags[2] = (rat->data.critter.combat.results & DAM_KNOCKED_DOWN) != 0
+                && !(stats->reactionReleases > at_vw_values[2] && stats->lastReleaseCritter == rat);
+        }
+        if (at_vw_values[4] != 0 && (rat->data.critter.combat.results & DAM_KNOCKED_DOWN) == 0 && !anim_busy(rat)) {
+            at_vw_flags[3] = true;
+        }
+        if (at_vw_flags[3] || since > 6000) {
+            at_check(C_REACTION_EFFECTS, at_vw_flags[1] && at_vw_flags[2] && at_vw_flags[3],
+                "a killing hit kills the rat (kill counted, damage applied once)=%d; a knockdown keeps it until the hit lands and knocks it down=%d; it stands up later=%d",
+                at_vw_flags[1], at_vw_flags[2], at_vw_flags[3]);
+            at_vw_phase = 99;
+        }
+        break;
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    rt_debug_force_player_hits(0, 0);
+    rt_debug_set_lock(NULL);
+    rt_debug_set_ai_paused(false);
+    at_vw_cleanup();
+    at_release_test_pistol();
+    at_clear_hostiles();
+    at_heal();
+    return true;
+}
+
+// A critter's "who hit me" left as a saved combat id (a number read as a
+// pointer) or pointing at a removed critter: forgotten on map load, ignored
+// when the critter is hit, cleared when the attacker is removed. (A
+// Sledgehammer sweep crashed on a Shady Sands guard with such a value.)
+static bool step_who_hit_me(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_check(C_WHO_HIT_ME, false, "timed out in phase %d", at_vw_phase);
+        rt_debug_set_ai_paused(false);
+        at_vw_cleanup();
+        return true;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    switch (at_vw_phase) {
+    case 0:
+        if (since < 400 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_move_to_clear_spot();
+        at_clear_rats_near(6);
+        at_vw_objs[0] = at_spawn_rat(1, 2, false);
+        at_vw_objs[1] = at_spawn_rat(2, 3, false);
+        at_vw_next(elapsed);
+        break;
+    case 1: {
+        if (since < 300) {
+            break;
+        }
+        Object* rat = at_vw_objs[0];
+        Object* other = at_vw_objs[1];
+        if (rat == NULL || other == NULL) {
+            at_check(C_WHO_HIT_ME, false, "no rats could be placed");
+            at_vw_phase = 99;
+            break;
+        }
+
+        // A saved combat id, as a map loaded from a save holds it.
+        rat->data.critter.combat.whoHitMe = NULL;
+        rat->data.critter.combat.whoHitMeCid = 12345;
+        map_fix_critter_combat_data();
+        at_vw_flags[0] = rat->data.critter.combat.whoHitMe == NULL;
+
+        // The same number when the rat is hit: ignored, the attacker is
+        // remembered instead (this read crashed).
+        rat->data.critter.combat.whoHitMe = NULL;
+        rat->data.critter.combat.whoHitMeCid = 12345;
+        combatai_check_retaliation(rat, obj_dude);
+        at_vw_flags[1] = rat->data.critter.combat.whoHitMe == obj_dude;
+
+        // Its attacker removed: forgotten.
+        critter_set_who_hit_me(other, rat);
+        at_vw_flags[2] = other->data.critter.combat.whoHitMe == rat;
+        at_erase(rat);
+        at_vw_objs[0] = NULL;
+        at_vw_flags[3] = other->data.critter.combat.whoHitMe == NULL;
+
+        at_check(C_WHO_HIT_ME, at_vw_flags[0] && at_vw_flags[1] && at_vw_flags[2] && at_vw_flags[3],
+            "a saved id is forgotten on map load=%d; a bad value is ignored when the critter is hit (the attacker is remembered)=%d; a removed attacker is forgotten (set=%d, cleared=%d)",
+            at_vw_flags[0], at_vw_flags[1], at_vw_flags[2], at_vw_flags[3]);
+        at_vw_phase = 99;
+        break;
+    }
+    }
+
+    if (at_vw_phase != 99) {
+        return false;
+    }
+
+    rt_debug_set_ai_paused(false);
+    at_vw_cleanup();
+    at_clear_hostiles();
+    return true;
+}
+
+// After the save is loaded: every critter's "who hit me" is nobody or a
+// critter on the map.
+static bool step_who_hit_me_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    Object** list;
+    int count = obj_create_list(-1, map_elevation, OBJ_TYPE_CRITTER, &list);
+    int bad = 0;
+    for (int index = 0; index < count; index++) {
+        Object* whoHitMe = list[index]->data.critter.combat.whoHitMe;
+        if (whoHitMe != NULL && !rt_is_live_critter(whoHitMe)) {
+            bad++;
+        }
+    }
+    if (count > 0) {
+        obj_delete_list(list);
+    }
+    at_check(C_WHO_HIT_ME_LOAD, bad == 0, "%d critters on the map, %d with a stale \"who hit me\"", count, bad);
+    return true;
+}
+
+static bool step_cc_before_save(unsigned int elapsed, bool first, bool timedOut)
+{
+    Object* rat = at_spawn_rat(3, 6, false);
+    if (rat == NULL) {
+        at_qp_saved_id = -1;
+        return true;
+    }
+    perk_rt_debug_set_rank(PERK_QUICK_POCKETS, std::max(1, perk_level(PERK_QUICK_POCKETS)));
+    rt_quick_pockets_begin(rat);
+    rt_quick_pockets_end();
+    at_qp_saved_id = rat->id;
+    at_qp_saved_elapsed = rt_quick_pockets_record(rat->id);
+    at_erase(rat);
+    at_log("close combat for the save: Quick Pockets record id %d at %d ms", at_qp_saved_id, at_qp_saved_elapsed);
+    return true;
+}
+
+static bool step_cc_after_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    int record = at_qp_saved_id != -1 ? rt_quick_pockets_record(at_qp_saved_id) : -2;
+    bool recordOk = at_qp_saved_id != -1 && record == at_qp_saved_elapsed;
+    bool inputOk = !gamepad_is_menu_key_mode() && !gamepad_is_stick_tabs() && !rt_quick_pockets_state()->active;
+    bool apOk = rt_get_dude_ap() <= (float)stat_level(obj_dude, STAT_MAXIMUM_ACTION_POINTS) + 0.01f;
+    at_check(C_CLOSE_AFTER_LOAD, recordOk && inputOk && apOk && rt_debug_counter_count() == 0,
+        "Quick Pockets record restored (%d ms, saved %d)=%d; no steal session, menu key mode or stick tabs left on=%d; AP within the maximum=%d; no counterattack owed=%d",
+        record, at_qp_saved_elapsed, recordOk, inputOk, apOk, rt_debug_counter_count() == 0);
+    return true;
+}
+
+// Vault 15's first elevator shaft (BVElv1W) and the one below it
+// (BVElv2E): a rope is attached through the shaft's own script, which
+// replaces the shaft with a roped one (this pid, same script) that lowers
+// the player.
+#define AT_ROPED_SHAFT_PID 33555334
+
+static int at_rope_phase;
+static unsigned int at_rope_time;
+static Object* at_rope_shaft;
+static int at_rope_shaft_tile;
+static int at_rope_values[12];
+static bool at_rope_flags[12];
+
+static void at_rope_next()
+{
+    at_rope_phase++;
+    at_rope_time = SDL_GetTicks();
+}
+
+// The object on `elevation` running the named script whose pid is (or,
+// with `roped` false, isn't) the roped shaft.
+static Object* at_rope_find(const char* scriptName, int elevation, bool roped)
+{
+    int scriptIndex = at_find_script(scriptName);
+    if (scriptIndex == -1) {
+        return NULL;
+    }
+    for (Object* obj = obj_find_first_at(elevation); obj != NULL; obj = obj_find_next_at()) {
+        Script* script;
+        if (obj->sid == -1 || scr_ptr(obj->sid, &script) == -1 || script->scr_script_idx != scriptIndex) {
+            continue;
+        }
+        if ((obj->pid == AT_ROPED_SHAFT_PID) == roped) {
+            return obj;
+        }
+    }
+    return NULL;
+}
+
+// How many such objects (one roped shaft, never two).
+static int at_rope_objects(const char* scriptName, int elevation, bool roped)
+{
+    int scriptIndex = at_find_script(scriptName);
+    int count = 0;
+    for (Object* obj = obj_find_first_at(elevation); obj != NULL; obj = obj_find_next_at()) {
+        Script* script;
+        if (obj->sid != -1 && scr_ptr(obj->sid, &script) != -1 && script->scr_script_idx == scriptIndex
+            && (obj->pid == AT_ROPED_SHAFT_PID) == roped) {
+            count++;
+        }
+    }
+    return count;
+}
+
+static int at_rope_count()
+{
+    return inven_pid_quantity_carried(obj_dude, PROTO_ID_ROPE);
+}
+
+static void at_rope_give(int quantity)
+{
+    Object* rope;
+    if (obj_pid_new(&rope, PROTO_ID_ROPE) != -1 && item_add_force(obj_dude, rope, quantity) == 0) {
+        // In the inventory only, not on the map (see `at_create_weapon`).
+        Rect rect;
+        obj_disconnect(rope, &rect);
+    }
+}
+
+static void at_rope_take_all()
+{
+    Object* rope;
+    while ((rope = inven_pid_is_carried_ptr(obj_dude, PROTO_ID_ROPE)) != NULL) {
+        int quantity = item_count(obj_dude, rope);
+        if (item_remove_mult(obj_dude, rope, quantity) != 0) {
+            break;
+        }
+        obj_erase_object(rope, NULL);
+    }
+    intface_update_items(false);
+}
+
+// Stands the player next to `obj` (A only reaches adjacent hexes).
+static bool at_rope_stand_next_to(Object* obj)
+{
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        int tile = tile_num_in_direction(obj->tile, rotation, 1);
+        if (obj_blocking_at(NULL, tile, obj->elevation) == NULL) {
+            Rect rect;
+            obj_move_to_tile(obj_dude, tile, obj->elevation, &rect);
+            if (map_elevation != obj->elevation) {
+                map_set_elevation(obj->elevation);
+            }
+            tile_set_center(obj_dude->tile, TILE_SET_CENTER_REFRESH_WINDOW);
+            obj_set_rotation(obj_dude, tile_dir(obj_dude->tile, obj->tile), &rect);
+            return true;
+        }
+    }
+    return false;
+}
+
+// A on the object, as the player does it (the highlighted object within
+// reach); when something else nearby is highlighted, the same interaction
+// directly.
+static void at_rope_press_a(Object* obj)
+{
+    if (rt_get_interact_target() == obj) {
+        at_press(GAMEPAD_BUTTON_A);
+    } else {
+        at_log("rope: %s isn't highlighted (%s is), interacting directly", object_name(obj),
+            rt_get_interact_target() != NULL ? object_name(rt_get_interact_target()) : "nothing");
+        rt_context_interact(obj);
+    }
+}
+
+static bool at_rope_label_has(const char* text)
+{
+    return strstr(rt_get_interact_label(), text) != NULL;
+}
+
+static bool step_rope(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtContextStats* ctx = rt_context_get_stats();
+    if (first) {
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_rope_phase = 0;
+        at_rope_time = SDL_GetTicks();
+        at_rope_shaft = NULL;
+        memset(at_rope_values, 0, sizeof(at_rope_values));
+        memset(at_rope_flags, 0, sizeof(at_rope_flags));
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("rope: timed out in phase %d", at_rope_phase);
+        at_check(C_ROPE_ATTACH, false, "timed out in phase %d", at_rope_phase);
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+
+    unsigned int since = SDL_GetTicks() - at_rope_time;
+    if (at_rope_phase >= 2) {
+        at_heal();
+    }
+
+    switch (at_rope_phase) {
+    case 0: {
+        if (since < 500) {
+            break;
+        }
+        int map = map_match_map_name("VAULTBUR.MAP");
+        if (map == -1) {
+            at_check(C_ROPE_ATTACH, false, "VAULTBUR.MAP not found");
+            return true;
+        }
+        at_log("rope: going to Vault 15 (VAULTBUR.MAP, index %d)", map);
+        MapTransition transition;
+        transition.map = map;
+        transition.elevation = 0;
+        transition.tile = -1;
+        transition.rotation = 0;
+        map_leave_map(&transition);
+        at_rope_next();
+        break;
+    }
+    case 1:
+        if (SDL_strncasecmp(map_data.name, "VAULTBUR", 8) != 0 || since < 1500) {
+            break;
+        }
+        rt_debug_set_ai_paused(true);
+        at_rope_shaft = at_rope_find("BVElv1W.int", 0, false);
+        if (at_rope_shaft == NULL) {
+            at_check(C_ROPE_ATTACH, false, "no BVElv1W shaft on level 1 of %s", map_data.name);
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        at_rope_shaft_tile = at_rope_shaft->tile;
+        at_log("rope: shaft %s (pid %d) at tile %d", object_name(at_rope_shaft), at_rope_shaft->pid, at_rope_shaft_tile);
+        at_rope_take_all();
+        at_unarmed();
+        at_rope_stand_next_to(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 2:
+        // No rope: Use says what is missing, and using it changes nothing.
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_rope_flags[0] = at_rope_label_has("needs a Rope") && !at_rope_label_has("Attach");
+        at_log("rope: label without a rope: \"%s\"", rt_get_interact_label());
+        at_rope_values[0] = ctx->itemUses;
+        at_rope_press_a(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 3:
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_rope_flags[1] = at_rope_find("BVElv1W.int", 0, false) == at_rope_shaft && at_rope_find("BVElv1W.int", 0, true) == NULL
+            && obj_dude->elevation == 0 && ctx->itemUses == at_rope_values[0];
+        at_check(C_ROPE_MISSING, at_rope_flags[0] && at_rope_flags[1],
+            "no rope: A shows \"%s\" (says a rope is needed)=%d; A used the shaft without changing it (its own message)=%d",
+            rt_get_interact_label(), at_rope_flags[0], at_rope_flags[1]);
+        // Two ropes carried, none in hand.
+        at_rope_give(2);
+        at_rope_next();
+        break;
+    case 4:
+        if (since < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_rope_flags[2] = at_rope_label_has("Attach Rope") && !at_rope_label_has("Use");
+        at_log("rope: label with a carried rope: \"%s\"", rt_get_interact_label());
+        at_rope_values[1] = ctx->itemUses;
+        at_rope_values[2] = ctx->itemUseRefused;
+        at_rope_press_a(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 5:
+        // A again right away: refused while the first one is under way.
+        if (since < 120) {
+            break;
+        }
+        at_rope_press_a(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 6: {
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        Object* roped = at_rope_find("BVElv1W.int", 0, true);
+        bool replaced = roped != NULL && roped->tile == at_rope_shaft_tile && at_rope_find("BVElv1W.int", 0, false) == NULL;
+        at_rope_values[3] = at_rope_count();
+        at_rope_flags[3] = replaced && at_rope_values[3] == 1 && ctx->itemUses > at_rope_values[1]
+            && ctx->lastItemPid == PROTO_ID_ROPE;
+        // The second press was refused or replaced the first (still walking):
+        // either way the script ran once.
+        at_rope_values[6] = at_rope_objects("BVElv1W.int", 0, true);
+        at_rope_values[7] = ctx->itemUseRefused - at_rope_values[2];
+        at_rope_values[8] = ctx->itemUses - at_rope_values[1];
+        at_rope_flags[4] = at_rope_values[6] == 1 && at_rope_values[7] + at_rope_values[8] == 2;
+        at_rope_shaft = roped;
+        at_rope_next();
+        break;
+    }
+    case 7:
+        if (since < 600) {
+            break;
+        }
+        // The roped shaft: no second rope, A climbs down.
+        at_rope_flags[5] = at_rope_shaft != NULL && !at_rope_label_has("Attach") && at_rope_label_has("Use");
+        at_log("rope: label on the roped shaft: \"%s\"", rt_get_interact_label());
+        at_check(C_ROPE_ATTACH, at_rope_flags[2] && at_rope_flags[3] && at_rope_flags[5],
+            "carried rope: A shows Attach Rope=%d; the shaft's script took one rope (%d left) and put up the roped shaft=%d; the roped shaft offers only Use=%d",
+            at_rope_flags[2], at_rope_values[3], at_rope_flags[3], at_rope_flags[5]);
+        at_check(C_ROPE_REPEAT, at_rope_flags[4] && at_rope_values[3] == 1,
+            "two A presses 120 ms apart: %d refused, %d started; one roped shaft=%d (%d), one rope used=%d",
+            at_rope_values[7], at_rope_values[8], at_rope_values[6] == 1, at_rope_values[6], at_rope_values[3] == 1);
+        if (at_rope_shaft == NULL) {
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        at_rope_values[4] = obj_dude->elevation;
+        at_rope_press_a(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 8:
+        if ((obj_dude->elevation == at_rope_values[4] || anim_busy(obj_dude)) && since < 6000) {
+            break;
+        }
+        at_rope_flags[6] = obj_dude->elevation == 1;
+        at_screenshot("rope_descended");
+        at_rope_next();
+        break;
+    case 9:
+        // The shaft below, with the last rope in the active hand.
+        if (since < 1000) {
+            break;
+        }
+        at_rope_shaft = at_rope_find("BVElv2E.int", 1, false);
+        if (at_rope_shaft == NULL) {
+            at_log("rope: no BVElv2E shaft on level 2");
+            at_check(C_ROPE_DESCEND, false, "no BVElv2E shaft on level 2 (descended=%d)", at_rope_flags[6]);
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        at_rope_shaft_tile = at_rope_shaft->tile;
+        at_rope_stand_next_to(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 10: {
+        if (since < 500 || anim_busy(obj_dude)) {
+            break;
+        }
+        Object* rope = inven_pid_is_carried_ptr(obj_dude, PROTO_ID_ROPE);
+        if (!at_wield(rope)) {
+            if (since > 3000) {
+                at_check(C_ROPE_HELD, false, "the rope could not be put in the hand");
+                rt_debug_set_ai_paused(false);
+                return true;
+            }
+            break;
+        }
+        at_rope_next();
+        break;
+    }
+    case 11:
+        if (since < 600) {
+            break;
+        }
+        at_rope_flags[7] = at_rope_label_has("Attach Rope");
+        at_log("rope: label with the rope in hand: \"%s\"", rt_get_interact_label());
+        at_rope_values[5] = ctx->itemUses;
+        at_rope_press_a(at_rope_shaft);
+        at_rope_next();
+        break;
+    case 12: {
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        Object* roped = at_rope_find("BVElv2E.int", 1, true);
+        Object* current = NULL;
+        intface_get_current_item(&current);
+        at_rope_flags[8] = roped != NULL && roped->tile == at_rope_shaft_tile && at_rope_find("BVElv2E.int", 1, false) == NULL
+            && at_rope_count() == 0 && ctx->itemUses == at_rope_values[5] + 1
+            && inven_left_hand(obj_dude) == NULL && inven_right_hand(obj_dude) == NULL && current == NULL;
+        at_check(C_ROPE_DESCEND, at_rope_flags[6], "A on the roped shaft lowered the player to level 2 (elevation %d)", obj_dude->elevation);
+        at_check(C_ROPE_HELD, at_rope_flags[7] && at_rope_flags[8],
+            "rope in the active hand: A shows Attach Rope=%d; the script took it from the hand (hands empty, the item slot cleared, no rope left) and put up the roped shaft=%d",
+            at_rope_flags[7], at_rope_flags[8]);
+        at_screenshot("rope_held_attached");
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    }
+    return false;
+}
+
+// After the save is loaded (and after leaving the map and coming back):
+// both shafts still have their ropes, and no rope came back.
+static void at_rope_check_kept(AutotestCheck check, const char* when)
+{
+    Object* first = at_rope_find("BVElv1W.int", 0, true);
+    Object* second = at_rope_find("BVElv2E.int", 1, true);
+    bool unroped = at_rope_find("BVElv1W.int", 0, false) != NULL || at_rope_find("BVElv2E.int", 1, false) != NULL;
+    at_check(check, first != NULL && second != NULL && !unroped && at_rope_count() == 0,
+        "%s on %s: roped shaft on level 1=%d, on level 2=%d, an unroped one back=%d, ropes carried %d",
+        when, map_data.name, first != NULL, second != NULL, unroped, at_rope_count());
+}
+
+static bool step_rope_save(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        rt_debug_set_ai_paused(true);
+        at_phase = 0;
+        at_count_a = 0;
+        at_save_time = time(NULL) - 1;
+        struct stat info;
+        at_save_slot_existed = stat("data\\SAVEGAME\\SLOT01\\SAVE.DAT", &info) == 0;
+        return false;
+    }
+    if (at_count_a == 0) {
+        if (elapsed > 800 && !anim_busy(obj_dude)) {
+            at_expect_menu(NULL, at_menu_save_script);
+            at_press(GAMEPAD_BUTTON_START);
+            at_count_a = 1;
+        }
+        return false;
+    }
+    if (at_menu_seen && !options_rt_is_menu_open() && elapsed > 2000) {
+        bool saved = at_file_recent("data\\SAVEGAME\\SLOT01\\SAVE.DAT", at_save_time);
+        at_log("rope: saved in slot 1=%d", saved);
+        at_menu_expected = false;
+        return true;
+    }
+    if (timedOut) {
+        at_log("rope: save timed out");
+        at_menu_expected = false;
+        return true;
+    }
+    return false;
+}
+
+static bool step_rope_load(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        rt_debug_set_ai_paused(true);
+        at_phase = 0;
+        at_count_a = 0;
+        return false;
+    }
+    if (at_count_a == 0) {
+        if (elapsed > 800) {
+            // Undone by the load.
+            at_rope_give(1);
+            at_expect_menu(NULL, at_menu_load_script);
+            at_press(GAMEPAD_BUTTON_START);
+            at_count_a = 1;
+        }
+        return false;
+    }
+    if (at_count_a == 1) {
+        if (at_menu_seen && !options_rt_is_menu_open()) {
+            at_count_a = 2;
+            at_time_a = SDL_GetTicks();
+        }
+        if (timedOut) {
+            at_check(C_ROPE_SAVE, false, "load timed out");
+            at_menu_expected = false;
+            return true;
+        }
+        return false;
+    }
+    if (SDL_GetTicks() - at_time_a < 1500) {
+        return false;
+    }
+    at_menu_expected = false;
+    at_rope_check_kept(C_ROPE_SAVE, "after saving and loading");
+    return true;
+}
+
+static bool step_rope_map(unsigned int elapsed, bool first, bool timedOut)
+{
+    if (first) {
+        at_release_all();
+        rt_debug_set_ai_paused(true);
+        at_phase = 0;
+        at_time_a = SDL_GetTicks();
+        return false;
+    }
+    if (timedOut) {
+        at_check(C_ROPE_MAP, false, "timed out in phase %d (map %s)", at_phase, map_data.name);
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+
+    unsigned int since = SDL_GetTicks() - at_time_a;
+    const char* names[2] = { "VAULTENT.MAP", "VAULTBUR.MAP" };
+    switch (at_phase) {
+    case 0:
+    case 2:
+        if (since < 800) {
+            break;
+        }
+        {
+            MapTransition transition;
+            transition.map = map_match_map_name(names[at_phase / 2]);
+            transition.elevation = 0;
+            transition.tile = -1;
+            transition.rotation = 0;
+            if (transition.map == -1) {
+                at_check(C_ROPE_MAP, false, "%s not found", names[at_phase / 2]);
+                return true;
+            }
+            map_leave_map(&transition);
+        }
+        at_phase++;
+        at_time_a = SDL_GetTicks();
+        break;
+    case 1:
+    case 3:
+        if (SDL_strncasecmp(map_data.name, names[at_phase / 2], 8) != 0 || since < 1500) {
+            break;
+        }
+        if (at_phase == 3) {
+            at_rope_check_kept(C_ROPE_MAP, "after leaving Vault 15 and coming back");
+            rt_debug_set_ai_paused(false);
+            return true;
+        }
+        at_phase++;
+        at_time_a = SDL_GetTicks();
+        break;
+    }
+    return false;
+}
+
+// -----------------------------------------------------------------------------
+// Enemy attack eligibility, RT spam and timing, Hunting Rifle reload
+// -----------------------------------------------------------------------------
+
+// Whether `from` sees `to` (no scenery or wall that light doesn't pass in
+// between), as the NPC attack check does.
+static bool at_view_clear(Object* from, Object* to)
+{
+    Object* obstacle = from;
+    make_straight_path_func(from, from->tile, to->tile, NULL, &obstacle, 0, obj_sight_blocking_at);
+    return obstacle == NULL || obstacle == from || obstacle == to;
+}
+
+// Whether `attacker` (holding a gun in the right hand) could validly shoot
+// the player right now: in range, nothing blocking the shot or the view,
+// ammunition, and a hit chance above 0% (returned in `toHit`).
+static bool at_shot_valid(Object* attacker, int* toHit)
+{
+    int hitMode = HIT_MODE_RIGHT_WEAPON_PRIMARY;
+    Object* weapon = item_hit_with(attacker, hitMode);
+    *toHit = determine_to_hit(attacker, obj_dude, HIT_LOCATION_UNCALLED, hitMode);
+    return weapon != NULL
+        && attacker->elevation == obj_dude->elevation
+        && obj_dist(attacker, obj_dude) <= item_w_range(attacker, hitMode)
+        && (item_w_max_ammo(weapon) == 0 || item_w_curr_ammo(weapon) > 0)
+        && !combat_is_shot_blocked(attacker, attacker->tile, obj_dude->tile, obj_dude, NULL)
+        && at_view_clear(attacker, obj_dude)
+        && *toHit > 0;
+}
+
+static bool at_in_slot_queue(Object* critter)
+{
+    Object* queue[16];
+    int count = rt_get_player_slot_queue(queue, 16);
+    for (int index = 0; index < count; index++) {
+        if (queue[index] == critter) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Watches an enemy (`at_el_watch`) attacking the player each tick: its
+// attacks start only from valid positions, it isn't in the attack slot
+// queue for long while it has no valid shot, and the player is never held
+// by its ordinary attacks.
+typedef struct AtEligibilityWatch {
+    Object* critter;
+    int startTile;
+    bool startedValid;
+    unsigned int validSince;
+    unsigned int invalidSince;
+    bool wasHolder;
+    int attacks;
+    int invalidAttacks;
+    int firstAttackDelayMs;
+    int firstAttackToHit;
+    int firstAttackDistance;
+    int slotWhileInvalid;
+    int heldTicks;
+    int heldBase;
+    bool moved;
+} AtEligibilityWatch;
+
+static AtEligibilityWatch at_el_watch;
+
+static void at_el_watch_begin(Object* critter)
+{
+    memset(&at_el_watch, 0, sizeof(at_el_watch));
+    at_el_watch.critter = critter;
+    at_el_watch.startTile = critter != NULL ? critter->tile : -1;
+    int toHit;
+    at_el_watch.startedValid = critter != NULL && at_shot_valid(critter, &toHit);
+    at_el_watch.firstAttackDelayMs = -1;
+    at_el_watch.firstAttackToHit = -999;
+    at_el_watch.heldBase = rt_get_stats()->playerHeldAttacks;
+}
+
+static void at_el_watch_tick()
+{
+    AtEligibilityWatch* watch = &at_el_watch;
+    Object* critter = watch->critter;
+    if (critter == NULL || !rt_is_live_critter(critter) || critter_is_dead(critter)) {
+        return;
+    }
+
+    unsigned int now = SDL_GetTicks();
+    int toHit;
+    bool valid = at_shot_valid(critter, &toHit);
+    if (critter->tile != watch->startTile) {
+        watch->moved = true;
+    }
+
+    if (valid) {
+        if (watch->validSince == 0) {
+            watch->validSince = now;
+        }
+        watch->invalidSince = 0;
+    } else {
+        watch->validSince = 0;
+        if (watch->invalidSince == 0) {
+            watch->invalidSince = now;
+        }
+        // (A queue entry goes stale a second after its last valid moment.)
+        if (at_in_slot_queue(critter) && now - watch->invalidSince > 1300) {
+            watch->slotWhileInvalid++;
+        }
+    }
+
+    bool holder = rt_get_player_slot_holder() == critter;
+    if (holder && !watch->wasHolder) {
+        watch->attacks++;
+        if (!valid) {
+            watch->invalidAttacks++;
+            at_log("eligibility: %s started an attack from tile %d without a valid shot (to-hit %d)", critter_name(critter), critter->tile, toHit);
+        }
+        if (watch->attacks == 1) {
+            watch->firstAttackDelayMs = watch->validSince != 0 ? (int)(now - watch->validSince) : -1;
+            watch->firstAttackToHit = toHit;
+            watch->firstAttackDistance = obj_dist(critter, obj_dude);
+        }
+    }
+    watch->wasHolder = holder;
+
+    // Held: the player in an enemy attack (only heavy outcomes may do that).
+    if (rt_debug_player_held() && rt_get_stats()->playerHeldAttacks == watch->heldBase) {
+        watch->heldTicks++;
+    }
+}
+
+// A free tile within `maxDistance` the player can't see or shoot (cover),
+// that the player could walk to.
+static int at_el_covered_tile(int minDistance, int maxDistance)
+{
+    for (int distance = minDistance; distance <= maxDistance; distance++) {
+        for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+            int corner = tile_num_in_direction(obj_dude->tile, rotation, distance);
+            for (int step = 0; step < distance && corner != -1; step++) {
+                int tile = tile_num_in_direction(corner, (rotation + 2) % ROTATION_COUNT, step);
+                if (tile == -1 || !at_tile_free(tile)) {
+                    continue;
+                }
+                if (!combat_is_shot_blocked(obj_dude, obj_dude->tile, tile, NULL, NULL)) {
+                    continue;
+                }
+                int length = make_path(obj_dude, obj_dude->tile, tile, NULL, 0);
+                if (length > 0 && length <= 16) {
+                    return tile;
+                }
+            }
+        }
+    }
+    return -1;
+}
+
+static int at_el_ac_bonus = 0;
+static bool at_el_ac_changed = false;
+
+static void at_el_restore_ac()
+{
+    if (at_el_ac_changed) {
+        stat_set_bonus(obj_dude, STAT_ARMOR_CLASS, at_el_ac_bonus);
+        at_el_ac_changed = false;
+    }
+}
+
+// Enemies attack only with a valid opportunity: a gunman behind cover
+// repositions and shoots once it has a clear shot (the player is never
+// held meanwhile); a gunman with no chance to hit closes in and shoots as
+// soon as its chance is positive, however small.
+static bool step_eligibility(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("eligibility: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    Object* gunman = at_vw_objs[0];
+    if (at_vw_phase >= 1 && at_vw_phase < 99) {
+        at_heal();
+        if (gunman != NULL) {
+            Object* pistol = item_hit_with(gunman, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+            if (pistol != NULL && item_w_max_ammo(pistol) > 0) {
+                item_w_set_curr_ammo(pistol, item_w_max_ammo(pistol));
+            }
+        }
+    }
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_vw_home();
+        at_clear_rats_near(14);
+        int tile = at_el_covered_tile(4, 8);
+        if (tile == -1) {
+            at_move_to_clear_spot();
+            tile = at_el_covered_tile(4, 8);
+        }
+        if (tile == -1) {
+            at_check(C_ELIG_BLOCKED, false, "no covered tile near the player");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_objs[0] = at_spawn_gunman(tile);
+        if (at_vw_objs[0] == NULL) {
+            at_check(C_ELIG_BLOCKED, false, "no gunman could be placed");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_values[0] = stats->aiHopelessAttacks;
+        at_vw_values[1] = stats->aiSightBlockedSkips + stats->aiZeroChanceSkips;
+        at_vw_values[2] = stats->playerFreeHits;
+        at_vw_values[3] = stats->playerReactions;
+        at_vw_values[4] = stats->playerReactionsSkipped;
+        at_vw_values[5] = stats->playerFreeAttacks;
+        at_el_watch_begin(at_vw_objs[0]);
+        at_log("eligibility: gunman behind cover at %d hexes (valid shot at the start=%d)", obj_dist(obj_dude, at_vw_objs[0]), at_el_watch.startedValid);
+        rt_debug_set_ai_paused(false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1:
+        // It repositions and shoots once it can.
+        at_el_watch_tick();
+        if (at_el_watch.attacks < 2 && since < 20000) {
+            break;
+        }
+        at_screenshot("60_eligibility_blocked");
+        at_check(C_ELIG_BLOCKED,
+            !at_el_watch.startedValid && at_el_watch.invalidAttacks == 0 && stats->aiHopelessAttacks == at_vw_values[0]
+                && at_el_watch.moved && at_el_watch.attacks >= 1,
+            "gunman behind cover (no shot at first=%d): moved=%d, attacks %d, from an invalid position %d, with no positive chance %d, invalid-shot skips %d",
+            !at_el_watch.startedValid, at_el_watch.moved, at_el_watch.attacks, at_el_watch.invalidAttacks,
+            stats->aiHopelessAttacks - at_vw_values[0], stats->aiSightBlockedSkips + stats->aiZeroChanceSkips - at_vw_values[1]);
+        at_check(C_ELIG_PROMPT, at_el_watch.firstAttackDelayMs >= 0 && at_el_watch.firstAttackDelayMs <= 1500,
+            "first attack %d ms after it had a valid shot (to-hit %d%% at %d hexes)",
+            at_el_watch.firstAttackDelayMs, at_el_watch.firstAttackToHit, at_el_watch.firstAttackDistance);
+        at_vw_flags[0] = at_el_watch.slotWhileInvalid == 0;
+        at_vw_flags[1] = at_el_watch.heldTicks == 0;
+        at_vw_values[6] = at_el_watch.slotWhileInvalid;
+        at_vw_values[7] = at_el_watch.heldTicks;
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        // The player walks away while its next attack plays.
+        at_el_watch_tick();
+        if (rt_get_player_slot_holder() == gunman && rt_debug_attacks_on(obj_dude) > 0) {
+            at_vw_values[8] = obj_dude->tile;
+            at_vw_flags[2] = !rt_debug_player_held();
+            at_stick_open_direction();
+            at_vw_next(elapsed);
+        } else if (since > 8000) {
+            at_log("eligibility: no further attack to walk away from");
+            at_vw_phase = 4;
+        }
+        break;
+    case 3:
+        at_el_watch_tick();
+        at_stick_open_direction();
+        if (rt_debug_player_held()) {
+            at_vw_flags[2] = false;
+        }
+        if (obj_dude->tile != at_vw_values[8]) {
+            at_vw_flags[3] = true;
+        }
+        if (rt_debug_attacks_on(obj_dude) == 0 || since > 3000) {
+            at_stick_release();
+            at_vw_next(elapsed);
+        }
+        break;
+    case 4:
+        // Hits and misses: a hit plays the player's own reaction, a miss none.
+        at_el_watch_tick();
+        if (!at_vw_flags[15]) {
+            // Counted from here, the player standing (a walk goes on
+            // through a hit, without a reaction).
+            if (anim_busy(obj_dude) || rt_debug_attacks_on(obj_dude) > 0) {
+                break;
+            }
+            at_vw_flags[15] = true;
+            at_vw_values[2] = stats->playerFreeHits;
+            at_vw_values[3] = stats->playerReactions;
+            at_vw_values[4] = stats->playerReactionsSkipped;
+            at_vw_values[5] = stats->playerFreeAttacks;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (stats->playerFreeHits - at_vw_values[2] < 1 && since < 15000) {
+            break;
+        }
+        // (A hit counts when its attack starts; its impact comes later.)
+        if ((anim_busy(obj_dude) || rt_debug_attacks_on(obj_dude) > 0) && since < 16000) {
+            break;
+        }
+        {
+            int hits = stats->playerFreeHits - at_vw_values[2];
+            int attacks = stats->playerFreeAttacks - at_vw_values[5];
+            int reactions = stats->playerReactions - at_vw_values[3];
+            int skipped = stats->playerReactionsSkipped - at_vw_values[4];
+            at_check(C_PLAYER_FREE,
+                at_vw_flags[1] && at_el_watch.heldTicks == 0 && at_vw_flags[2] && at_vw_flags[3]
+                    && reactions + skipped == hits && (hits == 0 || reactions >= 1),
+                "ordinary enemy attacks %d (hits %d): the player was held %d ticks, walked away during an attack=%d (free=%d); hit reactions played %d, skipped while busy %d (misses play none)",
+                attacks, hits, at_el_watch.heldTicks, at_vw_flags[3], at_vw_flags[2], reactions, skipped);
+        }
+        rt_debug_set_ai_paused(true);
+        at_erase(gunman);
+        at_vw_objs[0] = NULL;
+        at_vw_next(elapsed);
+        break;
+    case 5: {
+        // No chance to hit at first: it must close in, then shoot as soon as
+        // the chance is positive.
+        if (since < 600 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_home();
+        at_clear_rats_near(14);
+        int tile = -1;
+        for (int distance = 8; distance >= 6 && tile == -1; distance--) {
+            for (int rotation = 0; rotation < ROTATION_COUNT && tile == -1; rotation++) {
+                int candidate = tile_num_in_direction(obj_dude->tile, rotation, distance);
+                if (candidate != -1 && at_tile_free(candidate)
+                    && !combat_is_shot_blocked(obj_dude, obj_dude->tile, candidate, NULL, NULL)
+                    && make_path(obj_dude, obj_dude->tile, candidate, NULL, 0) > 0) {
+                    tile = candidate;
+                }
+            }
+        }
+        at_vw_objs[0] = at_spawn_gunman(tile);
+        gunman = at_vw_objs[0];
+        if (gunman == NULL || !at_view_clear(gunman, obj_dude)) {
+            at_check(C_ELIG_ZERO, false, "no open line for the distant gunman");
+            at_vw_phase = 98;
+            break;
+        }
+        // Perception 1: every hex beyond 2 costs 4%. Then the player's armor
+        // takes the rest, so the chance is 0% where it stands.
+        stat_set_bonus(gunman, STAT_PERCEPTION, stat_get_bonus(gunman, STAT_PERCEPTION) + 1 - stat_level(gunman, STAT_PERCEPTION));
+        at_el_ac_bonus = stat_get_bonus(obj_dude, STAT_ARMOR_CLASS);
+        at_el_ac_changed = true;
+        for (int tries = 0; tries < 4; tries++) {
+            int toHit = determine_to_hit(gunman, obj_dude, HIT_LOCATION_UNCALLED, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+            if (toHit <= 0) {
+                break;
+            }
+            stat_set_bonus(obj_dude, STAT_ARMOR_CLASS, stat_get_bonus(obj_dude, STAT_ARMOR_CLASS) + toHit);
+        }
+        at_vw_values[9] = determine_to_hit(gunman, obj_dude, HIT_LOCATION_UNCALLED, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+        at_vw_values[10] = obj_dist(obj_dude, gunman);
+        at_vw_values[0] = stats->aiHopelessAttacks;
+        at_vw_values[11] = stats->aiZeroChanceSkips;
+        at_el_watch_begin(gunman);
+        at_log("eligibility: gunman %d hexes away with %d%% to hit", at_vw_values[10], at_vw_values[9]);
+        rt_debug_set_ai_paused(false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        at_el_watch_tick();
+        if (at_el_watch.attacks < 1 && since < 12000) {
+            break;
+        }
+        at_check(C_ELIG_ZERO,
+            at_vw_values[9] <= 0 && at_el_watch.invalidAttacks == 0 && stats->aiHopelessAttacks == at_vw_values[0]
+                && stats->aiZeroChanceSkips > at_vw_values[11]
+                && at_el_watch.attacks >= 1 && at_el_watch.firstAttackToHit > 0 && at_el_watch.firstAttackToHit <= 20
+                && at_el_watch.firstAttackDistance < at_vw_values[10],
+            "gunman at %d hexes with %d%% to hit: no attack while 0%% (skips %d, attacks without a chance %d); closed in and shot at %d hexes with %d%% (a small chance is enough), %d ms after it had one",
+            at_vw_values[10], at_vw_values[9], stats->aiZeroChanceSkips - at_vw_values[11], stats->aiHopelessAttacks - at_vw_values[0],
+            at_el_watch.firstAttackDistance, at_el_watch.firstAttackToHit, at_el_watch.firstAttackDelayMs);
+        at_vw_flags[0] = at_vw_flags[0] && at_el_watch.slotWhileInvalid == 0;
+        at_vw_values[6] += at_el_watch.slotWhileInvalid;
+        at_check(C_ELIG_SLOT, at_vw_flags[0],
+            "ticks an enemy with no valid attack stayed in the attack slot queue (beyond its 1 s staleness): %d",
+            at_vw_values[6]);
+        at_vw_phase = 98;
+        break;
+    case 98:
+        at_el_restore_ac();
+        rt_debug_set_ai_paused(true);
+        at_stick_release();
+        at_vw_cleanup();
+        at_vw_phase = 99;
+        break;
+    case 99:
+        at_el_restore_ac();
+        at_stick_release();
+        at_vw_cleanup();
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
+// RT pressed again and again at one rat: the rat and another one keep
+// moving and attacking; nothing queues up on the rat.
+// The last enemy seen attacking the player (not in `at_vw_objs`: those are
+// erased at the end).
+static Object* at_spam_holder = NULL;
+
+static bool step_spam_enemies(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("spam: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    Object* target = at_vw_objs[0];
+    Object* other = at_vw_objs[1];
+    if (at_vw_phase >= 1 && at_vw_phase < 99) {
+        at_heal();
+        rt_debug_set_ap(10.0f);
+    }
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        if (intface_is_item_right_hand()) {
+            intface_toggle_items(false);
+        }
+        at_vw_home();
+        at_move_to_clear_spot();
+        at_clear_rats_near(12);
+        int rotation = at_vw_open_rotation();
+        if (rotation == -1) {
+            at_check(C_SPAM_ENEMIES, false, "no open hexes");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 1), true);
+        at_vw_objs[1] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, (rotation + 3) % ROTATION_COUNT, 1), true);
+        if (at_vw_objs[0] == NULL || at_vw_objs[1] == NULL) {
+            at_check(C_SPAM_ENEMIES, false, "rats could not be placed");
+            at_vw_phase = 99;
+            break;
+        }
+        at_full_hp(at_vw_objs[0]);
+        at_full_hp(at_vw_objs[1]);
+        rt_debug_set_lock(at_vw_objs[0]);
+        // Hits that hurt no one: the rats stay for the whole test.
+        rt_debug_force_player_hits(1000, 0);
+        at_vw_values[0] = stats->playerFreeAttacks + stats->playerHeldAttacks;
+        at_vw_values[1] = stats->enemyAttacksDuringPlayerAttack;
+        at_vw_values[2] = stats->playerAttacks - stats->freeSwingAttempts + stats->freeSwings;
+        at_vw_values[3] = 0;
+        at_vw_values[4] = 0;
+        at_vw_values[5] = 0;
+        at_vw_values[6] = 0;
+        at_vw_values[7] = 0;
+        at_vw_values[8] = stats->meleeApCharges;
+        at_spam_holder = NULL;
+        rt_debug_set_ai_paused(false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1: {
+        // RT every 120 ms for 8 s.
+        Object* holder = rt_get_player_slot_holder();
+        if (holder != at_spam_holder) {
+            if (holder == target) {
+                at_vw_values[3]++;
+            } else if (holder == other) {
+                at_vw_values[4]++;
+            }
+            at_spam_holder = holder;
+        }
+        at_vw_values[5] = std::max(at_vw_values[5], rt_debug_attacks_on(target));
+        if (since - (unsigned int)at_vw_values[6] >= 120) {
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[6] = since;
+            at_vw_values[7]++;
+        }
+        if (since < 8000) {
+            break;
+        }
+        at_vw_next(elapsed);
+        break;
+    }
+    case 2: {
+        if (since < 1500) {
+            break;
+        }
+        int enemyAttacks = stats->playerFreeAttacks + stats->playerHeldAttacks - at_vw_values[0];
+        int during = stats->enemyAttacksDuringPlayerAttack - at_vw_values[1];
+        int playerAttacks = stats->playerAttacks - stats->freeSwingAttempts + stats->freeSwings - at_vw_values[2];
+        int apCharges = stats->meleeApCharges - at_vw_values[8];
+        at_check(C_SPAM_ENEMIES,
+            enemyAttacks >= 3 && at_vw_values[3] >= 1 && at_vw_values[4] >= 1 && during >= 1 && playerAttacks >= 3
+                && at_vw_values[5] <= 1,
+            "%d RT presses in 8 s: player attacks %d; enemy attacks on the player %d (the punched rat %d, the other %d), %d of them while the player was attacking; attacks pending on the punched rat at most %d",
+            at_vw_values[7], playerAttacks, enemyAttacks, at_vw_values[3], at_vw_values[4], during, at_vw_values[5]);
+        at_check(C_TIMING_COSTS, apCharges == playerAttacks,
+            "AP charged %d times for %d unarmed attacks from %d presses (only committed attacks pay)",
+            apCharges, playerAttacks, at_vw_values[7]);
+        at_vw_phase = 99;
+        break;
+    }
+    case 99:
+        rt_debug_force_player_hits(0, 0);
+        rt_debug_set_lock(NULL);
+        rt_debug_set_ai_paused(true);
+        at_vw_cleanup();
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
+// Repeated RT presses and their timing: a fresh press and a press near the
+// end of the recovery keep the normal hit chance, an early one loses some,
+// spam loses more (up to the maximum), once; one attack per press series;
+// cancellations clear it; held automatic fire is unaffected.
+static int at_tm_vanilla(Object* target)
+{
+    int hitMode = at_current_hit_mode();
+    return determine_to_hit(obj_dude, target, HIT_LOCATION_UNCALLED, hitMode);
+}
+
+static bool step_timing(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    const RtRules* rules = rt_rules();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("timing: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    Object* rat = at_vw_objs[0];
+    Object* pistol = at_vw_objs[1];
+    if (at_vw_phase >= 1 && at_vw_phase < 99) {
+        at_heal();
+        if (pistol != NULL) {
+            item_w_set_curr_ammo(pistol, item_w_max_ammo(pistol));
+        }
+    }
+    int recoveryLeft = rt_debug_recovery_left_ms();
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_vw_home();
+        at_move_to_clear_spot();
+        at_clear_rats_near(12);
+        int rotation = at_vw_open_rotation();
+        if (rotation == -1) {
+            at_check(C_TIMING_FRESH, false, "no open hexes");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_values[15] = rotation;
+        at_vw_face(rotation);
+        at_vw_objs[0] = at_spawn_rat_at(tile_num_in_direction(obj_dude->tile, rotation, 2), true);
+        at_vw_objs[1] = at_test_pistol();
+        if (at_vw_objs[0] == NULL || at_vw_objs[1] == NULL) {
+            at_check(C_TIMING_FRESH, false, "fixture missing (rat %d, pistol %d)", at_vw_objs[0] != NULL, at_vw_objs[1] != NULL);
+            at_vw_phase = 99;
+            break;
+        }
+        rt_debug_force_player_hits(1000, 0);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1:
+        // A fresh press with the weapon ready.
+        if (since < 800 || !at_wield(pistol) || anim_busy(obj_dude) || recoveryLeft != 0) {
+            break;
+        }
+        rt_debug_set_lock(rat);
+        if (since < 1300) {
+            break;
+        }
+        at_vw_values[0] = at_tm_vanilla(rat);
+        at_vw_values[1] = stats->playerAttacks;
+        at_vw_values[2] = stats->timingClears;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 2:
+        if (stats->playerAttacks == at_vw_values[1]) {
+            if (since > 3000) {
+                at_check(C_TIMING_FRESH, false, "the fresh press started no attack");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_check(C_TIMING_FRESH, stats->lastTimingPenalty == 0 && stats->lastTimingToHit == at_vw_values[0],
+            "fresh press: penalty %d, hit chance %d%% (normal %d%%)", stats->lastTimingPenalty, stats->lastTimingToHit, at_vw_values[0]);
+        at_vw_values[1] = stats->playerAttacks;
+        at_vw_floats[0] = (float)SDL_GetTicks();
+        at_vw_next(elapsed);
+        break;
+    case 3:
+        // A press shortly before the recovery ends.
+        if (recoveryLeft <= 0 || recoveryLeft > 150) {
+            if (since > 5000) {
+                at_check(C_TIMING_GOOD, false, "the recovery end was never seen");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_values[3] = recoveryLeft;
+        // How long an attack and its recovery take with this gun.
+        at_vw_floats[1] = (float)(SDL_GetTicks() + recoveryLeft) - at_vw_floats[0];
+        at_vw_values[0] = at_tm_vanilla(rat);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 4:
+        if (stats->playerAttacks == at_vw_values[1]) {
+            if (since > 3000) {
+                at_check(C_TIMING_GOOD, false, "the well-timed press started no attack");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_values[4] = stats->lastTimingPenalty;
+        at_vw_values[5] = stats->lastTimingLeadMs;
+        at_vw_values[6] = stats->lastTimingToHit;
+        at_vw_values[7] = at_vw_values[0];
+        at_vw_values[1] = stats->playerAttacks;
+        // While this attack plays: an early press, about 1 s before its
+        // recovery ends (a press is kept for 1.2 s).
+        at_vw_values[0] = at_tm_vanilla(rat);
+        at_vw_floats[2] = (float)SDL_GetTicks() + std::max(0.0f, at_vw_floats[1] - 1000.0f);
+        at_vw_values[8] = -2;
+        at_vw_next(elapsed);
+        break;
+    case 5: {
+        // The indicator shows the penalty the buffered press would get.
+        if (at_vw_values[8] == -2) {
+            if ((float)SDL_GetTicks() >= at_vw_floats[2]) {
+                at_vw_values[0] = at_tm_vanilla(rat);
+                at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+                at_vw_values[8] = -1;
+                at_vw_time = elapsed;
+            }
+            break;
+        }
+        int preview = rt_debug_timing_preview();
+        const RtIndicator* indicator = rt_get_indicator();
+        if (preview > 0 && indicator->toHit >= 0 && at_vw_values[8] == -1 && recoveryLeft >= 0) {
+            at_vw_values[8] = indicator->toHit == at_tm_vanilla(rat) - preview ? 1 : 0;
+            at_vw_values[9] = indicator->toHit;
+            at_vw_values[10] = preview;
+        }
+        if (stats->playerAttacks == at_vw_values[1]) {
+            if (since > 4000) {
+                at_check(C_TIMING_EARLY, false, "the early press started no attack");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        int early = stats->lastTimingPenalty;
+        at_check(C_TIMING_GOOD, at_vw_values[4] == 0 && at_vw_values[6] == at_vw_values[7] && at_vw_values[4] < early,
+            "press %d ms before the recovery ended (counted %d ms): penalty %d, hit chance %d%% (normal %d%%); the early press's penalty %d",
+            at_vw_values[3], at_vw_values[5], at_vw_values[4], at_vw_values[6], at_vw_values[7], early);
+        at_check(C_TIMING_EARLY,
+            stats->lastTimingLeadMs >= 2 * rules->timingWindowMs && early == rules->timingEarlyPenalty
+                && stats->lastTimingSpam == 0 && stats->lastTimingToHit == at_vw_values[0] - early,
+            "press %d ms before the recovery ended: penalty %d (configured %d), hit chance %d%% (normal %d%%)",
+            stats->lastTimingLeadMs, early, rules->timingEarlyPenalty, stats->lastTimingToHit, at_vw_values[0]);
+        at_check(C_TIMING_INDICATOR, at_vw_values[8] == 1,
+            "while the press was buffered the indicator showed %d%% with a timing penalty of %d (matches=%d)",
+            at_vw_values[9], at_vw_values[10], at_vw_values[8]);
+        // Spam during this attack.
+        at_vw_values[1] = stats->playerAttacks;
+        at_vw_values[11] = 0;
+        at_vw_values[12] = 0;
+        at_vw_values[13] = at_ammo_rounds(pistol) + item_w_curr_ammo(pistol);
+        at_vw_values[14] = 0;
+        at_vw_values[0] = at_tm_vanilla(rat);
+        at_vw_floats[3] = (float)SDL_GetTicks() + std::max(0.0f, at_vw_floats[1] - 700.0f);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 6:
+        // Six presses 100 ms apart while it plays, the last one shortly
+        // before its recovery ends.
+        if (at_vw_values[11] < 6) {
+            if ((float)SDL_GetTicks() >= at_vw_floats[3] + at_vw_values[11] * 100.0f && recoveryLeft != 0) {
+                at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+                at_vw_values[11]++;
+            }
+            break;
+        }
+        if (stats->playerAttacks == at_vw_values[1]) {
+            if (since > 4000) {
+                at_check(C_TIMING_SPAM, false, "the spammed presses started no attack");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_values[12] = stats->lastTimingPenalty;
+        at_vw_values[14] = stats->lastTimingSpam;
+        at_vw_values[3] = stats->lastTimingToHit;
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        // Then nothing more: one attack for the whole series.
+        if (since < 2500 || anim_busy(obj_dude)) {
+            break;
+        }
+        {
+            int attacks = stats->playerAttacks - at_vw_values[1];
+            int expected = std::min(rules->timingMaxPenalty, at_vw_values[14] * rules->timingSpamPenalty);
+            at_check(C_TIMING_SPAM,
+                attacks == 1 && at_vw_values[14] == 5 && at_vw_values[12] >= expected && at_vw_values[12] <= rules->timingMaxPenalty
+                    && at_vw_values[12] > rules->timingEarlyPenalty && at_vw_values[3] == at_vw_values[0] - at_vw_values[12],
+                "6 presses during one attack: %d attack(s) started from them, %d counted as spam, penalty %d (max %d), hit chance %d%% (normal %d%%)",
+                attacks, at_vw_values[14], at_vw_values[12], rules->timingMaxPenalty, at_vw_values[3], at_vw_values[0]);
+            at_vw_flags[0] = attacks == 1;
+        }
+        at_vw_values[1] = stats->playerAttacks;
+        at_vw_values[0] = at_tm_vanilla(rat);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 8:
+        // The penalty was used once: the next fresh press has none.
+        if (stats->playerAttacks == at_vw_values[1]) {
+            if (since > 3000) {
+                at_check(C_TIMING_ONCE, false, "the fresh press after the spam started no attack");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        {
+            int rounds = at_ammo_rounds(pistol) + item_w_curr_ammo(pistol);
+            at_check(C_TIMING_ONCE, stats->lastTimingPenalty == 0 && stats->lastTimingToHit == at_vw_values[0],
+                "the next fresh press: penalty %d, hit chance %d%% (normal %d%%); never above the normal chance",
+                stats->lastTimingPenalty, stats->lastTimingToHit, at_vw_values[0]);
+            at_vw_values[13] = rounds;
+        }
+        at_vw_values[1] = stats->playerAttacks;
+        at_vw_next(elapsed);
+        break;
+    case 9:
+        // A buffered press then a weapon change: both cleared, nothing fires.
+        if (recoveryLeft != -1 && since < 100) {
+            break;
+        }
+        if (at_vw_values[11] != 100) {
+            at_vw_values[2] = stats->timingClears;
+            at_vw_values[1] = stats->playerAttacks + stats->freeSwings;
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[11] = 100;
+            break;
+        }
+        if (since < 300) {
+            break;
+        }
+        at_unarmed();
+        at_vw_next(elapsed);
+        break;
+    case 10:
+        if (since < 2500) {
+            break;
+        }
+        at_vw_flags[1] = stats->timingClears > at_vw_values[2] && stats->playerAttacks + stats->freeSwings == at_vw_values[1];
+        at_vw_values[4] = stats->timingClears - at_vw_values[2];
+        at_vw_values[5] = stats->playerAttacks + stats->freeSwings - at_vw_values[1];
+        at_vw_next(elapsed);
+        break;
+    case 11:
+        // A buffered press then a controller disconnect.
+        if (since < 600 || !at_wield(pistol) || anim_busy(obj_dude) || recoveryLeft != 0) {
+            break;
+        }
+        at_vw_values[1] = stats->playerAttacks;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_values[11] = 0;
+        at_vw_next(elapsed);
+        break;
+    case 12:
+        if (at_vw_values[11] == 0 && stats->playerAttacks == at_vw_values[1]) {
+            if (since > 3000) {
+                at_check(C_TIMING_CLEAR, false, "no attack to buffer a press behind");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        if (at_vw_values[11] == 0) {
+            at_vw_values[2] = stats->timingClears;
+            at_vw_values[1] = stats->playerAttacks;
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[11] = 1;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (at_vw_values[11] == 1 && since > 100) {
+            at_pad.connected = false;
+            at_vw_values[11] = 2;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (at_vw_values[11] == 2 && since > 400) {
+            at_pad.connected = true;
+            at_vw_values[11] = 3;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (at_vw_values[11] == 3 && since > 2500) {
+            at_vw_flags[2] = stats->timingClears > at_vw_values[2] && stats->playerAttacks == at_vw_values[1];
+            at_vw_values[6] = stats->timingClears - at_vw_values[2];
+            at_vw_values[7] = stats->playerAttacks - at_vw_values[1];
+            at_vw_values[11] = 0;
+            at_vw_phase = 20;
+            at_vw_time = elapsed;
+        }
+        break;
+    case 20:
+        // A buffered press, then the pause menu (Start), closed with B.
+        if (since < 600 || anim_busy(obj_dude) || recoveryLeft != 0) {
+            break;
+        }
+        at_vw_values[1] = stats->playerAttacks;
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 21:
+        if (at_vw_values[11] == 0) {
+            if (stats->playerAttacks == at_vw_values[1]) {
+                if (since > 3000) {
+                    at_check(C_TIMING_CLEAR, false, "no attack to buffer a press behind (menu)");
+                    at_vw_phase = 99;
+                }
+                break;
+            }
+            at_vw_values[2] = stats->timingClears;
+            at_vw_values[1] = stats->playerAttacks;
+            at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            at_vw_values[11] = 1;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (at_vw_values[11] == 1 && since > 100) {
+            at_expect_menu(NULL, at_menu_close_with_b);
+            at_press(GAMEPAD_BUTTON_START);
+            at_vw_values[11] = 2;
+            at_vw_time = elapsed;
+            break;
+        }
+        if (at_vw_values[11] == 2 && since > 4500) {
+            bool cleared = stats->timingClears > at_vw_values[2] && stats->playerAttacks == at_vw_values[1];
+            at_check(C_TIMING_CLEAR, at_vw_flags[1] && at_vw_flags[2] && cleared,
+                "weapon change: cleared %d, attacks after it %d; controller disconnect: cleared %d, attacks after it %d; pause menu: cleared %d, attacks after it %d",
+                at_vw_values[4], at_vw_values[5], at_vw_values[6], at_vw_values[7],
+                stats->timingClears - at_vw_values[2], stats->playerAttacks - at_vw_values[1]);
+            at_vw_phase = 13;
+            at_vw_time = elapsed;
+        }
+        break;
+    case 13:
+        // Held automatic fire: repeats as before, none counted as presses.
+        if (at_burst_weapon == NULL) {
+            at_burst_weapon = at_create_burst_weapon();
+        }
+        if (since < 500 || at_burst_weapon == NULL || !at_wield(at_burst_weapon) || anim_busy(obj_dude)) {
+            break;
+        }
+        rt_debug_set_lock(rat);
+        if (at_current_anim() != ANIM_FIRE_BURST) {
+            // Y cycles the attack mode (single -> burst).
+            if (since - (unsigned int)at_vw_values[12] > 600) {
+                at_vw_values[12] = since;
+                at_press(GAMEPAD_BUTTON_Y);
+            }
+            break;
+        }
+        if (recoveryLeft != 0 || since < 1500) {
+            break;
+        }
+        item_w_set_curr_ammo(at_burst_weapon, item_w_max_ammo(at_burst_weapon));
+        at_vw_values[1] = stats->playerBurst;
+        at_vw_values[2] = stats->timingBusyPresses;
+        at_vw_values[3] = stats->timingSpamPresses;
+        at_vw_values[4] = stats->timingPenalized;
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = true;
+        at_vw_next(elapsed);
+        break;
+    case 14:
+        item_w_set_curr_ammo(at_burst_weapon, item_w_max_ammo(at_burst_weapon));
+        if (since < 4000) {
+            break;
+        }
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        at_check(C_TIMING_AUTO,
+            stats->playerBurst - at_vw_values[1] >= 2 && stats->timingBusyPresses == at_vw_values[2]
+                && stats->timingSpamPresses == at_vw_values[3] && stats->timingPenalized == at_vw_values[4],
+            "RT held 4 s: %d bursts, presses counted %d, spam %d, penalized attacks %d",
+            stats->playerBurst - at_vw_values[1], stats->timingBusyPresses - at_vw_values[2],
+            stats->timingSpamPresses - at_vw_values[3], stats->timingPenalized - at_vw_values[4]);
+        at_vw_phase = 99;
+        break;
+    case 99:
+        at_pad.buttons[GAMEPAD_BUTTON_RIGHT_TRIGGER] = false;
+        at_pad.connected = true;
+        rt_debug_force_player_hits(0, 0);
+        rt_debug_set_lock(NULL);
+        at_vw_objs[1] = NULL;
+        at_vw_cleanup();
+        at_unarmed();
+        at_release_test_pistol();
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
+// Hunting Rifle: its armed idle pose when idle and while reloading (for as
+// long as the holster and draw would take); ammunition moves once; no
+// firing before it is done; an interrupted reload loses nothing.
+static Object* at_rf_rifle = NULL;
+static int at_rf_ammo_pid = -1;
+
+static void at_rf_observe()
+{
+    int anim = FID_ANIM_TYPE(obj_dude->fid);
+    // (A lone idle animation doesn't count as busy: its frames show it.)
+    if (anim == ANIM_STAND && obj_dude->frame > 0) {
+        at_vw_flags[12] = true;
+    }
+    if (anim != ANIM_STAND) {
+        at_vw_flags[4] = true;
+        at_vw_values[14] = anim;
+    }
+    if (((obj_dude->fid & 0xF000) >> 12) != item_w_anim_code(at_rf_rifle)) {
+        at_vw_flags[5] = true;
+    }
+    if (inven_right_hand(obj_dude) != at_rf_rifle && inven_left_hand(obj_dude) != at_rf_rifle) {
+        at_vw_flags[6] = true;
+    }
+}
+
+static bool at_rf_idle_pose()
+{
+    int code = item_w_anim_code(at_rf_rifle);
+    return !anim_busy(obj_dude)
+        && FID_ANIM_TYPE(obj_dude->fid) == ANIM_STAND
+        && ((obj_dude->fid & 0xF000) >> 12) == code
+        && code != 0
+        && art_exists(obj_dude->fid);
+}
+
+// Spare rounds for the rifle.
+static int at_rf_rounds()
+{
+    return at_rf_rifle != NULL ? at_ammo_rounds(at_rf_rifle) : 0;
+}
+
+static bool step_rifle(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        at_clear_hostiles();
+        at_unarmed();
+        rt_debug_set_ai_paused(true);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("rifle: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    unsigned int now = SDL_GetTicks();
+    if (at_vw_phase >= 1 && at_vw_phase < 99) {
+        at_heal();
+    }
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500 || anim_busy(obj_dude) || !at_unarmed()) {
+            break;
+        }
+        at_vw_home();
+        at_clear_rats_near(10);
+        int pid = at_item_pid_by_name("Hunting Rifle");
+        Proto* proto;
+        if (pid == -1 || proto_ptr(pid, &proto) == -1) {
+            at_check(C_RIFLE_IDLE, false, "no Hunting Rifle prototype");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_values[13] = pid;
+        Rect rect;
+        if (obj_pid_new(&at_rf_rifle, pid) == -1 || item_add_force(obj_dude, at_rf_rifle, 1) != 0) {
+            at_check(C_RIFLE_IDLE, false, "the Hunting Rifle could not be given");
+            at_rf_rifle = NULL;
+            at_vw_phase = 99;
+            break;
+        }
+        obj_disconnect(at_rf_rifle, &rect);
+        at_rf_ammo_pid = proto->item.data.weapon.ammoTypePid;
+        Object* ammo;
+        if (at_rf_ammo_pid > 0 && obj_pid_new(&ammo, at_rf_ammo_pid) != -1) {
+            if (item_add_force(obj_dude, ammo, 3) == 0) {
+                obj_disconnect(ammo, &rect);
+            }
+        }
+        at_log("harness: Hunting Rifle (pid 0x%08X, weapon code %d) and its ammunition given", pid, item_w_anim_code(at_rf_rifle));
+        at_vw_objs[0] = at_spawn_rat(3, 5, false);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1:
+        if (at_vw_values[12] == 1) {
+            // Its idle animation (the idle fidget) plays with the rifle: its
+            // frames advance, the sprite stays the rifle's stand set.
+            if (obj_dude->frame > 0) {
+                at_vw_values[10] = std::max(at_vw_values[10], obj_dude->frame);
+            }
+            if (((obj_dude->fid & 0xF000) >> 12) != item_w_anim_code(at_rf_rifle) || FID_ANIM_TYPE(obj_dude->fid) != ANIM_STAND) {
+                at_vw_flags[14] = false;
+            }
+            if (since < (unsigned int)at_vw_values[11] + 300) {
+                break;
+            }
+            at_vw_flags[14] = at_vw_flags[14] && at_vw_values[10] > 0;
+        } else {
+            // Idle with it: the armed idle pose.
+            if (!at_wield(at_rf_rifle) || anim_busy(obj_dude)) {
+                at_vw_time = elapsed;
+                break;
+            }
+            if (since < 1200) {
+                if (!at_rf_idle_pose()) {
+                    at_vw_time = elapsed;
+                }
+                break;
+            }
+            at_screenshot("61_rifle_idle");
+            at_vw_flags[13] = at_rf_idle_pose();
+            at_vw_values[11] = at_anim_length_ms(obj_dude, ANIM_STAND);
+            at_play_anim(obj_dude, ANIM_STAND);
+            at_vw_flags[14] = true;
+            at_vw_values[10] = 0;
+            at_vw_values[12] = 1;
+            at_vw_time = elapsed;
+            break;
+        }
+        at_check(C_RIFLE_IDLE, at_vw_flags[13] && at_vw_flags[14] && at_rf_idle_pose() && at_vw_values[13] == PROTO_ID_HUNTING_RIFLE,
+            "idle with the Hunting Rifle (pid %d, expected %d): stand pose with weapon code %d (rifle %d)=%d; its idle animation (%d ms, up to frame %d) played with the rifle=%d and ended in the pose=%d",
+            at_vw_values[13] & 0xFFFFFF, PROTO_ID_HUNTING_RIFLE, (obj_dude->fid & 0xF000) >> 12, item_w_anim_code(at_rf_rifle),
+            at_vw_flags[13], at_vw_values[11], at_vw_values[10], at_vw_flags[14], at_rf_idle_pose());
+        at_vw_next(elapsed);
+        break;
+    case 2: {
+        // Reload from empty; RT pressed meanwhile.
+        if (at_vw_objs[0] != NULL) {
+            rt_debug_set_lock(at_vw_objs[0]);
+        }
+        item_w_set_curr_ammo(at_rf_rifle, 0);
+        intface_update_ammo_lights();
+        int code = item_w_anim_code(at_rf_rifle);
+        int putAway = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_PUT_AWAY, code, obj_dude->rotation + 1);
+        int takeOut = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_TAKE_OUT, code, obj_dude->rotation + 1);
+        CacheEntry* handle;
+        int total = 0;
+        int fids[2] = { putAway, takeOut };
+        for (int fid : fids) {
+            Art* art = art_ptr_lock(fid, &handle);
+            if (art != NULL) {
+                total += art_frame_max_frame(art) * 1000 / art_frame_fps(art);
+                art_ptr_unlock(handle);
+            }
+        }
+        at_vw_values[0] = total;
+        at_vw_values[1] = at_rf_rounds();
+        at_vw_values[2] = stats->reloadAmmoTransfers;
+        at_vw_values[3] = stats->idleReloads;
+        at_vw_values[4] = stats->playerAttacks;
+        at_vw_values[5] = 0;
+        at_vw_values[6] = (int)now;
+        at_vw_values[7] = stats->reloadsStarted;
+        at_vw_flags[4] = false;
+        at_vw_flags[5] = false;
+        at_vw_flags[6] = false;
+        at_vw_flags[7] = false;
+        at_press(GAMEPAD_BUTTON_X);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 3:
+        if (rt_is_reloading()) {
+            at_rf_observe();
+            if (!at_vw_flags[7] && since > 300) {
+                at_vw_flags[7] = true;
+                at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+            }
+            at_vw_values[5] = stats->playerAttacks - at_vw_values[4];
+            break;
+        }
+        if (stats->reloadsStarted == at_vw_values[7]) {
+            if (since > 3000) {
+                at_check(C_RIFLE_RELOAD, false, "the reload did not start");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        {
+            int took = (int)stats->lastReloadMs;
+            int loaded = item_w_curr_ammo(at_rf_rifle);
+            int rounds = at_rf_rounds();
+            int transfers = stats->reloadAmmoTransfers - at_vw_values[2];
+            int fired = stats->playerAttacks - at_vw_values[4] - at_vw_values[5] > 0 ? stats->lastPlayerAmmoUsed : 0;
+            bool conserved = rounds + loaded + fired == at_vw_values[1];
+            at_check(C_RIFLE_RELOAD,
+                stats->idleReloads == at_vw_values[3] + 1 && at_vw_flags[12] && !at_vw_flags[4] && !at_vw_flags[5] && !at_vw_flags[6]
+                    && took >= at_vw_values[0] - 120 && took <= at_vw_values[0] + 250,
+                "reload with the rifle's idle animation=%d (played=%d; another animation seen=%d, anim %d; sprite changed=%d; weapon left the hand=%d); took %d ms (holster + draw %d ms)",
+                stats->idleReloads == at_vw_values[3] + 1, at_vw_flags[12], at_vw_flags[4], at_vw_values[14], at_vw_flags[5], at_vw_flags[6], took, at_vw_values[0]);
+            at_check(C_RIFLE_AMMO, transfers == 1 && conserved && loaded > 0 && at_vw_values[5] == 0,
+                "transfers %d, loaded %d, spare rounds %d -> %d (conserved=%d); attacks started while reloading %d",
+                transfers, loaded, at_vw_values[1], rounds, conserved, at_vw_values[5]);
+        }
+        at_vw_next(elapsed);
+        break;
+    case 4:
+        // Interrupted: an animation of the player's (as a heavy hit's) cuts
+        // it short before the ammunition moved.
+        if (since < 1500 || anim_busy(obj_dude) || rt_get_pending_count() > 0) {
+            break;
+        }
+        rt_debug_set_lock(NULL);
+        item_w_set_curr_ammo(at_rf_rifle, 0);
+        intface_update_ammo_lights();
+        at_vw_values[1] = at_rf_rounds();
+        at_vw_values[2] = stats->reloadAmmoTransfers;
+        at_vw_values[3] = stats->reloadsInterrupted;
+        at_vw_values[7] = stats->reloadsStarted;
+        at_press(GAMEPAD_BUTTON_X);
+        at_vw_next(elapsed);
+        break;
+    case 5:
+        if (stats->reloadsStarted == at_vw_values[7]) {
+            if (since > 3000) {
+                at_check(C_RIFLE_INTERRUPT, false, "the reload to interrupt did not start");
+                at_vw_phase = 99;
+            }
+            at_vw_time = elapsed;
+            break;
+        }
+        if (since < 150) {
+            break;
+        }
+        // As a heavy hit does: its own animations end, another one starts.
+        at_log("harness: an animation of the player's interrupts the reload");
+        register_clear(obj_dude);
+        at_play_anim(obj_dude, ANIM_HIT_FROM_FRONT);
+        at_vw_next(elapsed);
+        break;
+    case 6:
+        if (since < 800 || anim_busy(obj_dude)) {
+            break;
+        }
+        at_vw_flags[8] = !rt_is_reloading() && stats->reloadsInterrupted == at_vw_values[3] + 1
+            && item_w_curr_ammo(at_rf_rifle) == 0 && at_rf_rounds() == at_vw_values[1]
+            && stats->reloadAmmoTransfers == at_vw_values[2];
+        at_vw_values[7] = stats->reloadsStarted;
+        at_press(GAMEPAD_BUTTON_X);
+        at_vw_next(elapsed);
+        break;
+    case 7:
+        if (rt_is_reloading() || stats->reloadsStarted == at_vw_values[7]) {
+            if (since > 5000) {
+                at_check(C_RIFLE_INTERRUPT, false, "the second reload did not finish");
+                at_vw_phase = 99;
+            }
+            break;
+        }
+        at_vw_flags[9] = stats->reloadAmmoTransfers == at_vw_values[2] + 1 && item_w_curr_ammo(at_rf_rifle) > 0
+            && at_rf_rounds() + item_w_curr_ammo(at_rf_rifle) == at_vw_values[1];
+        // Then it fires, and the player walks.
+        if (at_vw_objs[0] != NULL) {
+            rt_debug_set_lock(at_vw_objs[0]);
+        }
+        rt_debug_force_player_hits(1, 0);
+        at_vw_values[4] = stats->playerAttacks;
+        at_vw_values[5] = item_w_curr_ammo(at_rf_rifle);
+        at_press(GAMEPAD_BUTTON_RIGHT_TRIGGER);
+        at_vw_next(elapsed);
+        break;
+    case 8:
+        if ((stats->playerAttacks == at_vw_values[4] || rt_get_pending_count() > 0 || anim_busy(obj_dude)) && since < 4000) {
+            break;
+        }
+        at_vw_flags[10] = stats->playerAttacks == at_vw_values[4] + 1 && item_w_curr_ammo(at_rf_rifle) == at_vw_values[5] - 1;
+        rt_debug_set_lock(NULL);
+        at_vw_values[6] = obj_dude->tile;
+        at_stick_open_direction();
+        at_vw_next(elapsed);
+        break;
+    case 9:
+        at_stick_open_direction();
+        if (since < 700) {
+            break;
+        }
+        at_stick_release();
+        at_vw_flags[11] = obj_dude->tile != at_vw_values[6];
+        at_vw_next(elapsed);
+        break;
+    case 10:
+        if ((anim_busy(obj_dude) || since < 600) && since < 3000) {
+            break;
+        }
+        at_check(C_RIFLE_INTERRUPT, at_vw_flags[8] && at_vw_flags[9] && at_vw_flags[10] && at_vw_flags[11] && at_rf_idle_pose(),
+            "interrupted before the ammo moved: nothing loaded or lost=%d; reloading again loads once=%d; then it fires one round=%d, the player walks=%d and stands in the rifle's idle pose=%d",
+            at_vw_flags[8], at_vw_flags[9], at_vw_flags[10], at_vw_flags[11], at_rf_idle_pose());
+        at_vw_phase = 99;
+        break;
+    case 99:
+        at_stick_release();
+        rt_debug_force_player_hits(0, 0);
+        rt_debug_set_lock(NULL);
+        at_unarmed();
+        if (at_rf_rifle != NULL && obj_top_environment(at_rf_rifle) == obj_dude) {
+            item_remove_mult(obj_dude, at_rf_rifle, 1);
+            Rect rect;
+            obj_erase_object(at_rf_rifle, &rect);
+        }
+        at_rf_rifle = NULL;
+        if (at_rf_ammo_pid > 0) {
+            Object* ammo = inven_pid_is_carried_ptr(obj_dude, at_rf_ammo_pid);
+            if (ammo != NULL) {
+                item_remove_mult(obj_dude, ammo, item_count(obj_dude, ammo));
+            }
+        }
+        at_vw_cleanup();
+        rt_debug_set_ai_paused(false);
+        return true;
+    }
+    return false;
+}
+
+// Shady Sands: the player inside a tent, a gunman outside. It doesn't shoot
+// through the tent; it moves to where it can shoot (the player is never
+// held meanwhile).
+static int at_tent_blocked_directions(int tile)
+{
+    int blocked = 0;
+    for (int rotation = 0; rotation < ROTATION_COUNT; rotation++) {
+        for (int distance = 1; distance <= 4; distance++) {
+            int other = tile_num_in_direction(tile, rotation, distance);
+            if (other != -1 && obj_sight_blocking_at(NULL, other, obj_dude->elevation) != NULL) {
+                blocked++;
+                break;
+            }
+        }
+    }
+    return blocked;
+}
+
+static bool step_tent(unsigned int elapsed, bool first, bool timedOut)
+{
+    const RtStats* stats = rt_get_stats();
+    if (first) {
+        at_vw_begin(elapsed);
+        at_release_all();
+        rt_debug_set_lock(NULL);
+        return false;
+    }
+
+    if (timedOut) {
+        at_log("tent: timed out in phase %d", at_vw_phase);
+        at_vw_phase = 99;
+    }
+
+    unsigned int since = elapsed - at_vw_time;
+    if (at_vw_phase >= 2 && at_vw_phase < 99) {
+        at_heal();
+        Object* gunman = at_vw_objs[0];
+        if (gunman != NULL) {
+            Object* pistol = item_hit_with(gunman, HIT_MODE_RIGHT_WEAPON_PRIMARY);
+            if (pistol != NULL && item_w_max_ammo(pistol) > 0) {
+                item_w_set_curr_ammo(pistol, item_w_max_ammo(pistol));
+            }
+        }
+    }
+
+    switch (at_vw_phase) {
+    case 0: {
+        if (since < 500) {
+            break;
+        }
+        const char* names[] = { "SHADYE.MAP", "SHADYW.MAP" };
+        int map = -1;
+        for (const char* name : names) {
+            if (map == -1) {
+                map = map_match_map_name(name);
+            }
+        }
+        if (map == -1) {
+            at_check(C_TENT, false, "Shady Sands map not found");
+            return true;
+        }
+        MapTransition transition;
+        transition.map = map;
+        transition.elevation = 0;
+        transition.tile = -1;
+        transition.rotation = 0;
+        map_leave_map(&transition);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 1: {
+        if (SDL_strncasecmp(map_data.name, "SHADY", 5) != 0 || since < 1500) {
+            if (since > 15000) {
+                at_check(C_TENT, false, "Shady Sands did not load (map %s)", map_data.name);
+                return true;
+            }
+            break;
+        }
+        // Inside: a free hex with walls or scenery blocking the view in
+        // most directions; outside: a free hex 5-9 away the player can't be
+        // seen from, from which the player can be reached.
+        int inside = -1;
+        int outside = -1;
+        Object* wall = NULL;
+        for (Object* obj = obj_find_first_at(obj_dude->elevation); obj != NULL && inside == -1; obj = obj_find_next_at()) {
+            if (FID_TYPE(obj->fid) != OBJ_TYPE_WALL) {
+                continue;
+            }
+            for (int rotation = 0; rotation < ROTATION_COUNT && inside == -1; rotation++) {
+                for (int distance = 1; distance <= 2 && inside == -1; distance++) {
+                    int tile = tile_num_in_direction(obj->tile, rotation, distance);
+                    if (tile == -1 || !at_tile_free(tile) || at_tent_blocked_directions(tile) < 5) {
+                        continue;
+                    }
+                    for (int far = 5; far <= 9 && outside == -1; far++) {
+                        for (int dir = 0; dir < ROTATION_COUNT && outside == -1; dir++) {
+                            int candidate = tile_num_in_direction(tile, dir, far);
+                            if (candidate == -1 || !at_tile_free(candidate)) {
+                                continue;
+                            }
+                            // (The player only stands in for a critter here.)
+                            Object* probe = obj_dude;
+                            make_straight_path_func(obj_dude, candidate, tile, NULL, &probe, 0, obj_sight_blocking_at);
+                            Object* blocker = probe != obj_dude ? probe : NULL;
+                            if (blocker != NULL && make_path(obj_dude, tile, candidate, NULL, 0) > 0) {
+                                inside = tile;
+                                outside = candidate;
+                                wall = blocker;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if (inside == -1) {
+            at_check(C_TENT, false, "no enclosed spot with a hidden approach found on %s", map_data.name);
+            at_vw_phase = 99;
+            break;
+        }
+        Rect rect;
+        obj_move_to_tile(obj_dude, inside, obj_dude->elevation, &rect);
+        tile_set_center(inside, TILE_SET_CENTER_REFRESH_WINDOW);
+        rt_view_reset_pan();
+        rt_debug_camera_follow();
+        at_log("tent: player inside at tile %d (view blocked in %d of 6 directions); the gunman outside at tile %d; between them %s (pid 0x%08X, type %d, shoot-through %d, light-through %d)",
+            inside, at_tent_blocked_directions(inside), outside, object_name(wall), wall->pid, FID_TYPE(wall->fid),
+            (wall->flags & OBJECT_SHOOT_THRU) != 0, (wall->flags & OBJECT_LIGHT_THRU) != 0);
+        at_vw_values[5] = (wall->flags & OBJECT_SHOOT_THRU) != 0;
+        at_vw_objs[0] = at_spawn_gunman(outside);
+        if (at_vw_objs[0] == NULL) {
+            at_check(C_TENT, false, "no gunman could be placed outside");
+            at_vw_phase = 99;
+            break;
+        }
+        at_vw_values[0] = stats->aiHopelessAttacks;
+        at_vw_values[1] = stats->aiSightBlockedSkips;
+        at_vw_values[2] = stats->playerHeldAttacks;
+        at_el_watch_begin(at_vw_objs[0]);
+        at_vw_next(elapsed);
+        break;
+    }
+    case 2:
+        at_el_watch_tick();
+        if (at_el_watch.attacks < 1 && since < 20000) {
+            break;
+        }
+        at_screenshot("62_tent");
+        at_check(C_TENT,
+            !at_el_watch.startedValid && at_el_watch.invalidAttacks == 0 && stats->aiHopelessAttacks == at_vw_values[0]
+                && at_el_watch.heldTicks == 0 && at_el_watch.moved,
+            "gunman outside the tent (shot through possible=%d, but no view): attacks %d (from an invalid spot %d, without a chance %d), first one %d ms after it had a valid shot at %d hexes (%d%%); no-sight skips %d; it moved=%d; player held %d ticks",
+            at_vw_values[5], at_el_watch.attacks, at_el_watch.invalidAttacks, stats->aiHopelessAttacks - at_vw_values[0],
+            at_el_watch.firstAttackDelayMs, at_el_watch.firstAttackDistance, at_el_watch.firstAttackToHit,
+            stats->aiSightBlockedSkips - at_vw_values[1], at_el_watch.moved, at_el_watch.heldTicks);
+        at_vw_phase = 99;
+        break;
+    case 99:
+        at_vw_cleanup();
+        return true;
+    }
+    return false;
+}
+
 static const AtStep at_steps[] = {
     { "wait for map", step_wait_load, 10000 },
     { "script scan", step_script_scan, 5000 },
@@ -13918,6 +21072,8 @@ static const AtStep at_steps[] = {
     { "focus loss", step_focus, 12000 },
     { "Pip-Boy shortcuts", step_pipboy_shortcuts, 40000 },
     { "Pip-Boy tabs and actions", step_pipboy, 120000 },
+    { "Pip-Boy: LT/RT tabs, left stick subcategories", step_pipboy_stick, 45000 },
+    { "Pip-Boy: perk artwork", step_pb_perk_art, 60000 },
     { "favorites assignment (Pip-Boy Y)", step_fav_assign, 90000 },
     { "favorites (direct D-pad)", step_fav_use, 60000 },
     { "level-up indicator", step_level_icon, 90000 },
@@ -13941,9 +21097,28 @@ static const AtStep at_steps[] = {
     { "ambient dialogue follows its speaker", step_text_follow, 20000 },
     { "cutaway size", step_cutaway, 10000 },
     { "melee and unarmed swings without a lock", step_swing, 60000 },
+    { "close combat: AP costs", step_cc_ap, 40000 },
+    { "close combat: counterattacks", step_cc_counter, 40000 },
+    { "close combat: two-handed sweeps", step_cc_sweep, 40000 },
+    { "attack AP costs", step_ap_table, 10000 },
+    { "RB throw from the right hand", step_rb_throw, 60000 },
+    { "ranged counterattacks", step_ranged_counter, 50000 },
+    { "stale who-hit-me", step_who_hit_me, 10000 },
+    { "enemy hit reactions", step_reactions, 60000 },
+    { "enemy attack eligibility", step_eligibility, 60000 },
+    { "RT spam: enemies keep acting", step_spam_enemies, 20000 },
+    { "RT timing accuracy", step_timing, 60000 },
+    { "Hunting Rifle reload", step_rifle, 40000 },
+    { "Quick Pockets: timed steal bonus", step_qp, 60000 },
     { "smooth right stick camera", step_camera_smooth, 25000 },
     { "R3 wider view", step_zoom, 20000 },
+    { "traits: Kamikaze", step_traits_kamikaze, 30000 },
+    { "traits: Fast Shot", step_traits_fast_shot, 100000 },
+    { "traits: Bloody Mess", step_traits_bloody_mess, 90000 },
+    { "traits: Skilled", step_traits_skilled, 3000 },
+    { "traits for the save", step_traits_before_save, 2000 },
     { "sneak on for the save", step_sneak_before_save, 2000 },
+    { "close combat for the save", step_cc_before_save, 2000 },
     { "save game", step_save, 30000 },
     { "load game", step_load, 40000 },
     { "Pip-Boy progress after load", step_pipboy_persist, 3000 },
@@ -13951,18 +21126,38 @@ static const AtStep at_steps[] = {
     { "level-up indicator after load", step_level_after_load, 3000 },
     { "perk selections after load", step_rules_perks_after_load, 3000 },
     { "sneak after load", step_sneak_after_load, 3000 },
+    { "traits after load", step_traits_after_load, 3000 },
+    { "close combat after load", step_cc_after_load, 3000 },
+    { "who-hit-me after load", step_who_hit_me_after_load, 3000 },
     { "map transition", step_map_change, 30000 },
     { "Pip-Boy saved automaps and world map", step_pipboy_maps, 30000 },
     { "neutral NPC lock", step_neutral, 40000 },
+    { "dialogue with the controller", step_dialogue, 90000 },
     { "camera edge scrolling (Vault 13)", step_camera_vault, 40000 },
+    { "Vault 15 rope", step_rope, 60000 },
+    { "Vault 15 rope: save", step_rope_save, 30000 },
+    { "Vault 15 rope: load", step_rope_load, 40000 },
+    { "Vault 15 rope: map transition", step_rope_map, 40000 },
+    { "Shady Sands tent", step_tent, 60000 },
 };
 
 #define AT_STEP_COUNT ((int)(sizeof(at_steps) / sizeof(at_steps[0])))
 
+// `--rt-autotest-menus`: after the main menu and character creation (see
+// `at_menus_pregame`), these run in the game.
+static const AtStep at_menus_steps[] = {
+    { "wait for map", step_wait_load, 10000 },
+    { "menus: character after creation", step_mn_after_creation, 8000 },
+    { "menus: pause menu and preferences", step_mn_pause, 45000 },
+    { "menus: save with the controller", step_mn_save, 45000 },
+};
+
+#define AT_MENUS_STEP_COUNT ((int)(sizeof(at_menus_steps) / sizeof(at_menus_steps[0])))
+
 // `--rt-autotest-only=a|b` runs the steps whose names contain a or b.
 static bool at_only_matches(const char* name)
 {
-    char filter[64];
+    char filter[256];
     SDL_strlcpy(filter, at_only, sizeof(filter));
     for (char* part = strtok(filter, "|"); part != NULL; part = strtok(NULL, "|")) {
         if (SDL_strcasestr(name, part) != NULL) {
@@ -13977,6 +21172,11 @@ void rt_autotest_tick()
     if (!at_enabled || at_finished) {
         return;
     }
+
+    const AtStep* steps = at_menus_mode ? at_menus_steps : at_steps;
+    int stepCount = at_menus_mode ? AT_MENUS_STEP_COUNT : AT_STEP_COUNT;
+    // In the game: the menus before it are done.
+    at_menus_pregame_done = true;
 
     unsigned int now = SDL_GetTicks();
     if (at_start_time == 0) {
@@ -14005,22 +21205,22 @@ void rt_autotest_tick()
         return;
     }
 
-    if (now - at_start_time > AT_TOTAL_TIMEOUT || at_step_index >= AT_STEP_COUNT) {
+    if (now - at_start_time > AT_TOTAL_TIMEOUT || at_step_index >= stepCount) {
         at_finish();
         return;
     }
 
     // Development filter: skip steps not asked for (the first one loads the map).
-    while (at_only[0] != 0 && at_step_index > 0 && at_step_index < AT_STEP_COUNT
-        && !at_only_matches(at_steps[at_step_index].name)) {
+    while (at_only[0] != 0 && at_step_index > 0 && at_step_index < stepCount
+        && !at_only_matches(steps[at_step_index].name)) {
         at_step_index++;
     }
-    if (at_step_index >= AT_STEP_COUNT) {
+    if (at_step_index >= stepCount) {
         at_finish();
         return;
     }
 
-    const AtStep* step = &(at_steps[at_step_index]);
+    const AtStep* step = &(steps[at_step_index]);
     unsigned int elapsed = now - at_step_start;
     bool timedOut = elapsed > step->timeout;
     bool first = at_step_first;

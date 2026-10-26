@@ -18,6 +18,7 @@
 #include "game/object.h"
 #include "game/proto.h"
 #include "game/realtime.h"
+#include "game/rt_rules.h"
 #include "plib/color/color.h"
 #include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
@@ -664,6 +665,23 @@ int rt_favorites_activate(int slot)
     fav_state.activations++;
     switch (type) {
     case ITEM_TYPE_WEAPON: {
+        // A thrown weapon goes in the right hand (item 2), whatever hand is
+        // active, so RB can throw it while the active item stays.
+        if (rt_is_thrown_weapon(item)) {
+            Object* right = inven_right_hand(obj_dude);
+            if (right != NULL && right->pid == item->pid) {
+                fav_print("The %s is already in your right hand. RB throws it.", name);
+                return RT_FAVORITES_DONE;
+            }
+            if (inven_rt_equip(item, INVEN_RT_SLOT_RIGHT_HAND) == 0) {
+                gsound_play_sfx_file("ib1p1xx1");
+                fav_print("The %s is in your right hand. RB throws it.", name);
+                return RT_FAVORITES_DONE;
+            }
+            fav_print("You can't ready the %s.", name);
+            return RT_FAVORITES_FAILED;
+        }
+
         bool right = intface_is_item_right_hand() != 0;
         Object* active = right ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
         if (active != NULL && active->pid == item->pid) {

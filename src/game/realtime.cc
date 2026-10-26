@@ -36,6 +36,7 @@
 #include "game/rt_context.h"
 #include "game/rt_favorites.h"
 #include "game/rt_pipboy.h"
+#include "game/protinst.h"
 #include "game/rt_rules.h"
 #include "game/rt_view.h"
 #include "game/skill.h"
@@ -131,6 +132,26 @@ typedef struct RtPendingAttack {
     // (attacker, defender, extras), see `rt_refresh_death_flags`.
     bool criticalDeath[2 + EXPLOSION_TARGET_COUNT];
     bool slowLogged;
+    // An ordinary attack of the player's (not an AIMED SHOT): the swing or
+    // shot it belongs to, so a miss can give that enemy a counterattack
+    // (one per swing or shot, see `rt_request_counter`). 0 otherwise.
+    // `counterRanged`: a shot or throw rather than a close-combat attack.
+    int counterSwing;
+    bool counterRanged;
+    // Who the attack was aimed at: a missed shot can be redirected to
+    // whatever lies beyond (`check_ranged_miss` changes the defender), but
+    // the counterattack belongs to the intended target.
+    Object* counterTarget;
+    // The defender ([0]) and extras ([1 + index]) whose ordinary reaction is
+    // over: they may move again before the attack lands (while the attacker
+    // finishes its own animation), see `rt_release_targets`.
+    bool released[1 + EXPLOSION_TARGET_COUNT];
+    // An enemy attack on the player with an ordinary outcome: the player
+    // has no part in its animation and isn't held by it (see
+    // `rt_player_detachable`).
+    bool playerDetached;
+    // Timing penalty this attack of the player's was committed with.
+    int timingPenalty;
 } RtPendingAttack;
 
 // A melee or unarmed swing started without a target in reach (see
@@ -146,7 +167,28 @@ typedef struct RtSwing {
     bool hit;
     unsigned int startedAt;
     unsigned int impactAt;
+    // Numbers swings (counterattacks are once per swing).
+    int serial;
+    // Two-handed melee: the swing can hit several targets in its arc; those
+    // attacked so far (each at most once).
+    bool sweep;
+    Object* sweepDone[8];
+    int sweepDoneCount;
+    // Timing penalty of the RT press that started it (see
+    // `rt_timing_penalty_for`), for each of its hits.
+    int timingPenalty;
 } RtSwing;
+
+// A counterattack an enemy is owed after the player's attack missed it:
+// its next attack on the player goes before the others'. After a missed
+// shot or throw (`ranged`) it has longer, as it may first have to get within
+// its own weapon's range.
+typedef struct RtCounter {
+    Object* critter;
+    unsigned int requestedAt;
+    unsigned int windowMs;
+    bool ranged;
+} RtCounter;
 
 static void rt_init();
 static void rt_open_log();
@@ -155,6 +197,9 @@ static bool rt_is_known_critter(Object* obj);
 static bool rt_is_alive(Object* critter);
 static bool rt_is_player_team(Object* critter);
 static bool rt_obj_in_attack(Object* obj);
+static void rt_timing_clear(const char* reason);
+static int rt_timing_preview();
+static void rt_update_player_impacts();
 static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation = HIT_LOCATION_UNCALLED);
 static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toHit);
 static int rt_player_swing(int hitMode);
@@ -205,6 +250,9 @@ static void rt_update_chem_request();
 static void rt_update_favorite_request();
 static void rt_update_attack_input(bool pressAttack);
 static int rt_player_attack(bool explicitPress);
+static int rt_player_attack_with(int hitMode, bool rbThrow);
+static void rt_set_throw_sprite(Object* item);
+static void rt_update_throw_input();
 static int rt_player_hit_mode(int* hitMode);
 static Object* rt_find_interactable();
 static void rt_collect_interactables();
@@ -257,8 +305,48 @@ static unsigned int rt_next_move_issue_at = 0;
 static int rt_move_progress_tile = -1;
 static unsigned int rt_move_progress_at = 0;
 static unsigned int rt_dude_next_attack_at = 0;
+// Bloody Mess: critters whose gory death (see `rt_note_gory_death`) is
+// still playing.
+static std::vector<Object*> rt_gory_deaths;
+// Fast Shot: the target of the player attack being registered.
+static Object* rt_registering_target = NULL;
+// The player while an enemy attack with an ordinary outcome on them is
+// being registered (see `rt_action_detached_defender`).
+static Object* rt_registering_detached = NULL;
+// Enemy attacks whose impact on the player came (their attackers, see
+// `rt_player_impact_cue`): the player's reaction plays on the next tick.
+static std::vector<Object*> rt_player_impacts;
+// Timing of repeated manual attacks (see `rt_timing_penalty_for`): RT
+// presses made during the player's current attack or its recovery, the
+// latest of them, when the recovery last ended, whether it was in progress
+// on the last tick, the weapon and attack mode of the presses, the penalty
+// of the attack being committed, and the input interruption count (a focus
+// loss or disconnect in between clears it all; so does a menu, see
+// `rt_tick`).
+static int rt_timing_presses = 0;
+static unsigned int rt_timing_press_at = 0;
+static unsigned int rt_timing_ready_at = 0;
+static bool rt_timing_recovering = false;
+static Object* rt_timing_weapon = NULL;
+static int rt_timing_hit_mode = -1;
+static int rt_timing_committing = 0;
+static int rt_timing_interruptions = 0;
+// Hunting Rifle reloads in the armed idle pose: when the ammunition moves
+// (0 when the reload isn't one).
+static unsigned int rt_reload_commit_at = 0;
+static unsigned int rt_reload_started_at = 0;
+// Its weapon code and the length of its idle animation.
+static int rt_reload_idle_code = 0;
+static unsigned int rt_reload_idle_anim_ms = 0;
+// When its idle animation playing now ends (a lone idle animation doesn't
+// count as busy, see `anim_busy`).
+static unsigned int rt_reload_idle_next_at = 0;
 static Object* rt_lock = NULL;
 static RtSwing rt_swing;
+static int rt_swing_serial = 0;
+// Counterattacks owed, oldest first, and the swing that asked last.
+static std::vector<RtCounter> rt_counters;
+static int rt_counter_last_swing = 0;
 
 // Something drawn over the map by `rt_render_overlay`, at its normal size
 // wherever the object it belongs to appears in the play area (whatever the
@@ -288,6 +376,8 @@ static int rt_indicator_cross_height = 0;
 static char rt_indicator_built_text[32] = "";
 static int rt_indicator_built_color = -1;
 static unsigned int rt_attack_buffered_until = 0;
+// RB: a throw of the right hand's thrown weapon waiting to start.
+static unsigned int rt_throw_buffered_until = 0;
 static bool rt_fire_hold = false;
 static unsigned int rt_fire_pressed_at = 0;
 // The attack of the latest RT press has started; only then can a hold repeat.
@@ -558,6 +648,7 @@ void rt_reset()
     rt_indicator_overlay.visible = false;
     rt_indicator_overlay.shown = { 0, 0, -1, -1 };
     rt_attack_buffered_until = 0;
+    rt_throw_buffered_until = 0;
     rt_fire_hold = false;
     rt_fire_press_done = false;
     rt_interact_outlined = NULL;
@@ -596,7 +687,17 @@ void rt_reset()
     rt_label.visible = false;
     rt_label.shown = { 0, 0, -1, -1 };
     memset(&rt_swing, 0, sizeof(rt_swing));
+    rt_counters.clear();
+    rt_counter_last_swing = 0;
     rt_aimed_reset("map load");
+    rt_gory_deaths.clear();
+    rt_registering_target = NULL;
+    rt_registering_detached = NULL;
+    rt_player_impacts.clear();
+    rt_timing_clear(NULL);
+    rt_timing_ready_at = 0;
+    rt_timing_recovering = false;
+    rt_reload_commit_at = 0;
 
     gamepad_reset_gameplay_input();
 
@@ -627,11 +728,41 @@ void rt_object_erased(Object* obj)
     if (rt_swing.aim == obj) {
         rt_swing.aim = NULL;
     }
+    for (int index = 0; index < rt_swing.sweepDoneCount; index++) {
+        if (rt_swing.sweepDone[index] == obj) {
+            rt_swing.sweepDone[index] = NULL;
+        }
+    }
+    rt_counters.erase(std::remove_if(rt_counters.begin(), rt_counters.end(), [obj](const RtCounter& counter) { return counter.critter == obj; }), rt_counters.end());
+    for (RtPendingAttack* pending : rt_pending) {
+        if (pending->counterTarget == obj) {
+            pending->counterTarget = NULL;
+        }
+    }
+    // A critter that remembers the removed object as its attacker forgets
+    // it (turn-based combat does this in `combat_delete_critter`).
+    for (Object* critter : rt_critters) {
+        if (critter != obj && critter->data.critter.combat.whoHitMe == obj) {
+            critter->data.critter.combat.whoHitMe = NULL;
+        }
+    }
+    if (obj_dude != NULL && obj_dude != obj && obj_dude->data.critter.combat.whoHitMe == obj) {
+        obj_dude->data.critter.combat.whoHitMe = NULL;
+    }
+    rt_gory_deaths.erase(std::remove(rt_gory_deaths.begin(), rt_gory_deaths.end(), obj), rt_gory_deaths.end());
+    if (rt_registering_target == obj) {
+        rt_registering_target = NULL;
+    }
+    rt_player_impacts.erase(std::remove(rt_player_impacts.begin(), rt_player_impacts.end(), obj), rt_player_impacts.end());
+    if (rt_timing_weapon == obj) {
+        rt_timing_weapon = NULL;
+    }
     rt_aimed_object_erased(obj);
     if (rt_lock == obj) {
         rt_lock = NULL;
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
+        rt_throw_buffered_until = 0;
         rt_log("lock: cleared (target removed)");
     }
     if (rt_holster_weapon == obj) {
@@ -729,6 +860,21 @@ int rt_get_player_slot_queue(Object** critters, int capacity)
     return count;
 }
 
+bool rt_is_live_critter(Object* critter)
+{
+    if (critter == NULL) {
+        return false;
+    }
+    if (critter == obj_dude) {
+        return true;
+    }
+    if (!rt_initialized || rt_critter_elevation == -1) {
+        // Nothing to check against yet: trust it, as the original does.
+        return true;
+    }
+    return rt_critter_set.find(critter) != rt_critter_set.end();
+}
+
 bool rt_is_hostile(Object* critter)
 {
     return rt_is_hostile_to_player(critter);
@@ -817,6 +963,15 @@ void rt_tick()
     unsigned int realDelta = rt_last_real_tick != 0 ? realTick - rt_last_real_tick : 0;
     rt_last_real_tick = realTick;
 
+    // A menu, dialogue or other modal screen was open since the last tick: RT
+    // presses made before it don't carry over.
+    static int modalPolls = -1;
+    int polls = gamepad_get_modal_poll_count();
+    if (modalPolls != -1 && polls != modalPolls) {
+        rt_timing_clear("menu or other screen");
+    }
+    modalPolls = polls;
+
     // Modal menus and dialogue block the main loop, so a long gap means the
     // game was paused. Clamping keeps cooldowns and AP from jumping ahead.
     if (realDelta > 100) {
@@ -836,6 +991,7 @@ void rt_tick()
     rt_rebuild_critter_list();
     rt_resolve_attacks();
     rt_update_swing();
+    rt_update_player_impacts();
     rt_update_player_slot();
     rt_update_engagements();
     rt_update_knockdowns();
@@ -902,6 +1058,31 @@ static bool rt_is_player_team(Object* critter)
 // Attacks
 // -----------------------------------------------------------------------------
 
+// Whether `obj` must wait for an attack it is part of before acting: as
+// the attacker until the attack lands; as a target until its reaction is
+// over (see `rt_release_targets`), after which it may move but not attack
+// (`rt_attack` still refuses while the attack is pending).
+static bool rt_obj_held_by_attack(Object* obj)
+{
+    if (obj == obj_dude) {
+        return rt_obj_in_attack(obj);
+    }
+
+    for (RtPendingAttack* pending : rt_pending) {
+        Attack* attack = &(pending->attack);
+        if (attack->attacker == obj || (attack->defender == obj && !pending->released[0])) {
+            return true;
+        }
+
+        for (int index = 0; index < attack->extrasLength; index++) {
+            if (attack->extras[index] == obj && !pending->released[1 + index]) {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
 static bool rt_obj_in_attack(Object* obj)
 {
     // A swing in progress keeps the player busy like an attack.
@@ -911,7 +1092,9 @@ static bool rt_obj_in_attack(Object* obj)
 
     for (RtPendingAttack* pending : rt_pending) {
         Attack* attack = &(pending->attack);
-        if (attack->attacker == obj || attack->defender == obj) {
+        // The player under an enemy attack with an ordinary outcome isn't
+        // part of it until it lands.
+        if (attack->attacker == obj || (attack->defender == obj && !pending->playerDetached)) {
             return true;
         }
 
@@ -924,9 +1107,371 @@ static bool rt_obj_in_attack(Object* obj)
     return false;
 }
 
+// An enemy attack on the player is pending (held or not): the attack slot
+// lets one at a time through.
+static bool rt_player_under_attack()
+{
+    for (RtPendingAttack* pending : rt_pending) {
+        if (pending->attack.defender == obj_dude) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether the outcome of an enemy attack on the player is an ordinary one
+// (a hit with no knockdown, knockback, fire, death or weapon loss, or a
+// miss): the player then takes no part in the attacker's animation, plays
+// their own hit reaction at the impact (none for a miss) and isn't held.
+// Heavier outcomes play in the attack's sequence as before.
+static bool rt_player_detachable(Attack* attack)
+{
+    if (attack->defender != obj_dude || attack->attacker == obj_dude || critter_is_prone(obj_dude)) {
+        return false;
+    }
+
+    if ((attack->attackerFlags & DAM_HIT) == 0) {
+        return true;
+    }
+
+    int heavy = DAM_DEAD | DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_ON_FIRE | DAM_DROP | DAM_DESTROY | DAM_EXPLODE;
+    return (attack->defenderFlags & heavy) == 0 && attack->defenderKnockback == 0;
+}
+
+bool rt_action_detached_defender(Object* obj)
+{
+    return obj != NULL && obj == rt_registering_detached;
+}
+
+int rt_player_impact_cue(void* attacker, void* defender)
+{
+    if (defender == obj_dude) {
+        rt_player_impacts.push_back((Object*)attacker);
+    }
+    return 0;
+}
+
+// Plays the player's hit reaction for the enemy hits that just came, as the
+// player's own short animation, when the player stands; a walk, attack,
+// reload, chem use or holster of theirs goes on (no reaction then).
+static void rt_update_player_impacts()
+{
+    if (rt_player_impacts.empty()) {
+        return;
+    }
+
+    Object* attacker = rt_player_impacts.back();
+    rt_player_impacts.clear();
+
+    if (!rt_is_alive(obj_dude) || critter_is_prone(obj_dude)
+        || (obj_dude->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
+        return;
+    }
+
+    // Only when standing: a walk, an attack or anything else of the
+    // player's goes on (an enemy hit never takes the controls away).
+    if (anim_busy(obj_dude) || rt_move_active || rt_obj_in_attack(obj_dude) || rt_reload_active || rt_chem_active
+        || rt_holster_active || rt_aimed_is_executing()) {
+        rt_stats.playerReactionsSkipped++;
+        rt_log("player reaction: skipped (busy, anim %d)", FID_ANIM_TYPE(obj_dude->fid));
+        return;
+    }
+
+    // From the front unless the attacker stands behind (as `is_hit_from_front`).
+    int anim = ANIM_HIT_FROM_FRONT;
+    if (rt_is_known_critter(attacker)) {
+        int delta = abs(attacker->rotation - obj_dude->rotation);
+        bool front = delta != 0 && delta != 1 && delta != 5;
+        int backFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_HIT_FROM_BACK, (obj_dude->fid & 0xF000) >> 12, obj_dude->rotation + 1);
+        if (!front && art_exists(backFid)) {
+            anim = ANIM_HIT_FROM_BACK;
+        }
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_object_play_sfx(obj_dude, gsnd_build_character_sfx_name(obj_dude, anim, CHARACTER_SOUND_EFFECT_UNUSED), 0);
+    register_object_animate(obj_dude, anim, 0);
+    if (register_end() == 0) {
+        rt_stats.playerReactions++;
+        rt_log("player reaction: %s", anim == ANIM_HIT_FROM_BACK ? "hit from behind" : "hit from the front");
+    }
+}
+
+bool rt_debug_player_held()
+{
+    return rt_obj_in_attack(obj_dude);
+}
+
+// Attack rate statistics (Fast Shot tests).
+static void rt_note_player_attack_start()
+{
+    if (rt_stats.lastPlayerAttackAt != 0) {
+        rt_stats.lastPlayerAttackInterval = rt_now - rt_stats.lastPlayerAttackAt;
+    }
+    rt_stats.lastPlayerAttackAt = rt_now;
+}
+
+// -----------------------------------------------------------------------------
+// Attack AP and counterattacks
+// -----------------------------------------------------------------------------
+
+static bool rt_is_close_combat(int hitMode)
+{
+    int attackType = item_w_subtype(item_hit_with(obj_dude, hitMode), hitMode);
+    return attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED;
+}
+
+static bool rt_is_throw(int hitMode)
+{
+    Object* weapon = item_hit_with(obj_dude, hitMode);
+    return weapon != NULL && item_w_subtype(weapon, hitMode) == ATTACK_TYPE_THROW;
+}
+
+// Ordinary attacks that cost AP: melee, unarmed and throws (gunfire costs AP
+// only as an AIMED SHOT).
+static bool rt_attack_costs_ap(int hitMode)
+{
+    return rt_is_close_combat(hitMode) || rt_is_throw(hitMode);
+}
+
+// Takes `cost` AP from the player (spent once, when an attack is committed).
+static void rt_spend_ap(double cost)
+{
+    rt_dude_ap -= (float)cost;
+    if (rt_dude_ap < 0.0f) {
+        rt_dude_ap = 0.0f;
+    }
+    rt_dude_ap_shown = (int)rt_dude_ap;
+    obj_dude->data.critter.combat.ap = rt_dude_ap_shown;
+    intface_update_move_points(rt_dude_ap_shown, 0);
+}
+
+// Whether the player has the AP an ordinary attack with `hitMode` costs
+// (`rt_attack_ap_cost`: 0.5 for fists, 1-2 for melee weapons, 3 for a
+// throw). False, with a brief message, when they have less.
+static bool rt_attack_ap_ok(int hitMode)
+{
+    double cost = rt_attack_ap_cost(obj_dude, hitMode, false);
+    if (rt_dude_ap + 0.0001f >= (float)cost) {
+        return true;
+    }
+
+    rt_stats.meleeApRefused++;
+    char text[16];
+    static unsigned int lastMessageAt = 0;
+    if (lastMessageAt == 0 || rt_now - lastMessageAt >= 1000) {
+        lastMessageAt = rt_now;
+        rt_print("Not enough Action Points: this attack needs %s.", rt_ap_text(cost, text, sizeof(text)));
+    }
+    rt_log("ap: attack refused, %.1f AP needed, %.2f left", cost, rt_dude_ap);
+    return false;
+}
+
+// Charges an ordinary attack's `cost` (worked out before the attack: a
+// throw takes the item from the hand when it starts).
+static void rt_spend_attack_ap(double cost, bool thrown)
+{
+    rt_spend_ap(cost);
+    if (thrown) {
+        rt_stats.throwApSpent += (float)cost;
+        rt_stats.throwApCharges++;
+    } else {
+        rt_stats.meleeApSpent += (float)cost;
+        rt_stats.meleeApCharges++;
+        rt_stats.lastMeleeApCost = (float)cost;
+    }
+    rt_log("ap: %.1f AP spent on the attack, %.2f left", cost, rt_dude_ap);
+}
+
+static bool rt_is_counter(Object* critter)
+{
+    for (const RtCounter& counter : rt_counters) {
+        if (counter.critter == critter) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Whether `critter` can still use a counterattack: alive, on the map, not
+// the player's team, not knocked down or out, and fighting.
+static bool rt_counter_eligible(Object* critter)
+{
+    if (!rt_is_known_critter(critter) || !rt_is_alive(critter) || rt_is_player_team(critter)) {
+        return false;
+    }
+    if ((critter->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) != 0) {
+        return false;
+    }
+    auto it = rt_states.find(critter);
+    return it != rt_states.end() && it->second.engaged;
+}
+
+// The player's attack `swing` (a melee/unarmed swing, or a shot or throw:
+// `ranged`) missed `critter`: it gets the next chance to attack the player
+// before anyone else (an attempt, with its own to-hit roll; range, line of
+// sight, cooldown and the attack slot still apply). An enemy out of its
+// weapon's range or sight moves until it can attack, as it always does. One
+// per swing or shot, one per enemy at a time.
+static void rt_request_counter(Object* critter, int swing, bool ranged)
+{
+    if (swing == rt_counter_last_swing) {
+        rt_stats.counterSwingRepeats++;
+        return;
+    }
+    if (!rt_counter_eligible(critter)) {
+        rt_stats.counterIneligible++;
+        rt_log("counter: %s can't counterattack", rt_name(critter));
+        return;
+    }
+    if (rt_is_counter(critter)) {
+        rt_stats.counterDuplicates++;
+        return;
+    }
+
+    rt_counter_last_swing = swing;
+    rt_states[critter].target = obj_dude;
+    unsigned int window = (unsigned int)(ranged ? rt_rules()->rangedCounterWindowMs : rt_rules()->counterWindowMs);
+    rt_counters.push_back({ critter, rt_now, window, ranged });
+    rt_stats.counterRequests++;
+    if (ranged) {
+        rt_stats.counterRangedRequests++;
+    }
+    rt_stats.lastCounterRequestGrants = rt_stats.playerSlotGrants;
+    rt_log("counter: %s gets the next attack after the player's missed %s (%u ms, dist %d)",
+        critter_name(critter), ranged ? "shot" : "swing", window, obj_dist(critter, obj_dude));
+}
+
+// Drops counterattacks that expired or can't happen any more.
+static void rt_update_counters()
+{
+    for (size_t index = 0; index < rt_counters.size();) {
+        RtCounter& counter = rt_counters[index];
+        bool expired = rt_now - counter.requestedAt > counter.windowMs;
+        if (expired || !rt_counter_eligible(counter.critter)) {
+            rt_stats.counterExpired++;
+            rt_log("counter: %s %s", rt_is_known_critter(counter.critter) ? critter_name(counter.critter) : "(gone)",
+                expired ? "didn't attack in time" : "can no longer counterattack");
+            rt_counters.erase(rt_counters.begin() + index);
+        } else {
+            index++;
+        }
+    }
+}
+
+// The counterattacker that goes first: the oldest one ready to attack the
+// player right now (asked for the slot recently).
+static Object* rt_counter_ready()
+{
+    for (const RtCounter& counter : rt_counters) {
+        auto it = rt_states.find(counter.critter);
+        if (it != rt_states.end() && rt_now - it->second.slotRequestAt <= RT_SLOT_READY_MS) {
+            return counter.critter;
+        }
+    }
+    return NULL;
+}
+
+// Tests: player attacks made to miss, or to hit for a fixed damage with
+// no other effect (see `rt_debug_force_player_misses`).
+static int rt_forced_misses = 0;
+static int rt_forced_hits = 0;
+static int rt_forced_hit_damage = 0;
+static int rt_forced_hit_flags = 0;
+
+static void rt_apply_forced_miss(Attack* attack, Object* defender)
+{
+    if (rt_forced_hits > 0 && attack->attacker == obj_dude) {
+        rt_forced_hits--;
+        // A rolled miss may have been sent past the target (`check_ranged_miss`).
+        attack->defender = defender;
+        attack->tile = defender->tile;
+        attack->attackerFlags = DAM_HIT;
+        attack->attackerDamage = 0;
+        attack->defenderFlags = rt_forced_hit_flags;
+        attack->defenderDamage = rt_forced_hit_damage;
+        attack->defenderKnockback = 0;
+        attack->extrasLength = 0;
+        return;
+    }
+
+    if (rt_forced_misses <= 0 || attack->attacker != obj_dude) {
+        return;
+    }
+    rt_forced_misses--;
+    attack->attackerFlags &= ~(DAM_HIT | DAM_CRITICAL | DAM_DEAD);
+    attack->attackerDamage = 0;
+    attack->defenderFlags = 0;
+    attack->defenderDamage = 0;
+    attack->extrasLength = 0;
+}
+
+void rt_debug_force_player_misses(int count)
+{
+    rt_forced_misses = count;
+}
+
+void rt_debug_force_player_hits(int count, int damage, int flags)
+{
+    rt_forced_hits = count;
+    rt_forced_hit_damage = damage;
+    rt_forced_hit_flags = flags;
+}
+
+int rt_debug_attacks_on(Object* obj)
+{
+    int count = 0;
+    for (RtPendingAttack* pending : rt_pending) {
+        Attack* attack = &(pending->attack);
+        bool target = attack->defender == obj;
+        for (int index = 0; index < attack->extrasLength; index++) {
+            target = target || attack->extras[index] == obj;
+        }
+        if (target) {
+            count++;
+        }
+    }
+    return count;
+}
+
+void rt_debug_counter_request(Object* critter, int swing, bool ranged)
+{
+    rt_request_counter(critter, swing, ranged);
+}
+
+int rt_debug_counter_count()
+{
+    return (int)rt_counters.size();
+}
+
+static void rt_counter_started(Object* critter, int hitMode)
+{
+    for (size_t index = 0; index < rt_counters.size(); index++) {
+        if (rt_counters[index].critter == critter) {
+            rt_stats.counterAttacks++;
+            if (rt_counters[index].ranged) {
+                rt_stats.counterRangedAttacks++;
+            }
+            rt_stats.lastCounterRanged = rt_counters[index].ranged;
+            rt_stats.lastCounterHitMode = hitMode;
+            rt_stats.lastCounterCritter = critter;
+            rt_stats.lastCounterDelayMs = rt_now - rt_counters[index].requestedAt;
+            rt_stats.lastCounterStartGrants = rt_stats.playerSlotGrants;
+            rt_log("counter: %s counterattacks (%u ms after the miss, hit mode %d, dist %d)",
+                critter_name(critter), rt_stats.lastCounterDelayMs, hitMode, obj_dist(critter, obj_dude));
+            rt_counters.erase(rt_counters.begin() + index);
+            return;
+        }
+    }
+}
+
 static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLocation)
 {
-    if (rt_obj_in_attack(attacker) || rt_obj_in_attack(defender)) {
+    // An enemy attack on the player doesn't wait for the player's own
+    // attack (it may not need the player at all, see below); it waits for
+    // another enemy attack on the player.
+    bool onPlayer = defender == obj_dude && attacker != obj_dude;
+    if (rt_obj_in_attack(attacker) || (onPlayer ? rt_player_under_attack() : rt_obj_in_attack(defender))) {
         return RT_ATTACK_BUSY;
     }
 
@@ -942,14 +1487,36 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
     Attack* attack = &(pending->attack);
     combat_ctd_init(attack, attacker, defender, hitMode, hitLocation);
 
+    // The player's RT attack carries its timing penalty (0 for anything
+    // else: held automatic fire, AIMED SHOT, throws...).
+    int timing = attacker == obj_dude ? rt_timing_committing : 0;
+
     // The hit chance `compute_attack` rolls against (same state, same call).
     int toHit = determine_to_hit(attacker, defender, hitLocation, hitMode);
 
     // Vanilla to-hit roll, critical and damage calculations.
-    if (combat_rt_compute_attack(attack) == -1) {
+    int computed = combat_rt_compute_attack(attack);
+    if (attacker == obj_dude) {
+        rt_timing_committing = 0;
+    }
+    if (computed == -1) {
         rt_log("attack: compute_attack failed for %s -> %s", critter_name(attacker), critter_name(defender));
         delete pending;
         return -1;
+    }
+    rt_apply_forced_miss(attack, defender);
+    pending->timingPenalty = timing;
+
+    // An ordinary outcome leaves the player out of the enemy's animation; a
+    // heavy one (knockdown, death...) needs the player, so it waits for an
+    // attack of theirs to end (`action_attack` would fail).
+    pending->playerDetached = onPlayer && rt_player_detachable(attack);
+    if (onPlayer && attack->defender == obj_dude && !pending->playerDetached && rt_obj_in_attack(obj_dude)) {
+        delete pending;
+        return RT_ATTACK_BUSY;
+    }
+    if (pending->playerDetached) {
+        pending->released[0] = true;
     }
 
     // Any object in the attack may still be in another prioritized sequence
@@ -964,14 +1531,26 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
     // Attacker and targets stop what they were doing (a walk, a reload) for
     // the attack, as they would be standing still in the original turn-based
     // game. Otherwise the attack would only land once they stopped by
-    // themselves.
+    // themselves. A detached player keeps going, and a missed shot sent
+    // elsewhere (see `check_ranged_miss`) leaves its intended target alone.
     rt_stop_for_attack(attacker);
-    rt_stop_for_attack(defender);
+    if (!pending->playerDetached) {
+        rt_stop_for_attack(attack->defender);
+    }
     for (int index = 0; index < attack->extrasLength; index++) {
         rt_stop_for_attack(attack->extras[index]);
     }
 
-    if (action_attack(attack) == -1) {
+    // Before the attack is registered: a throw takes the item from the hand
+    // right away.
+    bool closeCombat = attacker == obj_dude && rt_is_close_combat(attack->hitMode);
+
+    rt_registering_target = attacker == obj_dude ? defender : NULL;
+    rt_registering_detached = pending->playerDetached ? obj_dude : NULL;
+    int registered = action_attack(attack);
+    rt_registering_target = NULL;
+    rt_registering_detached = NULL;
+    if (registered == -1) {
         // An object is still in a prioritized animation sequence.
         static unsigned int lastLockLog = 0;
         if (rt_now - lastLockLog >= 1000) {
@@ -993,6 +1572,17 @@ static int rt_attack(Object* attacker, Object* defender, int hitMode, int hitLoc
     }
 
     rt_attack_started(pending, hitLocation, toHit);
+    if (attacker == obj_dude) {
+        rt_note_player_attack_start();
+        // An ordinary (not aimed) attack is its own swing or shot (a
+        // swing started without a target in reach sets its own, see
+        // `rt_swing_hit`).
+        if (hitLocation == HIT_LOCATION_UNCALLED) {
+            pending->counterSwing = ++rt_swing_serial;
+            pending->counterRanged = !closeCombat;
+            pending->counterTarget = defender;
+        }
+    }
     return 0;
 }
 
@@ -1010,6 +1600,37 @@ static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toH
                 rt_stats.playerSlotOverlaps++;
             }
         }
+    }
+
+    if (attacker != obj_dude && defender == obj_dude) {
+        if (toHit <= 0) {
+            rt_stats.aiHopelessAttacks++;
+        }
+        if (rt_stats.aiLowestToHit == 0 || toHit < rt_stats.aiLowestToHit) {
+            rt_stats.aiLowestToHit = toHit;
+        }
+        if (pending->playerDetached) {
+            rt_stats.playerFreeAttacks++;
+            if ((attack->attackerFlags & DAM_HIT) != 0) {
+                rt_stats.playerFreeHits++;
+            }
+        } else {
+            rt_stats.playerHeldAttacks++;
+        }
+        bool playerAttacking = rt_swing.active;
+        for (RtPendingAttack* other : rt_pending) {
+            playerAttacking = playerAttacking || other->attack.attacker == obj_dude;
+        }
+        if (playerAttacking) {
+            rt_stats.enemyAttacksDuringPlayerAttack++;
+        }
+    }
+
+    if (attacker == obj_dude && pending->timingPenalty > 0) {
+        rt_stats.timingPenalized++;
+    }
+    if (attacker == obj_dude && hitLocation == HIT_LOCATION_UNCALLED) {
+        rt_stats.lastTimingToHit = toHit;
     }
 
     rt_note_critical_deaths(pending);
@@ -1081,7 +1702,7 @@ static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toH
         rt_stats.maxConcurrentAttackers = (int)attackers.size();
     }
 
-    rt_log("attack: %s -> %s (hitMode=%d, anim=%d, rounds=%d, dist=%d, location=%d%s) %s%s dmg=%d flags=0x%X",
+    rt_log("attack: %s -> %s (hitMode=%d, anim=%d, rounds=%d, dist=%d, location=%d%s) %s%s dmg=%d flags=0x%X to-hit=%d%s%s",
         critter_name(attacker),
         rt_name(attack->defender),
         attack->hitMode,
@@ -1093,7 +1714,10 @@ static void rt_attack_started(RtPendingAttack* pending, int hitLocation, int toH
         (attack->attackerFlags & DAM_HIT) != 0 ? "HIT" : "MISS",
         (attack->attackerFlags & DAM_CRITICAL) != 0 ? " CRITICAL" : "",
         attack->defenderDamage,
-        attack->defenderFlags);
+        attack->defenderFlags,
+        toHit,
+        pending->playerDetached ? " (player not held)" : "",
+        pending->timingPenalty > 0 ? " (timing penalty)" : "");
 }
 
 // -----------------------------------------------------------------------------
@@ -1156,6 +1780,117 @@ static Object* rt_find_swing_target(int hitMode)
     return best;
 }
 
+// Two-handed melee weapons sweep: a swing can hit several targets in its
+// arc. Decided by the weapon data: the two-handed flag (WEAPON_TWO_HAND)
+// and a melee attack in the hit mode used, so two-handed firearms, thrown
+// attacks (the spear's throw), one-handed melee and unarmed attacks never
+// sweep.
+bool rt_weapon_sweeps(Object* weapon, int hitMode)
+{
+    return weapon != NULL
+        && item_get_type(weapon) == ITEM_TYPE_WEAPON
+        && item_w_is_2handed(weapon)
+        && item_w_subtype(weapon, hitMode) == ATTACK_TYPE_MELEE;
+}
+
+static bool rt_is_sweep(int hitMode)
+{
+    return rt_weapon_sweeps(item_hit_with(obj_dude, hitMode), hitMode);
+}
+
+// Hex centers on a plane where neighbors are 1 apart and 60 degrees from
+// each other (as `rt_tile_distance_exact`).
+static void rt_hex_point(int tile, double* x, double* y)
+{
+    int column = tile % HEX_GRID_WIDTH;
+    *x = column * 0.8660254037844386;
+    *y = tile / HEX_GRID_WIDTH + ((column & 1) == 0 ? 0.5 : 0.0);
+}
+
+// Whether `obj` is within the sweep arc (`melee_sweep_arc_deg`, centered on
+// the way the player faces).
+static bool rt_in_sweep_arc(Object* obj)
+{
+    int ahead = tile_num_in_direction(obj_dude->tile, obj_dude->rotation, 1);
+    if (ahead == -1 || obj->tile == obj_dude->tile) {
+        return false;
+    }
+
+    double px;
+    double py;
+    double ax;
+    double ay;
+    double ox;
+    double oy;
+    rt_hex_point(obj_dude->tile, &px, &py);
+    rt_hex_point(ahead, &ax, &ay);
+    rt_hex_point(obj->tile, &ox, &oy);
+    double fx = ax - px;
+    double fy = ay - py;
+    double tx = ox - px;
+    double ty = oy - py;
+    double length = sqrt(fx * fx + fy * fy) * sqrt(tx * tx + ty * ty);
+    if (length <= 0.0) {
+        return false;
+    }
+    double halfArc = std::clamp(rt_rules()->sweepArcDeg, 0, 360) / 2.0 * 3.14159265358979 / 180.0;
+    return (fx * tx + fy * ty) / length >= cos(halfArc) - 1e-6;
+}
+
+// Who a sweep hits at its impact: living critters (not the player's team)
+// on the player's elevation, in the arc, within the weapon's reach (Bonus
+// HtH Attacks included, never through walls, see `rt_check_shot`). Enemies
+// anywhere in the arc; a bystander only when locked or straight ahead, as
+// for one-handed swings. The aim first, then the closest, then the best
+// aligned; at most `capacity`.
+static int rt_find_sweep_targets(Object* aim, int hitMode, Object** out, int capacity)
+{
+    std::vector<std::pair<int, Object*>> found;
+    for (Object* critter : rt_critters) {
+        if (critter == obj_dude
+            || critter->elevation != obj_dude->elevation
+            || (critter->flags & OBJECT_HIDDEN) != 0
+            || rt_is_player_team(critter)
+            || !rt_is_alive(critter)
+            || !rt_in_sweep_arc(critter)) {
+            continue;
+        }
+
+        bool chosen = critter == aim || critter == rt_lock;
+        if (!chosen && !rt_is_hostile_to_player(critter) && !rt_swing_in_front(critter, 0)) {
+            continue;
+        }
+
+        if (rt_check_shot(obj_dude, critter, hitMode) != COMBAT_BAD_SHOT_OK) {
+            continue;
+        }
+
+        // A sweep never reaches through walls or scenery, even within the
+        // weapon's own reach (the original melee check only looks at the
+        // distance).
+        if (obj_dist(obj_dude, critter) > 1
+            && combat_is_shot_blocked(obj_dude, obj_dude->tile, critter->tile, critter, NULL)) {
+            continue;
+        }
+
+        int score = (critter == aim ? 0 : 1000) + obj_dist(obj_dude, critter) * 10 + (rt_swing_in_front(critter, 0) ? 0 : 1);
+        found.push_back({ score, critter });
+    }
+
+    std::stable_sort(found.begin(), found.end(), [](const std::pair<int, Object*>& a, const std::pair<int, Object*>& b) {
+        return a.first < b.first;
+    });
+
+    int count = 0;
+    for (const auto& entry : found) {
+        if (count >= capacity) {
+            break;
+        }
+        out[count++] = entry.second;
+    }
+    return count;
+}
+
 static int rt_swing_impact(void* a1, void* a2)
 {
     rt_swing.impactDue = true;
@@ -1184,6 +1919,12 @@ static int rt_player_swing(int hitMode)
             return RT_PLAYER_ATTACK_FAILED;
         }
     }
+
+    // Melee and unarmed attacks cost AP, empty swings included.
+    if (!rt_attack_ap_ok(hitMode)) {
+        return RT_PLAYER_ATTACK_FAILED;
+    }
+    int costHitMode = hitMode;
 
     // The sprite must show the weapon in hand first (right after a swap it
     // may still hold the previous one).
@@ -1216,9 +1957,19 @@ static int rt_player_swing(int hitMode)
 
     // Turn to the enemy the swing aims at (only enemies in the front arc:
     // the player never turns toward a bystander).
+    bool sweep = rt_is_sweep(hitMode);
     Object* aim = rt_find_swing_target(hitMode);
     int turnTile = -1;
-    if (aim != NULL && rt_is_hostile_to_player(aim) && !rt_swing_in_front(aim, 0)) {
+    if (sweep && rt_lock != NULL && rt_is_known_critter(rt_lock)
+        && rt_lock->elevation == obj_dude->elevation
+        && rt_check_shot(obj_dude, rt_lock, hitMode) == COMBAT_BAD_SHOT_OK) {
+        // A sweep with a locked target in reach turns to face it, wherever
+        // it stands: the arc is centered on it.
+        aim = rt_lock;
+        if (!rt_swing_in_front(rt_lock, 0)) {
+            turnTile = rt_lock->tile;
+        }
+    } else if (aim != NULL && rt_is_hostile_to_player(aim) && !rt_swing_in_front(aim, 0)) {
         turnTile = aim->tile;
     } else if (aim == NULL && rt_lock != NULL && rt_is_hostile_to_player(rt_lock)
         && rt_lock->elevation == obj_dude->elevation && rt_swing_in_front(rt_lock, 1)) {
@@ -1262,9 +2013,20 @@ static int rt_player_swing(int hitMode)
     rt_swing.hit = false;
     rt_swing.startedAt = rt_now;
     rt_swing.impactAt = 0;
+    rt_swing.serial = ++rt_swing_serial;
+    rt_swing.sweep = sweep;
+    rt_swing.sweepDoneCount = 0;
+    rt_swing.timingPenalty = rt_timing_committing;
+    if (sweep) {
+        rt_stats.sweeps++;
+    }
+
+    // Spent once, now that the swing is committed (hit, miss or nothing).
+    rt_spend_attack_ap(rt_attack_ap_cost(obj_dude, costHitMode, false), false);
 
     rt_stats.freeSwings++;
     rt_stats.lastSwingAnim = anim;
+    rt_note_player_attack_start();
     rt_log("swing: %s (anim %d) toward rotation %d, aiming at %s",
         hitMode == HIT_MODE_KICK ? "kick" : "attack", anim, obj_dude->rotation, aim != NULL ? rt_name(aim) : "nobody");
     return RT_PLAYER_ATTACK_STARTED;
@@ -1279,25 +2041,43 @@ static int rt_swing_hit(Object* defender)
         return RT_ATTACK_BUSY;
     }
 
+    // A swing reaches each target once.
+    for (int index = 0; index < rt_swing.sweepDoneCount; index++) {
+        if (rt_swing.sweepDone[index] == defender) {
+            rt_stats.sweepRepeats++;
+            return -1;
+        }
+    }
+
     RtPendingAttack* pending = new RtPendingAttack();
     Attack* attack = &(pending->attack);
     combat_ctd_init(attack, obj_dude, defender, rt_swing.hitMode, HIT_LOCATION_UNCALLED);
+    // The swing's press timing penalty (taken when it started).
+    rt_timing_committing = rt_swing.timingPenalty;
     int toHit = determine_to_hit(obj_dude, defender, HIT_LOCATION_UNCALLED, rt_swing.hitMode);
+    int computed = combat_rt_compute_attack(attack);
+    rt_timing_committing = 0;
 
-    if (combat_rt_compute_attack(attack) == -1) {
+    if (computed == -1) {
         rt_log("swing: compute_attack failed on %s", rt_name(defender));
         delete pending;
         return -1;
     }
+    rt_apply_forced_miss(attack, defender);
+    pending->timingPenalty = rt_swing.timingPenalty;
 
     rt_stop_for_attack(defender);
-    if (action_rt_melee_impact(attack, rt_swing.anim) == -1) {
+    rt_registering_target = defender;
+    int registered = action_rt_melee_impact(attack, rt_swing.anim);
+    rt_registering_target = NULL;
+    if (registered == -1) {
         delete pending;
         return RT_ATTACK_BUSY;
     }
 
     rt_stats.lastSwingToHit = toHit;
     rt_stats.lastSwingDefender = defender;
+    pending->counterSwing = rt_swing.serial;
     rt_attack_started(pending, HIT_LOCATION_UNCALLED, toHit);
     return 0;
 }
@@ -1311,7 +2091,56 @@ static void rt_update_swing()
         return;
     }
 
-    if (rt_swing.impactDue && !rt_swing.resolved) {
+    if (rt_swing.impactDue && !rt_swing.resolved && rt_swing.sweep) {
+        // Two-handed sweep: every target in the arc and in reach, each with
+        // its own attack (to-hit, armor, damage, criticals), at most once.
+        // Targets busy with another attack are tried again until the wait
+        // ends.
+        Object* aim = rt_swing.aim != NULL && rt_is_known_critter(rt_swing.aim) ? rt_swing.aim : NULL;
+        int maxTargets = std::clamp(rt_rules()->sweepMaxTargets, 1, 8);
+        Object* targets[8];
+        int count = rt_find_sweep_targets(aim, rt_swing.hitMode, targets, 8);
+        bool waiting = false;
+        for (int index = 0; index < count && rt_swing.sweepDoneCount < maxTargets; index++) {
+            Object* target = targets[index];
+            bool done = false;
+            for (int other = 0; other < rt_swing.sweepDoneCount; other++) {
+                done = done || rt_swing.sweepDone[other] == target;
+            }
+            if (done) {
+                continue;
+            }
+            int rc = rt_swing_hit(target);
+            if (rc == 0) {
+                rt_swing.sweepDone[rt_swing.sweepDoneCount++] = target;
+                rt_stats.sweepTargets++;
+            } else if (rc == RT_ATTACK_BUSY) {
+                waiting = true;
+            }
+        }
+
+        if (!waiting || rt_now - rt_swing.impactAt > RT_SWING_IMPACT_WAIT_MS) {
+            rt_swing.resolved = true;
+            rt_swing.hit = rt_swing.sweepDoneCount > 0;
+            if (rt_swing.hit) {
+                rt_stats.freeSwingAttempts++;
+            } else {
+                rt_stats.freeSwingWhiffs++;
+            }
+            rt_stats.lastSweepCount = rt_swing.sweepDoneCount;
+            for (int index = 0; index < 8; index++) {
+                rt_stats.lastSweepTargets[index] = index < rt_swing.sweepDoneCount ? rt_swing.sweepDone[index] : NULL;
+            }
+            rt_stats.sweepMaxTargets = std::max(rt_stats.sweepMaxTargets, rt_swing.sweepDoneCount);
+            char tiles[96] = "";
+            for (int index = 0; index < rt_swing.sweepDoneCount; index++) {
+                char part[16];
+                snprintf(part, sizeof(part), " %d", rt_swing.sweepDone[index] != NULL ? rt_swing.sweepDone[index]->tile : -1);
+                SDL_strlcat(tiles, part, sizeof(tiles));
+            }
+            rt_log("sweep: %d target(s) reached, at tiles%s (player at %d, facing %d)", rt_swing.sweepDoneCount, tiles, obj_dude->tile, obj_dude->rotation);
+        }
+    } else if (rt_swing.impactDue && !rt_swing.resolved) {
         Object* target = NULL;
         Object* aim = rt_swing.aim;
         if (aim != NULL
@@ -1354,7 +2183,7 @@ static void rt_update_swing()
         rt_swing.aim = NULL;
         if (!rt_swing.hit) {
             // A hit sets the cooldown when it lands (see `rt_resolve_attacks`).
-            rt_dude_next_attack_at = rt_now + item_w_mp_cost(obj_dude, rt_swing.hitMode, false) * rt_ms_per_ap;
+            rt_dude_next_attack_at = rt_now + rt_fast_shot_interval(item_w_mp_cost(obj_dude, rt_swing.hitMode, false) * rt_ms_per_ap);
         }
     }
 }
@@ -1438,6 +2267,64 @@ static void rt_refresh_death_flags(RtPendingAttack* pending)
     }
 }
 
+// Whether a target may move again once its animations for the attack are
+// over, before the attack lands: only after an ordinary reaction (a hit, a
+// dodge or none). Deaths, knockdowns, knockouts, knockback and burning keep
+// it until the attack lands (their effects apply then).
+static bool rt_may_release(Object* attacker, Object* target, int flags, int knockback)
+{
+    return target != obj_dude
+        && target != attacker
+        && rt_is_known_critter(target)
+        && (flags & (DAM_DEAD | DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN | DAM_ON_FIRE)) == 0
+        && knockback == 0
+        && !critter_is_prone(target);
+}
+
+// A target whose reaction is over isn't kept standing until the attacker
+// finishes its own animation (e.g. the rest of the player's swing): it may
+// walk again at once. It can't attack before the attack lands, and the
+// damage is applied when it lands, as before.
+static void rt_release_targets(RtPendingAttack* pending)
+{
+    Attack* attack = &(pending->attack);
+    Object* targets[1 + EXPLOSION_TARGET_COUNT];
+    int flags[1 + EXPLOSION_TARGET_COUNT];
+    int knockbacks[1 + EXPLOSION_TARGET_COUNT];
+    int count = 0;
+    targets[count] = attack->defender;
+    flags[count] = attack->defenderFlags;
+    knockbacks[count] = attack->defenderKnockback;
+    count++;
+    for (int index = 0; index < attack->extrasLength && count < 1 + EXPLOSION_TARGET_COUNT; index++) {
+        targets[count] = attack->extras[index];
+        flags[count] = attack->extrasFlags[index];
+        knockbacks[count] = attack->extrasKnockback[index];
+        count++;
+    }
+
+    for (int index = 0; index < count; index++) {
+        // Its reaction may be part of the attacker's sequence (an attack on a
+        // target in reach): once played, it is detached from it.
+        if (pending->released[index]
+            || !rt_may_release(attack->attacker, targets[index], flags[index], knockbacks[index])
+            || !anim_rt_detach_finished(targets[index])) {
+            continue;
+        }
+
+        pending->released[index] = true;
+        // Only an actual wait (the attacker still busy) counts.
+        if (anim_busy(attack->attacker)) {
+            rt_stats.reactionReleases++;
+            rt_stats.lastReleaseCritter = targets[index];
+            rt_stats.lastReleaseAt = rt_now;
+            rt_stats.lastReleaseDelayMs = rt_now - pending->startedAt;
+            rt_log("reaction over: %s may move again (%u ms after the attack started, %s still busy)",
+                critter_name(targets[index]), rt_now - pending->startedAt, critter_name(attack->attacker));
+        }
+    }
+}
+
 static void rt_resolve_attacks()
 {
     for (size_t index = 0; index < rt_pending.size();) {
@@ -1455,18 +2342,22 @@ static void rt_resolve_attacks()
             continue;
         }
 
+        rt_release_targets(pending);
+
         // A target that started walking meanwhile (e.g. moved by its script)
-        // stops to take the hit.
-        rt_stop_for_attack(attack->defender);
+        // stops to take the hit; one whose reaction is over may walk again.
+        if (!pending->released[0]) {
+            rt_stop_for_attack(attack->defender);
+        }
         for (int extra = 0; extra < attack->extrasLength; extra++) {
-            if (rt_is_known_critter(attack->extras[extra])) {
+            if (!pending->released[1 + extra] && rt_is_known_critter(attack->extras[extra])) {
                 rt_stop_for_attack(attack->extras[extra]);
             }
         }
 
-        bool busy = anim_busy(attack->attacker) || anim_busy(attack->defender);
+        bool busy = anim_busy(attack->attacker) || (!pending->released[0] && anim_busy(attack->defender));
         for (int extra = 0; extra < attack->extrasLength && !busy; extra++) {
-            busy = rt_is_known_critter(attack->extras[extra]) && anim_busy(attack->extras[extra]);
+            busy = !pending->released[1 + extra] && rt_is_known_critter(attack->extras[extra]) && anim_busy(attack->extras[extra]);
         }
 
         if (busy && !pending->slowLogged && rt_now - pending->startedAt > 2500) {
@@ -1506,6 +2397,17 @@ static void rt_resolve_attacks()
 
         // Death from damage depends on the hit points when the hit lands.
         rt_refresh_death_flags(pending);
+
+        // A released target the hit now kills (it was hurt meanwhile) stops
+        // walking first.
+        if (pending->released[0] && (attack->defenderFlags & DAM_DEAD) != 0) {
+            rt_stop_for_attack(attack->defender);
+        }
+        for (int extra = 0; extra < attack->extrasLength; extra++) {
+            if (pending->released[1 + extra] && (attack->extrasFlags[extra] & DAM_DEAD) != 0) {
+                rt_stop_for_attack(attack->extras[extra]);
+            }
+        }
 
         combat_display(attack);
         apply_damage(attack, true);
@@ -1553,9 +2455,26 @@ static void rt_resolve_attacks()
             combat_exps = 0;
         }
 
+        // A missed ordinary attack of the player's (a swing, a shot, a
+        // burst none of whose rounds hit, a throw whose blast spared the
+        // target): that enemy may counterattack first.
+        Object* intended = pending->counterTarget != NULL ? pending->counterTarget : attack->defender;
+        if (pending->counterSwing != 0 && (attack->attackerFlags & DAM_HIT) == 0
+            && rt_is_known_critter(intended)) {
+            bool struck = false;
+            for (int extra = 0; extra < attack->extrasLength; extra++) {
+                if (attack->extras[extra] == intended && attack->extrasDamage[extra] > 0) {
+                    struck = true;
+                }
+            }
+            if (!struck) {
+                rt_request_counter(intended, pending->counterSwing, pending->counterRanged);
+            }
+        }
+
         if (attack->attacker == obj_dude) {
             int hitMode = attack->hitMode;
-            rt_dude_next_attack_at = rt_now + item_w_mp_cost(obj_dude, hitMode, false) * rt_ms_per_ap;
+            rt_dude_next_attack_at = rt_now + rt_fast_shot_interval(item_w_mp_cost(obj_dude, hitMode, false) * rt_ms_per_ap);
         }
 
         delete pending;
@@ -1602,10 +2521,145 @@ static int rt_check_shot(Object* attacker, Object* defender, int hitMode)
     return COMBAT_BAD_SHOT_OK;
 }
 
+static bool rt_is_ranged_mode(Object* attacker, int hitMode)
+{
+    int attackType = item_w_subtype(item_hit_with(attacker, hitMode), hitMode);
+    return attackType == ATTACK_TYPE_RANGED || attackType == ATTACK_TYPE_THROW;
+}
+
+// Whether scenery or a wall that light doesn't pass (a tent, a building)
+// stands between the two: an NPC doesn't shoot at what it can't see, even
+// where the shot itself could pass (see `obj_sight_blocking_at`).
+static bool rt_view_blocked(Object* from, Object* to)
+{
+    if (from->elevation != to->elevation) {
+        return true;
+    }
+
+    Object* obstacle = from;
+    make_straight_path_func(from, from->tile, to->tile, NULL, &obstacle, 0, obj_sight_blocking_at);
+    return obstacle != NULL && obstacle != from && obstacle != to;
+}
+
 static unsigned int rt_attack_cooldown(Object* attacker, int hitMode)
 {
     // Measured from the start of the attack, so it includes the animation.
     return 900 + item_w_mp_cost(attacker, hitMode, false) * rt_ms_per_ap + roll_random(0, 300);
+}
+
+// -----------------------------------------------------------------------------
+// Traits (Bloody Mess, Fast Shot)
+// -----------------------------------------------------------------------------
+
+void rt_note_gory_death(Object* critter)
+{
+    if (!rt_enabled() || critter == NULL || critter == obj_dude) {
+        return;
+    }
+
+    if (std::find(rt_gory_deaths.begin(), rt_gory_deaths.end(), critter) == rt_gory_deaths.end()) {
+        rt_gory_deaths.push_back(critter);
+        rt_stats.goryDeathsNoted++;
+        rt_log("bloody mess: %s dies a gory death from a critical hit", critter_name(critter));
+    }
+}
+
+void rt_gory_death_shown(Object* critter)
+{
+    auto it = std::find(rt_gory_deaths.begin(), rt_gory_deaths.end(), critter);
+    if (it == rt_gory_deaths.end()) {
+        return;
+    }
+    rt_gory_deaths.erase(it);
+
+    // Only armor the victim wears; spare armor in its inventory, other loot
+    // and a creature's natural armor (part of its stats) stay.
+    Object* armor = inven_worn(critter);
+    if (armor == NULL) {
+        rt_log("bloody mess: %s wore no armor", critter_name(critter));
+        return;
+    }
+
+    rt_stats.armorDestroyed++;
+    rt_stats.lastArmorDestroyedPid = armor->pid;
+    rt_stats.lastArmorDestroyedOwner = critter;
+    rt_log("bloody mess: %s's %s is destroyed", critter_name(critter), object_name(armor));
+    obj_destroy(armor);
+}
+
+// The player's attack animations, and the reactions they cause.
+static bool rt_is_attack_anim(int anim)
+{
+    switch (anim) {
+    case ANIM_THROW_PUNCH:
+    case ANIM_KICK_LEG:
+    case ANIM_THROW_ANIM:
+    case ANIM_THRUST_ANIM:
+    case ANIM_SWING_ANIM:
+    case ANIM_POINT:
+    case ANIM_UNPOINT:
+    case ANIM_FIRE_SINGLE:
+    case ANIM_FIRE_BURST:
+    case ANIM_FIRE_CONTINUOUS:
+        return true;
+    }
+    return false;
+}
+
+static bool rt_is_reaction_anim(int anim)
+{
+    return anim == ANIM_HIT_FROM_FRONT || anim == ANIM_HIT_FROM_BACK || anim == ANIM_DODGE_ANIM;
+}
+
+// Fast Shot: the player's next attack waits for the current one to land,
+// i.e. for its animation and the target's reaction, then for the cooldown.
+// All three are shortened by the same factor, so the whole interval is
+// divided by 1.25 (frame-counted impact events stay on their frames).
+// Movement, reloads, holstering and death animations keep their speed.
+//
+// Ordinary hit reactions of NPCs also play faster (`hit_reaction_speed`), so
+// a hit enemy is back on its feet sooner; falls, knockdowns, deaths, dodges,
+// attacks and movement keep their speed.
+unsigned int rt_anim_frame_time(Object* obj, int anim, unsigned int frameTime)
+{
+    if (!rt_enabled() || obj == NULL) {
+        return frameTime;
+    }
+
+    if (obj != obj_dude
+        && (anim == ANIM_HIT_FROM_FRONT || anim == ANIM_HIT_FROM_BACK)
+        && FID_TYPE(obj->fid) == OBJ_TYPE_CRITTER) {
+        double speed = rt_rules()->hitReactionSpeed;
+        if (speed > 1.0) {
+            frameTime = std::max(1u, (unsigned int)(frameTime / speed + 0.5));
+            rt_stats.fastReactionAnims++;
+        }
+    }
+
+    if (!rt_fast_shot_active()) {
+        return frameTime;
+    }
+
+    bool fast = false;
+    if (obj == obj_dude) {
+        fast = rt_is_attack_anim(anim);
+    } else if (rt_is_reaction_anim(anim)) {
+        // A reaction can start while the attack is still being registered.
+        fast = obj == rt_registering_target;
+        for (RtPendingAttack* pending : rt_pending) {
+            if (pending->attack.attacker == obj_dude && pending->attack.defender == obj) {
+                fast = true;
+                break;
+            }
+        }
+    }
+
+    if (!fast) {
+        return frameTime;
+    }
+
+    rt_stats.fastShotFrames++;
+    return rt_fast_shot_interval(frameTime);
 }
 
 // -----------------------------------------------------------------------------
@@ -1846,8 +2900,20 @@ static void rt_update_knockdowns()
 // AI
 // -----------------------------------------------------------------------------
 
+// Test fixture: NPCs don't act (attack rate measurements).
+static bool rt_ai_paused = false;
+
+void rt_debug_set_ai_paused(bool paused)
+{
+    rt_ai_paused = paused;
+}
+
 static void rt_update_ai()
 {
+    if (rt_ai_paused) {
+        return;
+    }
+
     for (Object* critter : rt_critters) {
         if (critter == obj_dude || !rt_is_alive(critter)) {
             continue;
@@ -1895,7 +2961,7 @@ static int rt_npc_hit_mode(Object* critter, bool* reloaded)
 
 static void rt_ai_act(Object* critter, RtCritterState* state)
 {
-    if (rt_obj_in_attack(critter)) {
+    if (rt_obj_held_by_attack(critter)) {
         return;
     }
 
@@ -1926,7 +2992,24 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
         return;
     }
 
+    // An attack is only committed with a real chance: in range or reach,
+    // nothing blocking the shot or the view, ammunition, and a hit chance
+    // above 0% (a small one is enough). Otherwise the critter moves to a
+    // better position, without taking a place in the attack slot queue.
     int shot = rt_check_shot(critter, target, hitMode);
+    if (shot == COMBAT_BAD_SHOT_OK && rt_is_ranged_mode(critter, hitMode) && rt_view_blocked(critter, target)) {
+        rt_stats.aiSightBlockedSkips++;
+        rt_ai_debug(critter, state, "no line of sight to %s", critter_name(target));
+        shot = COMBAT_BAD_SHOT_AIM_BLOCKED;
+    }
+    if (shot == COMBAT_BAD_SHOT_OK) {
+        int toHit = determine_to_hit(critter, target, HIT_LOCATION_UNCALLED, hitMode);
+        if (toHit <= 0) {
+            rt_stats.aiZeroChanceSkips++;
+            rt_ai_debug(critter, state, "no chance to hit %s (%d%%), moving closer", critter_name(target), toHit);
+            shot = COMBAT_BAD_SHOT_AIM_BLOCKED;
+        }
+    }
     if (shot == COMBAT_BAD_SHOT_OK) {
         if (state->moving) {
             if (register_clear(critter) == -2) {
@@ -1945,12 +3028,11 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
                 return;
             }
 
-            // The player gets the next window when an attack, a reload or a
-            // chem use of theirs is waiting.
-            if ((rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until)
-                || (rt_reload_requested_until != 0 && rt_now <= rt_reload_requested_until)
-                || (rt_chem_requested_until != 0 && rt_now <= rt_chem_requested_until)
-                || rt_aimed_wants_window()) {
+            // AIMED SHOT planning gets its window. The player's buffered
+            // RT/RB presses, reloads and chem uses don't hold enemies back:
+            // an ordinary enemy attack doesn't hold the player either (see
+            // `rt_player_detachable`), and RT spam must not freeze enemies.
+            if (rt_aimed_wants_window()) {
                 state->nextActionAt = rt_now + 100;
                 return;
             }
@@ -1973,6 +3055,7 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
                     rt_stats.playerSlotMaxWaitMs = (int)waited;
                 }
                 rt_stats.playerSlotGrants++;
+                rt_counter_started(critter, hitMode);
                 rt_slot_head_since = rt_now;
                 rt_log("slot: %s attacks the player (waited %u ms, %d queued)", critter_name(critter), waited, (int)rt_slot_queue.size());
             }
@@ -2049,6 +3132,8 @@ static void rt_ai_act(Object* critter, RtCritterState* state)
     state->progressTile = critter->tile;
     state->progressAt = rt_now;
     state->nextActionAt = rt_now + 200;
+    rt_stats.lastAiMoveCritter = critter;
+    rt_stats.lastAiMoveAt = rt_now;
 }
 
 // -----------------------------------------------------------------------------
@@ -2077,6 +3162,14 @@ static bool rt_player_slot_may_attack(Object* critter, RtCritterState* state)
         return false;
     }
 
+    // An enemy owed a counterattack (the player's close-combat attack
+    // missed it) goes first when it is ready; an attack already committed
+    // (the holder's) is never interrupted.
+    Object* counter = rt_counter_ready();
+    if (counter != NULL) {
+        return counter == critter;
+    }
+
     // Entries that are not ready right now (e.g. stepping back into range)
     // don't hold up the ones behind them.
     for (Object* queued : rt_slot_queue) {
@@ -2095,6 +3188,8 @@ static bool rt_player_slot_may_attack(Object* critter, RtCritterState* state)
 
 static void rt_update_player_slot()
 {
+    rt_update_counters();
+
     // The slot is released when the holder's attack on the player resolved
     // (after its animation) or was dropped (attacker died or left the map).
     if (rt_slot_holder != NULL) {
@@ -2188,7 +3283,46 @@ static void rt_sync_weapon_sprite()
     rt_log("weapon sprite synced (weapon code %d)", code);
 }
 
+// Thrown weapons belong in the right hand (item 2) and are never the active
+// item (RB throws them). Equipping enforces this (`inven_rt_equip`); this
+// catches the rest (old saves, scripts): a thrown weapon in the left hand
+// moves to an empty right hand, or back to the inventory, and an active
+// right hand holding one gives the turn to the left.
+static void rt_enforce_thrown_hand()
+{
+    static unsigned int lastCheckAt = 0;
+    if (lastCheckAt != 0 && rt_now - lastCheckAt < 250 && rt_now >= lastCheckAt) {
+        return;
+    }
+    lastCheckAt = rt_now;
+
+    if (!rt_player_can_change_equipment()) {
+        return;
+    }
+
+    Object* left = inven_left_hand(obj_dude);
+    if (rt_is_thrown_weapon(left)) {
+        char name[64];
+        SDL_strlcpy(name, object_name(left), sizeof(name));
+        if (inven_right_hand(obj_dude) == NULL && inven_rt_equip(left, INVEN_RT_SLOT_RIGHT_HAND) == 0) {
+            rt_print("The %s can only be held in the right hand: moved there. RB throws it.", name);
+        } else if (inven_rt_unequip(left) == 0) {
+            rt_print("The %s can only be held in the right hand: put away.", name);
+        }
+        rt_stats.thrownHandFixes++;
+        rt_log("hands: thrown weapon %s taken out of the left hand", name);
+    }
+
+    if (intface_is_item_right_hand() && rt_is_thrown_weapon(inven_right_hand(obj_dude))) {
+        intface_toggle_items(false);
+        inven_rt_refresh_appearance();
+        rt_stats.thrownHandFixes++;
+        rt_log("hands: active hand back to the left (thrown weapon in the right)");
+    }
+}
+
 static void rt_update_dude(float dtMs)
+
 {
     int results = obj_dude->data.critter.combat.results;
     bool canAct = !game_ui_is_disabled()
@@ -2269,13 +3403,17 @@ static void rt_update_dude(float dtMs)
     }
 
     if (!canAct) {
+        rt_timing_clear("the player can't act");
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
+        rt_throw_buffered_until = 0;
         rt_set_interact_highlight(NULL);
         rt_update_label(NULL);
         rt_move_active = false;
         return;
     }
+
+    rt_enforce_thrown_hand();
 
     // Nothing may interfere with queued aimed attacks: no movement, attacks,
     // reloads, interactions or equipment changes until the queue is done.
@@ -2293,7 +3431,9 @@ static void rt_update_dude(float dtMs)
         }
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
+        rt_throw_buffered_until = 0;
         rt_reload_requested_until = 0;
+        rt_timing_clear("AIMED SHOT");
         rt_fav_pending_slot = -1;
         rt_interact_manual = NULL;
         rt_interact_target = NULL;
@@ -2307,7 +3447,13 @@ static void rt_update_dude(float dtMs)
         GNW_add_input_buffer(RT_PIPBOY_KEY_OPEN);
     }
     if (pressRB) {
-        if (rt_reload_active) {
+        // RB throws the right hand's (item 2's) thrown weapon without
+        // changing the active item; with no thrown weapon there, it switches
+        // hands as before.
+        if (rt_is_thrown_weapon(inven_right_hand(obj_dude))) {
+            rt_log("input: RB pressed: throw (lock=%s)", rt_lock != NULL ? critter_name(rt_lock) : "none");
+            rt_throw_buffered_until = rt_now + RT_ATTACK_BUFFER_MS;
+        } else if (rt_reload_active) {
             rt_log("input: RB ignored while reloading");
         } else {
             GNW_add_input_buffer(KEY_LOWERCASE_B);
@@ -2380,6 +3526,7 @@ static void rt_update_dude(float dtMs)
     }
 
     rt_update_attack_input(pressAttack);
+    rt_update_throw_input();
     rt_update_chem_request();
     rt_update_favorite_request();
 
@@ -2926,10 +4073,13 @@ static void rt_set_lock(Object* target)
         return;
     }
 
-    // Held fire and a buffered press never carry over to another target.
+    // Held fire and a buffered press never carry over to another target
+    // (nor the presses counted for its timing).
+    rt_timing_clear("target changed");
     rt_lock = target;
     rt_fire_hold = false;
     rt_attack_buffered_until = 0;
+    rt_throw_buffered_until = 0;
 
     if (target == NULL) {
         rt_log("lock: none");
@@ -3045,8 +4195,18 @@ static void rt_update_indicator()
             next.badShot = rt_check_shot(obj_dude, rt_lock, hitMode);
             switch (next.badShot) {
             case COMBAT_BAD_SHOT_OK:
+                // A buffered RT press shows the hit chance its timing would give.
+                rt_timing_committing = !rt_is_throw(hitMode) ? rt_timing_preview() : 0;
                 next.toHit = determine_to_hit(obj_dude, rt_lock, HIT_LOCATION_UNCALLED, hitMode);
+                rt_timing_committing = 0;
                 snprintf(next.text, sizeof(next.text), "%d%%", next.toHit);
+                // Close combat and throws cost AP: say so while there isn't
+                // enough.
+                if (rt_attack_costs_ap(hitMode) && rt_dude_ap + 0.0001f < (float)rt_attack_ap_cost(obj_dude, hitMode, false)) {
+                    char cost[16];
+                    snprintf(next.text, sizeof(next.text), "%d%%  %s AP needed", next.toHit, rt_ap_text(rt_attack_ap_cost(obj_dude, hitMode, false), cost, sizeof(cost)));
+                    color = colorTable[(31 << 10) | (24 << 5) | 0];
+                }
                 break;
             case COMBAT_BAD_SHOT_OUT_OF_RANGE:
                 SDL_strlcpy(next.text, "Out of range", sizeof(next.text));
@@ -3362,23 +4522,171 @@ static void rt_update_favorite_request()
     }
 }
 
+// -----------------------------------------------------------------------------
+// Timing of repeated manual attacks
+// -----------------------------------------------------------------------------
+
+// Whether the player's own attack (a swing, an attack in flight) or the
+// recovery after it is in progress.
+static bool rt_timing_player_recovering()
+{
+    if (rt_swing.active || rt_now < rt_dude_next_attack_at) {
+        return true;
+    }
+
+    for (RtPendingAttack* pending : rt_pending) {
+        if (pending->attack.attacker == obj_dude) {
+            return true;
+        }
+    }
+    return false;
+}
+
+// Forgets the presses counted for the next attack. With a `reason`, the
+// buffered press goes too (cancelled: weapon change, menu, disconnect...).
+static void rt_timing_clear(const char* reason)
+{
+    if (reason != NULL) {
+        if (rt_timing_presses > 0 || rt_attack_buffered_until != 0) {
+            rt_stats.timingClears++;
+            rt_log("timing: presses and penalty cleared (%s)", reason);
+        }
+        rt_attack_buffered_until = 0;
+    }
+
+    rt_timing_presses = 0;
+    rt_timing_press_at = 0;
+    rt_timing_weapon = NULL;
+    rt_timing_hit_mode = -1;
+    rt_timing_committing = 0;
+}
+
+// The hit chance penalty of the next RT attack if the current attack's
+// recovery ended at `readyAt`: extra presses during the attack (spam) and a
+// buffered press made well before that end (early) cost accuracy; a press
+// near the end, or a fresh press after it, costs nothing.
+static int rt_timing_penalty_for(unsigned int readyAt, int* spamOut, int* leadOut)
+{
+    const RtRules* rules = rt_rules();
+    int spam = rt_timing_presses > 1 ? rt_timing_presses - 1 : 0;
+    int lead = rt_timing_press_at != 0 && readyAt > rt_timing_press_at ? (int)(readyAt - rt_timing_press_at) : 0;
+
+    int early = 0;
+    int window = rules->timingWindowMs;
+    if (lead > window) {
+        early = window > 0
+            ? rules->timingEarlyPenalty * std::min(lead - window, window) / window
+            : rules->timingEarlyPenalty;
+    }
+
+    if (spamOut != NULL) {
+        *spamOut = spam;
+    }
+    if (leadOut != NULL) {
+        *leadOut = lead;
+    }
+    return std::clamp(early + spam * rules->timingSpamPenalty, 0, rules->timingMaxPenalty);
+}
+
+// The penalty a buffered press would get if its attack started now.
+static int rt_timing_preview()
+{
+    if (rt_attack_buffered_until == 0 || rt_now > rt_attack_buffered_until || rt_timing_presses == 0) {
+        return 0;
+    }
+    return rt_timing_penalty_for(rt_timing_recovering ? rt_now : rt_timing_ready_at, NULL, NULL);
+}
+
+int rt_player_timing_penalty()
+{
+    return rt_timing_committing;
+}
+
+int rt_debug_timing_preview()
+{
+    return rt_timing_preview();
+}
+
+int rt_debug_recovery_left_ms()
+{
+    if (rt_swing.active) {
+        return -1;
+    }
+    for (RtPendingAttack* pending : rt_pending) {
+        if (pending->attack.attacker == obj_dude) {
+            return -1;
+        }
+    }
+    return rt_now < rt_dude_next_attack_at ? (int)(rt_dude_next_attack_at - rt_now) : 0;
+}
+
+// Bookkeeping for each tick: when the recovery ends, and what clears the
+// counted presses (a menu, focus loss or controller disconnect in between,
+// or another weapon or attack mode).
+static void rt_update_timing(Object* activeItem, int hitMode)
+{
+    // (Held fire is released by the controller layer itself on focus loss
+    // or a disconnect.)
+    // (A menu is caught in `rt_tick`.)
+    int interruptions = gamepad_get_interruption_count();
+    if (interruptions != rt_timing_interruptions) {
+        rt_timing_clear("focus loss or controller disconnect");
+    }
+    rt_timing_interruptions = interruptions;
+
+    if ((rt_timing_presses > 0 || rt_attack_buffered_until != 0)
+        && rt_timing_hit_mode != -1
+        && (activeItem != rt_timing_weapon || hitMode != rt_timing_hit_mode)) {
+        rt_timing_clear("weapon or attack mode changed");
+    }
+
+    bool recovering = rt_timing_player_recovering();
+    if (rt_timing_recovering && !recovering) {
+        rt_timing_ready_at = rt_now;
+    }
+    rt_timing_recovering = recovering;
+}
+
 static void rt_update_attack_input(bool pressAttack)
 {
     Object* activeItem = NULL;
     if (intface_get_current_item(&activeItem) == 0 && activeItem != NULL && item_get_type(activeItem) == ITEM_TYPE_DRUG) {
         rt_fire_hold = false;
         rt_attack_buffered_until = 0;
+        rt_timing_clear(NULL);
         if (pressAttack) {
             rt_request_chem(activeItem);
         }
         return;
     }
 
+    int hitMode;
+    bool hasHitMode = rt_player_hit_mode(&hitMode) == 0;
+    rt_update_timing(activeItem, hasHitMode ? hitMode : -1);
+
     bool held = gamepad_is_held(GAMEPAD_BUTTON_RIGHT_TRIGGER);
 
     if (pressAttack) {
         // One buffered press at most; it expires if it can't run soon.
-        rt_log("input: RT pressed (lock=%s)", rt_lock != NULL ? critter_name(rt_lock) : "none");
+        // Presses during the current attack or its recovery are counted for
+        // the next attack's timing (see `rt_timing_penalty_for`); further
+        // presses never queue more attacks.
+        if (rt_timing_recovering) {
+            rt_timing_presses++;
+            rt_timing_press_at = rt_now;
+            rt_stats.timingBusyPresses++;
+            if (rt_timing_presses > 1) {
+                rt_stats.timingSpamPresses++;
+            }
+        } else {
+            rt_timing_presses = 0;
+            rt_timing_press_at = 0;
+        }
+        rt_timing_weapon = activeItem;
+        rt_timing_hit_mode = hasHitMode ? hitMode : -1;
+
+        rt_log("input: RT pressed (lock=%s%s)", rt_lock != NULL ? critter_name(rt_lock) : "none",
+            rt_timing_recovering ? ", during the current attack" : "");
         rt_attack_buffered_until = rt_now + RT_ATTACK_BUFFER_MS;
         rt_fire_hold = true;
         rt_fire_pressed_at = rt_now;
@@ -3389,8 +4697,7 @@ static void rt_update_attack_input(bool pressAttack)
         rt_fire_hold = false;
     }
 
-    int hitMode;
-    bool automatic = rt_player_hit_mode(&hitMode) == 0 && rt_is_automatic(hitMode);
+    bool automatic = hasHitMode && rt_is_automatic(hitMode);
 
     bool buffered = rt_attack_buffered_until != 0 && rt_now <= rt_attack_buffered_until;
     // A hold repeats only automatic attacks, and only once the press's own
@@ -3402,22 +4709,108 @@ static void rt_update_attack_input(bool pressAttack)
         && rt_fire_press_done
         && rt_now - rt_fire_pressed_at >= RT_HOLD_REPEAT_MS;
     if (!buffered && !repeat) {
+        if (rt_attack_buffered_until != 0) {
+            // The buffered press expired: its presses no longer count.
+            rt_timing_clear(NULL);
+        }
         rt_attack_buffered_until = 0;
         return;
     }
 
+    // The press's attack carries its timing penalty, taken now and used
+    // once (not for held automatic fire or throws).
+    int spam = 0;
+    int lead = 0;
+    int penalty = 0;
+    if (buffered && hasHitMode && !rt_is_throw(hitMode)) {
+        penalty = rt_timing_penalty_for(rt_timing_ready_at, &spam, &lead);
+    }
+    rt_timing_committing = penalty;
     int rc = rt_player_attack(pressAttack);
+    rt_timing_committing = 0;
+
     if (rc == RT_PLAYER_ATTACK_STARTED) {
+        if (buffered) {
+            rt_stats.lastTimingPenalty = penalty;
+            rt_stats.lastTimingSpam = spam;
+            rt_stats.lastTimingLeadMs = lead;
+            if (penalty > 0 || spam > 0 || lead > 0) {
+                rt_log("timing: attack started %d ms after its press (before the recovery end), %d extra press(es): -%d%% to hit",
+                    lead, spam, penalty);
+            }
+            rt_timing_clear(NULL);
+        }
         rt_attack_buffered_until = 0;
         rt_fire_press_done = true;
     } else if (rc == RT_PLAYER_ATTACK_FAILED) {
         // Nothing to retry: no target, out of range, empty...
         rt_attack_buffered_until = 0;
         rt_fire_hold = false;
+        rt_timing_clear(NULL);
     }
 }
 
+// RB: throws the right hand's thrown weapon at the locked target, the same
+// attack as RT with it active (lock, range, line of sight, cooldown, 3 AP),
+// while the active item stays in the hand it is in.
+static void rt_update_throw_input()
+{
+    if (rt_throw_buffered_until == 0) {
+        return;
+    }
+
+    if (!rt_is_thrown_weapon(inven_right_hand(obj_dude))) {
+        rt_throw_buffered_until = 0;
+        return;
+    }
+
+    if (rt_now > rt_throw_buffered_until) {
+        rt_throw_buffered_until = 0;
+        rt_stats.rbThrowRefused++;
+        rt_print("You can't throw right now.");
+        return;
+    }
+
+    int rc = rt_player_attack_with(HIT_MODE_RIGHT_WEAPON_PRIMARY, true);
+    if (rc == RT_PLAYER_ATTACK_WAIT) {
+        return;
+    }
+
+    rt_throw_buffered_until = 0;
+    if (rc == RT_PLAYER_ATTACK_FAILED) {
+        rt_stats.rbThrowRefused++;
+    }
+}
+
+// The throw animation belongs to the thrown weapon's sprite set (grenades
+// use the bare-handed one), not the active weapon's: switch to it for the
+// throw. `rt_sync_weapon_sprite` puts the active weapon's back afterwards.
+static void rt_set_throw_sprite(Object* item)
+{
+    if (item == NULL) {
+        return;
+    }
+
+    int current = (obj_dude->fid & 0xF000) >> 12;
+    int code = item_w_anim_code(item);
+    int throwFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_THROW_ANIM, code, obj_dude->rotation + 1);
+    if (!art_exists(throwFid)) {
+        code = 0;
+    }
+    if (current == code) {
+        return;
+    }
+
+    int fid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_STAND, code, obj_dude->rotation + 1);
+    Rect rect;
+    if (obj_change_fid(obj_dude, fid, &rect) == 0) {
+        tile_refresh_rect(&rect, obj_dude->elevation);
+    }
+    rt_log("throw: sprite set %d -> %d for %s", current, code, object_name(item));
+}
+
 static int rt_player_attack(bool explicitPress)
+
 {
     int hitMode;
     if (rt_player_hit_mode(&hitMode) != 0) {
@@ -3425,15 +4818,26 @@ static int rt_player_attack(bool explicitPress)
         return RT_PLAYER_ATTACK_FAILED;
     }
 
+    return rt_player_attack_with(hitMode, false);
+}
+
+// An ordinary attack with `hitMode`: RT with the active item, or RB's throw
+// of the right hand's thrown weapon (`rbThrow`), which leaves the active
+// item as it is.
+static int rt_player_attack_with(int hitMode, bool rbThrow)
+{
+
     // Melee and unarmed: the lock is optional. A locked target in reach is
     // attacked as before; otherwise the press swings anyway, and the swing
     // hits whoever is in reach in front of the player at its impact.
-    int attackType = item_w_subtype(item_hit_with(obj_dude, hitMode), hitMode);
-    if (attackType == ATTACK_TYPE_MELEE || attackType == ATTACK_TYPE_UNARMED) {
+    // Two-handed melee weapons always swing, so they can hit everyone in
+    // their arc; the lock is what they aim at first.
+    bool closeCombat = rt_is_close_combat(hitMode);
+    if (closeCombat) {
         if (rt_reload_active || rt_holster_active) {
             return RT_PLAYER_ATTACK_WAIT;
         }
-        if (rt_lock == NULL || rt_check_shot(obj_dude, rt_lock, hitMode) != COMBAT_BAD_SHOT_OK) {
+        if (rt_lock == NULL || rt_check_shot(obj_dude, rt_lock, hitMode) != COMBAT_BAD_SHOT_OK || rt_is_sweep(hitMode)) {
             return rt_player_swing(hitMode);
         }
     }
@@ -3495,12 +4899,38 @@ static int rt_player_attack(bool explicitPress)
         return RT_PLAYER_ATTACK_WAIT;
     }
 
+    // Melee, unarmed attacks and throws cost AP (gunfire doesn't). The cost
+    // is known before the attack: a throw takes the item from the hand.
+    bool costsAp = rt_attack_costs_ap(hitMode);
+    bool thrown = rt_is_throw(hitMode);
+    double cost = costsAp ? rt_attack_ap_cost(obj_dude, hitMode, false) : 0.0;
+    if (costsAp && !rt_attack_ap_ok(hitMode)) {
+        return RT_PLAYER_ATTACK_FAILED;
+    }
+
     if (rt_move_active) {
         rt_move_active = false;
     }
 
+    Object* thrownItem = rbThrow ? item_hit_with(obj_dude, hitMode) : NULL;
+    if (rbThrow) {
+        rt_set_throw_sprite(thrownItem);
+    }
+
     int rc = rt_attack(obj_dude, target, hitMode);
     if (rc == 0) {
+        if (costsAp) {
+            rt_spend_attack_ap(cost, thrown);
+        }
+        if (rbThrow) {
+            Object* active = NULL;
+            intface_get_current_item(&active);
+            rt_stats.rbThrows++;
+            rt_stats.lastRbThrowPid = thrownItem != NULL ? thrownItem->pid : -1;
+            rt_stats.lastRbThrowActiveItem = active;
+            rt_log("throw: RB threw %s at %s, active item %s", thrownItem != NULL ? object_name(thrownItem) : "?",
+                critter_name(target), active != NULL ? object_name(active) : "none");
+        }
         rt_set_interact_highlight(NULL);
         return RT_PLAYER_ATTACK_STARTED;
     }
@@ -3565,7 +4995,7 @@ bool rt_aim_player_in_attack()
     return rt_obj_in_attack(obj_dude);
 }
 
-int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost)
+int rt_aim_attack(Object* target, int hitMode, int hitLocation, float apCost)
 {
     if (rt_reload_active || rt_chem_active || rt_holster_active) {
         return RT_AIM_ATTACK_WAIT;
@@ -3581,7 +5011,7 @@ int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost)
         return RT_AIM_ATTACK_WAIT;
     }
 
-    if ((int)rt_dude_ap < apCost) {
+    if (rt_dude_ap + 0.0001f < apCost) {
         return RT_AIM_ATTACK_FAILED;
     }
 
@@ -3595,13 +5025,8 @@ int rt_aim_attack(Object* target, int hitMode, int hitLocation, int apCost)
     }
 
     // Spent exactly once, when the attack is committed (hit or miss).
-    rt_dude_ap -= (float)apCost;
-    if (rt_dude_ap < 0.0f) {
-        rt_dude_ap = 0.0f;
-    }
-    rt_dude_ap_shown = (int)rt_dude_ap;
-    obj_dude->data.critter.combat.ap = rt_dude_ap_shown;
-    intface_update_move_points(rt_dude_ap_shown, 0);
+    // AIMED SHOT pays its own cost only (no ordinary melee cost on top).
+    rt_spend_ap(apCost);
     return RT_AIM_ATTACK_STARTED;
 }
 
@@ -3857,6 +5282,34 @@ static void rt_set_interact_highlight(Object* obj)
     rt_set_outline(&rt_interact_outlined, obj, outlineType);
 }
 
+// Hunting Rifle reload: its idle animation again, if a whole one still fits
+// before the reload ends (the pose is held otherwise).
+static void rt_play_reload_idle()
+{
+    if (rt_reload_idle_anim_ms == 0 || rt_now + rt_reload_idle_anim_ms > rt_reload_until || rt_now < rt_reload_idle_next_at) {
+        return;
+    }
+
+    register_begin(ANIMATION_REQUEST_RESERVED);
+    register_object_animate(obj_dude, ANIM_STAND, 0);
+    if (register_end() == 0) {
+        rt_reload_idle_next_at = rt_now + rt_reload_idle_anim_ms;
+    }
+}
+
+// How long the animation `fid` plays at its own frame rate.
+static unsigned int rt_art_length_ms(int fid)
+{
+    CacheEntry* handle;
+    Art* art = art_ptr_lock(fid, &handle);
+    if (art == NULL) {
+        return 0;
+    }
+    unsigned int ms = (unsigned int)(art_frame_max_frame(art) * 1000 / art_frame_fps(art));
+    art_ptr_unlock(handle);
+    return ms;
+}
+
 static bool rt_has_ammo_for(Object* weapon)
 {
     int index = -1;
@@ -3938,10 +5391,44 @@ static int rt_reload()
     rt_move_active = false;
     rt_set_interact_highlight(NULL);
 
+    rt_reload_commit_at = 0;
+    rt_reload_started_at = rt_now;
+
     int code = item_w_anim_code(item);
     int putAwayFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_PUT_AWAY, code, obj_dude->rotation + 1);
     int takeOutFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_TAKE_OUT, code, obj_dude->rotation + 1);
     bool animated = code != 0 && art_exists(putAwayFid) && art_exists(takeOutFid);
+
+    // The Hunting Rifle reloads with its armed idle animation instead (the
+    // one it fidgets with when idle), played over and over for as long as
+    // the holster and draw would take; the ammunition moves where the
+    // holster would have ended.
+    int standFid = art_id(OBJ_TYPE_CRITTER, obj_dude->fid & 0xFFF, ANIM_STAND, code, obj_dude->rotation + 1);
+    if (animated && item->pid == PROTO_ID_HUNTING_RIFLE && art_exists(standFid)) {
+        if (anim_busy(obj_dude)) {
+            register_clear(obj_dude);
+        }
+
+        if (obj_dude->fid != standFid) {
+            Rect rect;
+            if (obj_change_fid(obj_dude, standFid, &rect) == 0) {
+                tile_refresh_rect(&rect, obj_dude->elevation);
+            }
+        }
+
+        unsigned int putAwayMs = rt_art_length_ms(putAwayFid);
+        unsigned int takeOutMs = rt_art_length_ms(takeOutFid);
+        rt_reload_commit_at = rt_now + putAwayMs;
+        rt_reload_until = rt_reload_commit_at + takeOutMs;
+        rt_reload_idle_code = code;
+        rt_reload_idle_anim_ms = rt_art_length_ms(standFid);
+        rt_reload_idle_next_at = 0;
+        rt_play_reload_idle();
+        rt_stats.idleReloads++;
+        rt_log("reload: started in the idle pose (%s %d/%d, %u ms, ammo after %u ms)",
+            object_name(item), item_w_curr_ammo(item), item_w_max_ammo(item), putAwayMs + takeOutMs, putAwayMs);
+        return RT_RELOAD_STARTED;
+    }
 
     if (animated) {
         if (anim_busy(obj_dude)) {
@@ -4003,6 +5490,50 @@ static void rt_update_reload()
         return;
     }
 
+    if (rt_reload_commit_at != 0) {
+        // Idle animation reload: the ammunition moves once, at its time, if
+        // the weapon is still in hand. Any other animation of the player's
+        // starting meanwhile (a heavy hit, a fall) cuts it short: nothing
+        // moved before that time, and afterwards the reload counts (as with
+        // the holster).
+        bool cut = FID_ANIM_TYPE(obj_dude->fid) != ANIM_STAND
+            || ((obj_dude->fid & 0xF000) >> 12) != rt_reload_idle_code;
+        if (!cut && !rt_reload_committed && rt_now >= rt_reload_commit_at) {
+            rt_reload_commit(rt_reload_weapon, NULL);
+        }
+        if (!cut && !anim_busy(obj_dude)) {
+            rt_play_reload_idle();
+        }
+        if (cut) {
+            rt_reload_commit_at = 0;
+            rt_reload_until = 0;
+            rt_reload_active = false;
+            rt_reload_weapon = NULL;
+            rt_stats.lastReloadMs = rt_now - rt_reload_started_at;
+            if (rt_reload_committed) {
+                rt_stats.reloadsCompleted++;
+                rt_log("reload: complete (idle pose cut short after the ammo moved)");
+            } else {
+                rt_stats.reloadsInterrupted++;
+                rt_print("Reload interrupted.");
+                rt_log("reload: idle pose interrupted before the ammo moved (nothing loaded)");
+            }
+            return;
+        }
+        if (rt_now < rt_reload_until) {
+            return;
+        }
+
+        rt_reload_commit_at = 0;
+        rt_reload_until = 0;
+        rt_reload_active = false;
+        rt_reload_weapon = NULL;
+        rt_stats.reloadsCompleted++;
+        rt_stats.lastReloadMs = rt_now - rt_reload_started_at;
+        rt_log("reload: complete (idle pose, %u ms)", rt_stats.lastReloadMs);
+        return;
+    }
+
     if (rt_reload_until != 0) {
         if (rt_now < rt_reload_until) {
             return;
@@ -4012,6 +5543,7 @@ static void rt_update_reload()
         rt_reload_active = false;
         rt_reload_weapon = NULL;
         rt_stats.reloadsCompleted++;
+        rt_stats.lastReloadMs = rt_now - rt_reload_started_at;
         rt_log("reload: complete (timed)");
         return;
     }
@@ -4023,6 +5555,7 @@ static void rt_update_reload()
     rt_reload_active = false;
     rt_reload_weapon = NULL;
 
+    rt_stats.lastReloadMs = rt_now - rt_reload_started_at;
     if (rt_reload_finished) {
         rt_stats.reloadsCompleted++;
         rt_log("reload: complete");

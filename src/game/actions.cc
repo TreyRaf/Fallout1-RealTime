@@ -20,6 +20,7 @@
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/skill.h"
@@ -257,6 +258,26 @@ static int internal_destroy(Object* a1, Object* a2)
     return obj_destroy(a2);
 }
 
+// RT: the death animation the last `show_damage_to_object` registered, or -1
+// (Bloody Mess armor destruction, see `action_rt_note_gory_death`).
+static int show_last_death_anim = -1;
+
+// RT: Bloody Mess. A critical hit of the player's that kills the defender
+// with a gory death animation (not a plain fall) marks it: its worn armor is
+// destroyed when the death animation is over (`show_death`).
+static void action_rt_note_gory_death(Attack* attack)
+{
+    if (attack->attacker == obj_dude
+        && trait_level(TRAIT_BLOODY_MESS)
+        && (attack->attackerFlags & DAM_HIT) != 0
+        && (attack->attackerFlags & DAM_CRITICAL) != 0
+        && (attack->defenderFlags & DAM_DEAD) != 0
+        && show_last_death_anim >= ANIM_BIG_HOLE
+        && show_last_death_anim <= ANIM_FIRE_DANCE) {
+        rt_note_gory_death(attack->defender);
+    }
+}
+
 // TODO: Check very carefully, lots of conditions and jumps.
 //
 // 0x410810
@@ -267,6 +288,7 @@ void show_damage_to_object(Object* defender, int damage, int flags, Object* weap
     const char* sfx_name;
 
     anim = FID_ANIM_TYPE(defender->fid);
+    show_last_death_anim = -1;
     if (!critter_is_prone(defender)) {
         if ((flags & DAM_DEAD) != 0) {
             fid = art_id(OBJ_TYPE_MISC, 10, 0, 0, 0);
@@ -391,6 +413,7 @@ void show_damage_to_object(Object* defender, int damage, int flags, Object* weap
 
     if ((flags & DAM_DEAD) != 0) {
         // TODO: Get rid of casts.
+        show_last_death_anim = anim;
         register_object_must_call(defender, (void*)anim, (AnimationCallback*)show_death, -1);
     }
 }
@@ -400,6 +423,10 @@ static int show_death(Object* obj, int anim)
 {
     Rect temp_rect;
     Rect dirty_rect;
+
+    // RT: Bloody Mess destroys the worn armor of a gory critical kill now,
+    // before a death "to nothing" drops the inventory.
+    rt_gory_death_shown(obj);
 
     obj_bound(obj, &dirty_rect);
 
@@ -446,6 +473,7 @@ int show_damage_target(Attack* attack)
             item_w_anim(attack->attacker, attack->hitMode),
             attack->attacker,
             0);
+        action_rt_note_gory_death(attack);
         register_end();
     }
 
@@ -503,7 +531,11 @@ void show_damage(Attack* attack, int a2, int delay)
         if (attack->defender != NULL) {
             hit_from_front = is_hit_from_front(attack->attacker, attack->defender);
 
-            if (FID_TYPE(attack->defender->fid) == OBJ_TYPE_CRITTER) {
+            if (rt_action_detached_defender(attack->defender)) {
+                // RT: the player's own reaction starts here, outside this
+                // sequence (see `rt_player_impact_cue`).
+                register_object_call(attack->attacker, attack->defender, (AnimationCallback*)rt_player_impact_cue, delay);
+            } else if (FID_TYPE(attack->defender->fid) == OBJ_TYPE_CRITTER) {
                 if (attack->attacker->fid == 33554933) {
                     show_damage_to_object(attack->defender,
                         attack->defenderDamage,
@@ -514,6 +546,7 @@ void show_damage(Attack* attack, int a2, int delay)
                         tile_dir(attack->attacker->tile, attack->defender->tile),
                         a2,
                         attack->attacker, delay);
+                    action_rt_note_gory_death(attack);
                 } else {
                     show_damage_to_object(attack->defender,
                         attack->defenderDamage,
@@ -525,6 +558,7 @@ void show_damage(Attack* attack, int a2, int delay)
                         item_w_anim(attack->attacker, attack->hitMode),
                         attack->attacker,
                         delay);
+                    action_rt_note_gory_death(attack);
                 }
             }
         }
@@ -542,7 +576,9 @@ int action_attack(Attack* attack)
         return -1;
     }
 
-    if (register_clear(attack->defender) == -2) {
+    // RT: a detached defender (the player under an enemy attack with an
+    // ordinary outcome) keeps doing what it does.
+    if (!rt_action_detached_defender(attack->defender) && register_clear(attack->defender) == -2) {
         return -1;
     }
 
@@ -618,7 +654,8 @@ static int action_melee(Attack* attack, int anim)
         register_object_play_sfx(attack->attacker, sfx_name_temp, v17);
         show_damage(attack, anim, 0);
     } else {
-        if (attack->defender->data.critter.combat.results & 0x03) {
+        // RT: a detached defender doesn't dodge (a miss shows no reaction).
+        if ((attack->defender->data.critter.combat.results & 0x03) || rt_action_detached_defender(attack->defender)) {
             register_object_play_sfx(attack->attacker, sfx_name_temp, -1);
             register_object_animate(attack->attacker, anim, 0);
         } else {
@@ -900,7 +937,8 @@ static int action_ranged(Attack* attack, int anim)
             } else {
                 if ((attack->attackerFlags & DAM_HIT) == 0) {
                     Object* defender = attack->defender;
-                    if ((defender->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) == 0) {
+                    if ((defender->data.critter.combat.results & (DAM_KNOCKED_OUT | DAM_KNOCKED_DOWN)) == 0
+                        && !rt_action_detached_defender(defender)) {
                         register_object_animate(defender, ANIM_DODGE_ANIM, actionFrame);
                         l56 = true;
                     }

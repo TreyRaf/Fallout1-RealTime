@@ -12,9 +12,11 @@
 #include "game/version.h"
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -366,6 +368,17 @@ int main_menu_loop()
                 }
                 continue;
             }
+        }
+
+        // RT: B (or Back) on the controller selects Exit instead of quitting
+        // at once; A then confirms it. The Escape key still quits.
+        if (keyCode == KEY_ESCAPE && gamepad_consume_menu_back()) {
+            Rect windowRect;
+            if (win_get_rect(main_window, &windowRect) == 0) {
+                mouse_set_position(windowRect.ulx + 425 + 13, windowRect.uly + MAIN_MENU_BUTTON_EXIT * 41 + 45 + 13);
+                gamepad_note_cursor_jump();
+            }
+            keyCode = -1;
         }
 
         if (keyCode == KEY_ESCAPE || game_user_wants_to_quit == 3) {

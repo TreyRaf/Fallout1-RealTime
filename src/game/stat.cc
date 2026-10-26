@@ -17,6 +17,7 @@
 #include "game/perk.h"
 #include "game/proto.h"
 #include "game/roll.h"
+#include "game/rt_rules.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/tile.h"
@@ -500,6 +501,10 @@ void stat_pc_set_defaults()
     for (pc_stat = 0; pc_stat < PC_STAT_COUNT; pc_stat++) {
         curr_pc_stat[pc_stat] = pc_stat_data[pc_stat].defaultValue;
     }
+
+    // RT: a new character starts with no Skilled experience fraction.
+    rt_skilled_xp_set_remainder(0);
+    rt_quick_pockets_reset();
 }
 
 // Returns experience to reach next level.
@@ -588,6 +593,10 @@ int stat_result(Object* critter, int stat, int modifier, int* howMuch)
 int stat_pc_add_experience(int xp)
 {
     xp += perk_level(PERK_SWIFT_LEARNER) * 5 * xp / 100;
+    // RT: Skilled gets less of every positive award (combat, quests, skill
+    // use, scripts); fractions carry over to the next award. Experience
+    // already earned and negative adjustments are left alone.
+    xp = rt_skilled_xp_award(xp);
     xp += stat_pc_get(PC_STAT_EXPERIENCE);
 
     if (xp < pc_stat_data[PC_STAT_EXPERIENCE].minimumValue) {

@@ -15,6 +15,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -125,6 +126,10 @@ int flgids2[FILE_DIALOG_FRM_COUNT] = {
 // 0x41BE70
 int dialog_out(const char* title, const char** body, int bodyLength, int x, int y, int titleColor, const char* a8, int bodyColor, int flags)
 {
+    // RT: the controller selects the box's buttons (with a selection frame)
+    // even when the screen below takes keys.
+    GamepadKeyModeScope keyMode(false);
+
     MessageList messageList;
     MessageListItem messageListItem;
     int savedFont = text_curr();

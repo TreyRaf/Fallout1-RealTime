@@ -19,6 +19,13 @@ namespace fallout {
 //   containers (next to Open, which runs the door's own lock logic) and on
 //   objects the engine can't lock; not on unlocked doors and containers.
 // Steal, First Aid and Doctor are never offered (they stay in the Skilldex).
+// - Using an item on the object, through the object's own
+//   `use_obj_on_p_proc` (the original "use item on" behavior), when its
+//   script checks for that item: the item in the active hand (the player
+//   picked it), or a Rope carried anywhere in the inventory where the script
+//   takes the rope (the Vault 15 elevator shafts, the Glow's metal beam):
+//   "Attach Rope" then replaces the plain Use, which only says a rope is
+//   needed. No other carried item is used without being held.
 // When more than one action applies, a small controller menu asks which one.
 //
 // Script reading: the compiled script's `use_skill_on_p_proc` is scanned for
@@ -36,11 +43,24 @@ typedef struct RtSkillInfo {
     int requirement;
 } RtSkillInfo;
 
+#define RT_SCRIPT_ITEM_PIDS 8
+
 typedef struct RtScriptSkills {
     bool hasProc;
     // `action_being_used` is read in a way the scan doesn't understand.
     bool unknownForm;
     RtSkillInfo skills[SKILL_COUNT];
+    // `use_obj_on_p_proc` (an item used on the object): the item pids it
+    // checks for (`obj_pid(obj_being_used_with) == N`), whether it takes
+    // the item (rm_obj_from_inven or destroy_object on it), and the object
+    // pid it refuses it on (`obj_pid(self_obj) != N` around that branch: a
+    // Vault 15 shaft that already has a rope is replaced by one with this
+    // pid and the same script), or 0.
+    bool hasUseOnProc;
+    int itemPids[RT_SCRIPT_ITEM_PIDS];
+    int itemPidCount;
+    bool consumesItem;
+    int refusingSelfPid;
 } RtScriptSkills;
 
 typedef struct RtContextStats {
@@ -50,6 +70,12 @@ typedef struct RtContextStats {
     int skillBlocked;
     int menus;
     int menuCancels;
+    // Items used on objects (started), refused while the player was still
+    // busy (a repeated press), and the last item pid and object.
+    int itemUses;
+    int itemUseRefused;
+    int lastItemPid;
+    Object* lastItemTarget;
 } RtContextStats;
 
 // True if pressing A on `obj` would do something.

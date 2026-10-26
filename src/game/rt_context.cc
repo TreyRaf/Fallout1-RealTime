@@ -12,13 +12,17 @@
 #include <SDL.h>
 
 #include "game/actions.h"
+#include "game/anim.h"
 #include "game/combat.h"
 #include "game/critter.h"
 #include "game/display.h"
+#include "game/intface.h"
+#include "game/inventry.h"
 #include "game/item.h"
 #include "game/object.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/proto_types.h"
 #include "game/game.h"
 #include "game/map.h"
 #include "game/realtime.h"
@@ -49,6 +53,10 @@ namespace fallout {
 #define RT_OP_ACTION_BEING_USED 0x80FA
 #define RT_OP_DUDE_OBJ 0x80BF
 #define RT_OP_SELF_OBJ 0x80BC
+#define RT_OP_OBJ_BEING_USED_WITH 0x80C0
+#define RT_OP_RM_OBJ_FROM_INVEN 0x80D9
+#define RT_OP_DESTROY_OBJECT 0x80F4
+#define RT_OP_OBJ_PID 0x8100
 #define RT_OP_STORE 0x8031
 #define RT_OP_FETCH 0x8032
 #define RT_OP_EQUAL 0x8033
@@ -64,11 +72,14 @@ namespace fallout {
 
 #define RT_ACTION_DEFAULT 0
 #define RT_ACTION_SKILL 1
+#define RT_ACTION_ITEM 2
 #define RT_MAX_ACTIONS 8
 
 typedef struct RtAction {
     int kind;
     int skill;
+    // RT_ACTION_ITEM: the item used on the object.
+    Object* item;
     char label[48];
 } RtAction;
 
@@ -257,30 +268,51 @@ static void rt_scan_body(const std::vector<RtInstruction>& code, RtScriptSkills*
     out->unknownForm = readsAction && !understood;
 }
 
-static bool rt_scan_script_file(const char* path, RtScriptSkills* out)
+// Items `use_obj_on_p_proc` reacts to (see `RtScriptSkills`).
+static void rt_scan_use_on_body(const std::vector<RtInstruction>& code, RtScriptSkills* out)
 {
-    DB_FILE* stream = db_fopen(path, "rb");
-    if (stream == NULL) {
-        return false;
-    }
+    out->hasUseOnProc = true;
+    int count = (int)code.size();
+    for (int index = 0; index + 1 < count; index++) {
+        if (code[index].opcode == RT_OP_OBJ_BEING_USED_WITH) {
+            // obj_pid(obj_being_used_with) == N, either operand order.
+            int pid = 0;
+            if (code[index + 1].opcode == RT_OP_OBJ_PID) {
+                if (index + 3 < count && rt_is_int(code[index + 2])
+                    && (code[index + 3].opcode == RT_OP_EQUAL || code[index + 3].opcode == RT_OP_NOT_EQUAL)) {
+                    pid = code[index + 2].value;
+                } else if (index >= 1 && index + 2 < count && rt_is_int(code[index - 1])
+                    && (code[index + 2].opcode == RT_OP_EQUAL || code[index + 2].opcode == RT_OP_NOT_EQUAL)) {
+                    pid = code[index - 1].value;
+                }
+            }
 
-    long size = db_filelength(stream);
-    std::vector<unsigned char> data(size > 0 ? size : 0);
-    if (size > 0) {
-        db_fread(data.data(), 1, size, stream);
-    }
-    db_fclose(stream);
+            if (pid > 0 && out->itemPidCount < RT_SCRIPT_ITEM_PIDS
+                && std::find(out->itemPids, out->itemPids + out->itemPidCount, pid) == out->itemPids + out->itemPidCount) {
+                out->itemPids[out->itemPidCount++] = pid;
+            }
 
-    if (size < RT_INT_PROCEDURES_OFFSET + 4) {
-        return false;
+            // rm_obj_from_inven(who, obj_being_used_with),
+            // destroy_object(obj_being_used_with).
+            if (code[index + 1].opcode == RT_OP_RM_OBJ_FROM_INVEN || code[index + 1].opcode == RT_OP_DESTROY_OBJECT) {
+                out->consumesItem = true;
+            }
+        } else if (code[index].opcode == RT_OP_SELF_OBJ && index + 3 < count
+            && code[index + 1].opcode == RT_OP_OBJ_PID && rt_is_int(code[index + 2])
+            && code[index + 3].opcode == RT_OP_NOT_EQUAL) {
+            // obj_pid(self_obj) != N
+            out->refusingSelfPid = code[index + 2].value;
+        }
     }
+}
 
+// Decodes the named procedure's bytecode. False if the script has none.
+static bool rt_read_procedure(const std::vector<unsigned char>& data, const char* procedureName, std::vector<RtInstruction>* code)
+{
+    long size = (long)data.size();
     const unsigned char* procedures = data.data() + RT_INT_PROCEDURES_OFFSET;
     int procedureCount = rt_be32(procedures);
     long identifiersOffset = RT_INT_PROCEDURES_OFFSET + 4 + (long)procedureCount * RT_INT_PROCEDURE_SIZE;
-    if (procedureCount <= 0 || identifiersOffset + 4 > size) {
-        return false;
-    }
 
     const unsigned char* identifiers = data.data() + identifiersOffset;
     int body = -1;
@@ -292,17 +324,15 @@ static bool rt_scan_script_file(const char* path, RtScriptSkills* out)
         }
 
         const char* name = (const char*)(identifiers + nameOffset);
-        if (SDL_strncasecmp(name, "use_skill_on_p_proc", 20) == 0) {
+        if (SDL_strncasecmp(name, procedureName, strlen(procedureName) + 1) == 0) {
             body = rt_be32(procedure + RT_INT_PROCEDURE_BODY);
             break;
         }
     }
 
     if (body <= 0 || body >= size) {
-        return true;
+        return false;
     }
-
-    out->hasProc = true;
 
     // The procedure ends where the next one in the file begins.
     long end = size;
@@ -313,7 +343,6 @@ static bool rt_scan_script_file(const char* path, RtScriptSkills* out)
         }
     }
 
-    std::vector<RtInstruction> code;
     long pos = body;
     while (pos + 2 <= end) {
         RtInstruction instruction;
@@ -334,8 +363,46 @@ static bool rt_scan_script_file(const char* path, RtScriptSkills* out)
             pos += 4;
         }
 
-        code.push_back(instruction);
+        code->push_back(instruction);
     }
+    return true;
+}
+
+static bool rt_scan_script_file(const char* path, RtScriptSkills* out)
+{
+    DB_FILE* stream = db_fopen(path, "rb");
+    if (stream == NULL) {
+        return false;
+    }
+
+    long size = db_filelength(stream);
+    std::vector<unsigned char> data(size > 0 ? size : 0);
+    if (size > 0) {
+        db_fread(data.data(), 1, size, stream);
+    }
+    db_fclose(stream);
+
+    if (size < RT_INT_PROCEDURES_OFFSET + 4) {
+        return false;
+    }
+
+    int procedureCount = rt_be32(data.data() + RT_INT_PROCEDURES_OFFSET);
+    long identifiersOffset = RT_INT_PROCEDURES_OFFSET + 4 + (long)procedureCount * RT_INT_PROCEDURE_SIZE;
+    if (procedureCount <= 0 || identifiersOffset + 4 > size) {
+        return false;
+    }
+
+    std::vector<RtInstruction> useOn;
+    if (rt_read_procedure(data, "use_obj_on_p_proc", &useOn)) {
+        rt_scan_use_on_body(useOn, out);
+    }
+
+    std::vector<RtInstruction> code;
+    if (!rt_read_procedure(data, "use_skill_on_p_proc", &code)) {
+        return true;
+    }
+
+    out->hasProc = true;
 
     // Diagnostics: RT_SCAN_DUMP=name1,name2 logs the procedure's bytecode.
     const char* dump = SDL_getenv("RT_SCAN_DUMP");
@@ -488,6 +555,63 @@ static bool rt_context_can_steal_from(Object* obj)
         && !rt_is_hostile(obj);
 }
 
+// The item in the active hand, if any.
+static Object* rt_context_active_item()
+{
+    return intface_is_item_right_hand() ? inven_right_hand(obj_dude) : inven_left_hand(obj_dude);
+}
+
+// Using an item on `obj` through its script (see the header): the item in
+// the active hand if the script checks for it, or a carried Rope where the
+// script takes one. The rope action replaces the plain Use, which would
+// only say a rope is needed; without a rope that Use says so in its label.
+static void rt_context_add_items(Object* obj, const RtScriptSkills* scriptSkills, RtAction* actions, int* count)
+{
+    // An object the script refuses items on (a shaft that has its rope).
+    if (scriptSkills->refusingSelfPid != 0 && obj->pid == scriptSkills->refusingSelfPid) {
+        return;
+    }
+
+    Object* held = rt_context_active_item();
+    for (int index = 0; index < scriptSkills->itemPidCount && *count < RT_MAX_ACTIONS; index++) {
+        int pid = scriptSkills->itemPids[index];
+        bool rope = pid == PROTO_ID_ROPE && scriptSkills->consumesItem;
+
+        Object* item = NULL;
+        if (held != NULL && held->pid == pid) {
+            item = held;
+        } else if (rope) {
+            item = inven_pid_is_carried_ptr(obj_dude, PROTO_ID_ROPE);
+        }
+
+        if (item == NULL) {
+            if (rope && *count > 0 && actions[0].kind == RT_ACTION_DEFAULT) {
+                SDL_strlcat(actions[0].label, " (needs a Rope)", sizeof(actions[0].label));
+            }
+            continue;
+        }
+
+        RtAction action;
+        action.kind = RT_ACTION_ITEM;
+        action.skill = -1;
+        action.item = item;
+        if (rope) {
+            SDL_strlcpy(action.label, "Attach Rope", sizeof(action.label));
+        } else {
+            snprintf(action.label, sizeof(action.label), "Use %s", object_name(item));
+        }
+
+        if (rope && *count > 0 && actions[0].kind == RT_ACTION_DEFAULT) {
+            actions[0] = action;
+        } else {
+            // First: the player is holding it for this.
+            memmove(&(actions[1]), &(actions[0]), sizeof(*actions) * (*count));
+            actions[0] = action;
+            (*count)++;
+        }
+    }
+}
+
 static int rt_context_collect(Object* obj, RtAction* actions, RtScriptSkills* scriptSkills)
 {
     int count = 0;
@@ -537,6 +661,10 @@ static int rt_context_collect(Object* obj, RtAction* actions, RtScriptSkills* sc
         }
     }
 
+    if (scriptSkills->hasUseOnProc && type != OBJ_TYPE_CRITTER) {
+        rt_context_add_items(obj, scriptSkills, actions, &count);
+    }
+
     return count;
 }
 
@@ -562,9 +690,28 @@ void rt_context_describe(Object* obj, char* buffer, size_t size)
     }
 }
 
+// A script attached to an object made during play (the roped shaft a
+// Vault 15 shaft script puts up) isn't loaded until its first event, and a
+// script's first event runs its `start` procedure, which picks the handler
+// itself: BVElv1W's sends "use" to its use_obj_on_p_proc (an original
+// script bug), so the first A on the roped shaft did nothing. Loading it
+// with the start event first, as map loading does for every script (see
+// `scr_load_all_scripts`), sends A to its use_p_proc.
+static void rt_context_prepare_script(Object* obj)
+{
+    Script* script;
+    if (obj->sid == -1 || scr_ptr(obj->sid, &script) == -1 || script->program != NULL) {
+        return;
+    }
+
+    rt_log("interact: loading the script of %s", object_name(obj));
+    exec_script_proc(obj->sid, SCRIPT_PROC_START);
+}
+
 static void rt_context_default(Object* obj)
 {
     rt_context_stats.defaultActions++;
+    rt_context_prepare_script(obj);
 
     switch (FID_TYPE(obj->fid)) {
     case OBJ_TYPE_ITEM:
@@ -585,6 +732,27 @@ static void rt_context_default(Object* obj)
         action_use_an_object(obj_dude, obj);
         break;
     }
+}
+
+// The original "use item on" action: the player walks up and the object's
+// `use_obj_on_p_proc` decides (installing a rope takes it from the
+// inventory, or the hand, and replaces the shaft). The script runs once per
+// use: a press while the player still walks there replaces that walk (the
+// engine clears it), and one during the hand animation can't be
+// registered (the player is in that sequence).
+static void rt_context_use_item(Object* obj, Object* item)
+{
+    rt_context_prepare_script(obj);
+    if (action_use_an_item_on_object(obj_dude, obj, item) == -1) {
+        rt_context_stats.itemUseRefused++;
+        rt_log("interact: %s on %s not started, the player is still busy", object_name(item), object_name(obj));
+        return;
+    }
+
+    rt_context_stats.itemUses++;
+    rt_context_stats.lastItemPid = item->pid;
+    rt_context_stats.lastItemTarget = obj;
+    rt_log("interact: use %s on %s", object_name(item), object_name(obj));
 }
 
 // Runs the original skill use (the object's script, or the engine's own
@@ -658,6 +826,8 @@ void rt_context_interact(Object* obj)
 
     if (actions[choice].kind == RT_ACTION_DEFAULT) {
         rt_context_default(obj);
+    } else if (actions[choice].kind == RT_ACTION_ITEM) {
+        rt_context_use_item(obj, actions[choice].item);
     } else {
         rt_context_use_skill(obj, actions[choice].skill, &scriptSkills);
     }

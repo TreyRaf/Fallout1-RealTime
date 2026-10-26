@@ -121,7 +121,9 @@ int gnw_main(int argc, char** argv)
 
             mouse_show();
             int mainMenuRc;
-            if (rt_autotest_enabled()) {
+            if (rt_autotest_enabled() && rt_autotest_finished()) {
+                mainMenuRc = MAIN_MENU_EXIT;
+            } else if (rt_autotest_enabled() && !rt_autotest_menus_mode()) {
                 // The automated test starts a new game once, then exits.
                 mainMenuRc = autotestStarted ? MAIN_MENU_EXIT : MAIN_MENU_NEW_GAME;
                 autotestStarted = true;

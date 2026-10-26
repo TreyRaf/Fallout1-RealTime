@@ -25,10 +25,12 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
 #include "plib/gnw/memory.h"
+#include "plib/gnw/mouse.h"
 #include "plib/gnw/svga.h"
 #include "plib/gnw/text.h"
 
@@ -280,6 +282,9 @@ static int optnwin;
 
 // 0x661E70
 static int prfwin;
+// RT: the options menu and the preferences are open (automated tests).
+static bool options_rt_menu_open = false;
+static bool options_rt_prefs_open = false;
 
 // 0x661E74
 static unsigned char* opbmp[OPTIONS_WINDOW_FRM_COUNT];
@@ -385,6 +390,8 @@ int do_options()
         return -1;
     }
 
+    options_rt_menu_open = true;
+
     int rc = -1;
     while (rc == -1) {
         sharedFpsLimiter.mark();
@@ -460,6 +467,7 @@ int do_options()
     }
 
     OptnEnd();
+    options_rt_menu_open = false;
 
     return rc;
 }
@@ -828,6 +836,219 @@ static void ShadeScreen(bool is_world_map)
     mouse_show();
 }
 
+// RT: controller. The preference whose control is at a screen point (the
+// areas `PrefStart` registers as buttons), or -1.
+static int pref_rt_at(int x, int y)
+{
+    Rect windowRect;
+    if (win_get_rect(prfwin, &windowRect) != 0) {
+        return -1;
+    }
+
+    x -= windowRect.ulx;
+    y -= windowRect.uly;
+    for (int index = 0; index < PREF_COUNT; index++) {
+        PreferenceDescription* meta = &(btndat[index]);
+        int left;
+        int top;
+        int right;
+        int bottom;
+        if (index >= FIRST_RANGE_PREF) {
+            left = 384;
+            top = meta->knobY - 12;
+            right = left + 240;
+            bottom = top + 23;
+        } else if (index >= FIRST_SECONDARY_PREF) {
+            left = meta->minX;
+            top = meta->knobY - 5;
+            right = meta->maxX;
+            bottom = top + 28;
+        } else {
+            if (index == PREF_RUNNING_BURNING_GUY && !game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
+                continue;
+            }
+            left = meta->minX;
+            top = meta->knobY - 4;
+            right = meta->maxX;
+            bottom = top + 48;
+        }
+
+        if (x >= left && x < right && y >= top && y < bottom) {
+            return index;
+        }
+    }
+
+    return -1;
+}
+
+
+// RT: controller. Up/Down go through the preferences as one list (the
+// switches column by column, the sliders, the player speed box, then
+// Default, Done and Cancel); Left/Right change the selected preference
+// and move between the buttons at the bottom.
+static int pref_rt_nav_hook(int dirX, int dirY, int x, int y, int* outX, int* outY)
+{
+    Rect windowRect;
+    if (win_get_rect(prfwin, &windowRect) != 0) {
+        return GAMEPAD_NAV_DEFAULT;
+    }
+
+    int stopsX[PREF_COUNT + 4];
+    int stopsY[PREF_COUNT + 4];
+    int count = 0;
+    int current = -1;
+    int currentPreference = pref_rt_at(x, y);
+    for (int index = 0; index < PREF_COUNT; index++) {
+        PreferenceDescription* meta = &(btndat[index]);
+        if (index == PREF_RUNNING_BURNING_GUY && !game_global_vars[GVAR_RUNNING_BURNING_GUY]) {
+            continue;
+        }
+        if (index == currentPreference) {
+            current = count;
+        }
+        if (index >= FIRST_RANGE_PREF) {
+            stopsX[count] = windowRect.ulx + 384 + 120;
+            stopsY[count] = windowRect.uly + meta->knobY - 12 + 11;
+        } else if (index >= FIRST_SECONDARY_PREF) {
+            stopsX[count] = windowRect.ulx + (meta->minX + meta->maxX) / 2;
+            stopsY[count] = windowRect.uly + meta->knobY - 5 + 14;
+        } else {
+            stopsX[count] = windowRect.ulx + (meta->minX + meta->maxX) / 2;
+            stopsY[count] = windowRect.uly + meta->knobY - 4 + 24;
+        }
+        count++;
+    }
+
+    // The player speed box and the buttons at the bottom.
+    int firstButton = count;
+    for (int eventCode : { 524, 527, 504, 528 }) {
+        Rect rect;
+        if (win_find_nav_button(eventCode, &rect)) {
+            stopsX[count] = (rect.ulx + rect.lrx) / 2;
+            stopsY[count] = (rect.uly + rect.lry) / 2;
+            if (current == -1 && x >= rect.ulx && x <= rect.lrx && y >= rect.uly && y <= rect.lry) {
+                current = count;
+            }
+            count++;
+        }
+    }
+
+    if (current == -1) {
+        // Not on a preference yet: the first one.
+        if (count == 0) {
+            return GAMEPAD_NAV_DEFAULT;
+        }
+        *outX = stopsX[0];
+        *outY = stopsY[0];
+        return GAMEPAD_NAV_MOVE;
+    }
+
+    if (dirX != 0) {
+        if (current < firstButton) {
+            return GAMEPAD_NAV_KEY;
+        }
+        // Default, Done and Cancel are side by side (the box is above them).
+        int next = current + dirX;
+        if (current == firstButton || next <= firstButton || next >= count) {
+            return GAMEPAD_NAV_DEFAULT;
+        }
+        *outX = stopsX[next];
+        *outY = stopsY[next];
+        return GAMEPAD_NAV_MOVE;
+    }
+
+    int next = std::clamp(current + dirY, 0, count - 1);
+    *outX = stopsX[next];
+    *outY = stopsY[next];
+    return GAMEPAD_NAV_MOVE;
+}
+// RT: one step of a preference with the controller: the next or previous
+// position of a switch, or a tenth of a slider's range. The effects are the
+// ones clicking or dragging has (see `DoThing`).
+static void pref_rt_step(int preferenceIndex, int delta)
+{
+    PreferenceDescription* meta = &(btndat[preferenceIndex]);
+
+    if (preferenceIndex >= FIRST_PRIMARY_PREF && preferenceIndex <= LAST_PRIMARY_PREF) {
+        int value = std::clamp(*meta->valuePtr + delta, 0, meta->valuesCount - 1);
+        if (value == *meta->valuePtr) {
+            return;
+        }
+        *meta->valuePtr = value;
+        gsound_play_sfx_file("ib3p1xx1");
+    } else if (preferenceIndex >= FIRST_SECONDARY_PREF && preferenceIndex <= LAST_SECONDARY_PREF) {
+        // The left label means 1 for combat messages, 0 for the others.
+        int left = preferenceIndex == PREF_COMBAT_MESSAGES ? 1 : 0;
+        int value = delta < 0 ? left : 1 - left;
+        if (value == *meta->valuePtr) {
+            return;
+        }
+        *meta->valuePtr = value;
+        gsound_play_sfx_file("ib2p1xx1");
+    } else if (preferenceIndex >= FIRST_RANGE_PREF && preferenceIndex <= LAST_RANGE_PREF) {
+        double value;
+        switch (preferenceIndex) {
+        case PREF_TEXT_BASE_DELAY:
+            value = 6.0 - text_delay + 1.0;
+            break;
+        case PREF_BRIGHTNESS:
+            value = gamma_value;
+            break;
+        case PREF_MOUSE_SENSITIVIY:
+            value = mouse_sens;
+            break;
+        default:
+            value = *meta->valuePtr;
+            break;
+        }
+
+        double step = (meta->maxValue - meta->minValue) / 10.0;
+        double newValue = std::clamp(value + delta * step, meta->minValue, meta->maxValue);
+        if (newValue == value) {
+            return;
+        }
+
+        switch (preferenceIndex) {
+        case PREF_COMBAT_SPEED:
+            *meta->valuePtr = (int)newValue;
+            break;
+        case PREF_TEXT_BASE_DELAY:
+            text_delay = 6.0 - newValue + 1.0;
+            break;
+        case PREF_MASTER_VOLUME:
+            *meta->valuePtr = (int)newValue;
+            gsound_set_master_volume(master_volume);
+            break;
+        case PREF_MUSIC_VOLUME:
+            *meta->valuePtr = (int)newValue;
+            gsound_background_volume_set(music_volume);
+            break;
+        case PREF_SFX_VOLUME:
+            *meta->valuePtr = (int)newValue;
+            gsound_set_sfx_volume(sndfx_volume);
+            break;
+        case PREF_SPEECH_VOLUME:
+            *meta->valuePtr = (int)newValue;
+            gsound_speech_volume_set(speech_volume);
+            break;
+        case PREF_BRIGHTNESS:
+            gamma_value = newValue;
+            colorGamma(newValue);
+            break;
+        case PREF_MOUSE_SENSITIVIY:
+            mouse_sens = newValue;
+            break;
+        }
+        gsound_play_sfx_file(preferenceIndex == PREF_SFX_VOLUME ? "butin1" : "ib1p1xx1");
+    } else {
+        return;
+    }
+
+    UpdateThing(preferenceIndex);
+    win_draw(prfwin);
+    changed = true;
+}
+
 // 0x481E84
 static int do_prefscreen()
 {
@@ -835,6 +1056,10 @@ static int do_prefscreen()
         debug_printf("\nPREFERENCE MENU: Error loading preference dialog data!\n");
         return -1;
     }
+
+    // RT: the controller goes through the preferences as a list.
+    gamepad_set_menu_nav_hook(pref_rt_nav_hook);
+    options_rt_prefs_open = true;
 
     int rc = -1;
     while (rc == -1) {
@@ -874,8 +1099,33 @@ static int do_prefscreen()
             if (eventCode == KEY_ESCAPE || eventCode == 528 || game_user_wants_to_quit != 0) {
                 RestoreSettings();
                 rc = 0;
+            } else if (eventCode >= 505 && eventCode < 505 + PREF_COUNT && gamepad_get_menu_highlight(NULL)) {
+                // RT: A on a switch selected with the controller turns it to
+                // the next position (wrapping around); sliders move with
+                // left/right only.
+                int preferenceIndex = eventCode - 505;
+                PreferenceDescription* meta = &(btndat[preferenceIndex]);
+                if (preferenceIndex >= FIRST_SECONDARY_PREF && preferenceIndex <= LAST_SECONDARY_PREF) {
+                    int left = preferenceIndex == PREF_COMBAT_MESSAGES ? 1 : 0;
+                    pref_rt_step(preferenceIndex, (*meta->valuePtr ^ 1) == left ? -1 : 1);
+                } else if (preferenceIndex <= LAST_PRIMARY_PREF) {
+                    if (*meta->valuePtr >= meta->valuesCount - 1) {
+                        pref_rt_step(preferenceIndex, -(meta->valuesCount - 1));
+                    } else {
+                        pref_rt_step(preferenceIndex, 1);
+                    }
+                }
             } else if (eventCode >= 505 && eventCode <= 524) {
                 DoThing(eventCode);
+            } else if (eventCode == KEY_ARROW_LEFT || eventCode == KEY_ARROW_RIGHT) {
+                // RT: the controller changes the selected preference.
+                int mouseX;
+                int mouseY;
+                mouse_get_position(&mouseX, &mouseY);
+                int preferenceIndex = pref_rt_at(mouseX, mouseY);
+                if (preferenceIndex != -1) {
+                    pref_rt_step(preferenceIndex, eventCode == KEY_ARROW_LEFT ? -1 : 1);
+                }
             }
             break;
         }
@@ -885,6 +1135,8 @@ static int do_prefscreen()
     }
 
     PrefEnd();
+    options_rt_prefs_open = false;
+    gamepad_set_menu_nav_hook(NULL);
 
     return rc;
 }
@@ -2022,6 +2274,22 @@ err:
     SavePrefs(0);
 
     return -1;
+}
+
+
+bool options_rt_is_menu_open()
+{
+    return options_rt_menu_open;
+}
+
+bool options_rt_is_prefs_open()
+{
+    return options_rt_prefs_open;
+}
+
+int options_rt_debug_pref(int index)
+{
+    return index >= 0 && index < PREF_COUNT && btndat[index].valuePtr != NULL ? *btndat[index].valuePtr : -1;
 }
 
 } // namespace fallout

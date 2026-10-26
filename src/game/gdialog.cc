@@ -34,6 +34,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -364,6 +365,9 @@ static int curReviewSlot = 0;
 
 // 0x505198
 static int gdNumOptions = 0;
+
+// RT: options chosen (see `gdialog_rt_choice_count`).
+static int gdialog_rt_choices = 0;
 
 // 0x50519C
 static int gReplyWin = -1;
@@ -963,6 +967,16 @@ bool gdialog_rt_has_reply_window()
     return gd_replyWin != -1 && gReplyWin != -1;
 }
 
+int gdialog_rt_choice_count()
+{
+    return gdialog_rt_choices;
+}
+
+int gdialog_rt_option_count()
+{
+    return gdNumOptions;
+}
+
 void gdialog_display_msg(char* msg)
 {
     if (gd_replyWin == -1) {
@@ -1432,6 +1446,8 @@ static void gDialogProcessCleanup()
 // 0x43EF30
 static int gDialogProcessChoice(int a1)
 {
+    gdialog_rt_choices++;
+
     // FIXME: There is a buffer underread bug when `a1` is -1 (pressing 0 on the
     // keyboard, see `gDialogProcess`). When it happens the game looks into unused
     // continuation of `dialogBlock.replyText` (within 0x58F868-0x58FF70 range) which
@@ -1873,6 +1889,18 @@ static void gDialogProcessUpdate()
         }
     }
 
+    // RT: no option is selected when the options appear (the A press that
+    // started the conversation or chose the last option must not choose
+    // one): the D-pad or the left stick selects the first one, and A must
+    // be pressed again. The cursor waits between the reply and the options.
+    Rect firstOption;
+    if (gdNumOptions > 0 && win_find_nav_button(49, &firstOption)) {
+        int parkX = (screenGetWidth() - GAME_DIALOG_WINDOW_WIDTH) / 2 + GAME_DIALOG_WINDOW_WIDTH / 2;
+        int parkY = (screenGetHeight() - GAME_DIALOG_WINDOW_HEIGHT) / 2
+            + (GAME_DIALOG_REPLY_WINDOW_Y + GAME_DIALOG_REPLY_WINDOW_HEIGHT + GAME_DIALOG_OPTIONS_WINDOW_Y) / 2;
+        gamepad_begin_unselected_choice(parkX, parkY, (firstOption.ulx + firstOption.lrx) / 2, (firstOption.uly + firstOption.lry) / 2);
+    }
+
     win_draw(gReplyWin);
     win_draw(gOptionWin);
 }
@@ -1880,6 +1908,7 @@ static void gDialogProcessUpdate()
 // 0x43F8D4
 static int gDialogProcessExit()
 {
+    gamepad_end_unselected_choice();
     gDialogProcessCleanup();
 
     win_delete(gReplyWin);

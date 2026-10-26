@@ -36,6 +36,7 @@
 #include "game/tile.h"
 #include "game/trait.h"
 #include "game/rt_favorites.h"
+#include "game/rt_rules.h"
 #include "game/version.h"
 #include "game/wordwrap.h"
 #include "game/worldmap.h"
@@ -43,6 +44,7 @@
 #include "plib/color/color.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -340,6 +342,9 @@ void ResetLoadSave()
 int SaveGame(int mode)
 {
     MessageListItem messageListItem;
+
+    // RT: the controller picks a slot with Up/Down, A saves, B cancels.
+    GamepadKeyModeScope keyMode(true);
 
     ls_error_code = 0;
 
@@ -848,6 +853,9 @@ static int QuickSnapShot()
 int LoadGame(int mode)
 {
     MessageListItem messageListItem;
+
+    // RT: the controller picks a slot with Up/Down, A loads, B cancels.
+    GamepadKeyModeScope keyMode(true);
 
     const char* body[] = {
         str1,
@@ -1572,6 +1580,11 @@ static int SaveSlot()
         debug_printf("\nLOADSAVE: ** Error writing favorites! **\n");
     }
 
+    // RT: Character rule state (Skilled experience fraction), after that.
+    if (rt_rules_save(flptr) == -1) {
+        debug_printf("\nLOADSAVE: ** Error writing character rule data! **\n");
+    }
+
     debug_printf("LOADSAVE: Total save data written: %ld bytes.\n", db_ftell(flptr));
 
     db_fclose(flptr);
@@ -1650,8 +1663,10 @@ static int LoadSlot(int slot)
         debug_printf("LOADSAVE: Load function #%d data size read: %d bytes.\n", index, db_ftell(flptr) - pos);
     }
 
-    // RT: Favorites, after the original data (absent in older saves).
+    // RT: Favorites and character rule state, after the original data
+    // (absent in older saves).
     rt_favorites_load(flptr);
+    rt_rules_load(flptr);
 
     debug_printf("LOADSAVE: Total load data read: %ld bytes.\n", db_ftell(flptr));
     db_fclose(flptr);
@@ -2213,6 +2228,11 @@ static int get_input_str2(int win, int doneKeyCode, int cancelKeyCode, char* des
 
     beginTextInput();
 
+    // RT: the controller types with the D-pad (see `editor_rt_text_entry_key`):
+    // A accepts, B cancels.
+    GamepadKeyModeScope keyMode(true);
+    int hintWin = editor_rt_text_hint_open(win);
+
     int blinkCounter = 3;
     bool blink = false;
 
@@ -2229,7 +2249,17 @@ static int get_input_str2(int win, int doneKeyCode, int cancelKeyCode, char* des
             v1++;
         }
 
-        if (keyCode == doneKeyCode || keyCode == KEY_RETURN) {
+        int oldWidth = text_width(text);
+        text[textLength] = '\0';
+        bool controllerEdit = editor_rt_text_entry_key(keyCode, text, &textLength, maxLength, flags);
+        text[textLength] = ' ';
+        text[textLength + 1] = '\0';
+
+        if (controllerEdit) {
+            buf_fill(windowBuffer + windowWidth * y + x, oldWidth, lineHeight, windowWidth, backgroundColor);
+            text_to_buf(windowBuffer + windowWidth * y + x, text, windowWidth, windowWidth, textColor);
+            win_draw(win);
+        } else if (keyCode == doneKeyCode || keyCode == KEY_RETURN) {
             rc = 0;
         } else if (keyCode == cancelKeyCode || keyCode == KEY_ESCAPE) {
             rc = -1;
@@ -2283,6 +2313,7 @@ static int get_input_str2(int win, int doneKeyCode, int cancelKeyCode, char* des
     }
 
     endTextInput();
+    editor_rt_text_hint_close(hintWin);
 
     if (rc == 0) {
         text[textLength] = '\0';

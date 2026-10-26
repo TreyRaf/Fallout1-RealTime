@@ -20,6 +20,7 @@
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/stat.h"
@@ -582,6 +583,86 @@ int anim_rt_end_unprioritized(Object* obj)
         }
     }
     return ended;
+}
+
+// RT: an object that has played its whole part of another object's
+// sequence (a hit reaction in the attacker's attack sequence, which goes on
+// until the attacker's own animation is over) is detached from it: its
+// finished descriptions are handed to the sequence's first object. It is
+// then free to start a sequence of its own, which the end of the
+// attacker's sequence neither stops nor resets to standing. Its part is
+// done when all of its descriptions have started (`field_0` is the next one
+// to start) and none of its animations is playing in that sequence.
+// Sequences in which it hides or is erased are left alone. Returns true
+// when `obj` has nothing left to play in any sequence.
+bool anim_rt_detach_finished(Object* obj)
+{
+    bool pending = false;
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000 || (animationSequence->flags & ANIM_SEQ_ACCUMULATING) != 0) {
+            continue;
+        }
+
+        bool part = false;
+        bool finished = true;
+        for (int index = 0; index < animationSequence->length; index++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[index]);
+            if (animationDescription->owner != obj) {
+                continue;
+            }
+            part = true;
+            if (index >= animationSequence->field_0
+                || animationDescription->kind == ANIM_KIND_HIDE
+                || animationDescription->kind == ANIM_KIND_ANIMATE_AND_HIDE) {
+                finished = false;
+            }
+        }
+
+        if (!part) {
+            continue;
+        }
+
+        for (int index = 0; index < curr_sad && finished; index++) {
+            if (sad[index].obj == obj && sad[index].animationSequenceIndex == animationSequenceIndex && sad[index].field_20 != -1000) {
+                finished = false;
+            }
+        }
+
+        Object* first = animationSequence->animations[0].owner;
+        if (!finished || first == NULL || first == obj) {
+            pending = true;
+            continue;
+        }
+
+        for (int index = 0; index < animationSequence->length; index++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[index]);
+            if (animationDescription->owner == obj) {
+                animationDescription->owner = first;
+            }
+        }
+    }
+    return !pending;
+}
+
+int anim_rt_sequence_count(Object* obj)
+{
+    int count = 0;
+    for (int animationSequenceIndex = 0; animationSequenceIndex < ANIMATION_SEQUENCE_LIST_CAPACITY; animationSequenceIndex++) {
+        AnimationSequence* animationSequence = &(anim_set[animationSequenceIndex]);
+        if (animationSequence->field_0 == -1000) {
+            continue;
+        }
+
+        for (int animationDescriptionIndex = 0; animationDescriptionIndex < animationSequence->length; animationDescriptionIndex++) {
+            AnimationDescription* animationDescription = &(animationSequence->animations[animationDescriptionIndex]);
+            if (obj == animationDescription->owner && animationDescription->kind != ANIM_KIND_CALLBACK) {
+                count++;
+                break;
+            }
+        }
+    }
+    return count;
 }
 
 // 0x41390C
@@ -3460,7 +3541,8 @@ unsigned int compute_tpf(Object* object, int fid)
         }
     }
 
-    return 1000 / fps;
+    // RT: Fast Shot plays the player's attacks faster.
+    return rt_anim_frame_time(object, FID_ANIM_TYPE(fid), 1000 / fps);
 }
 
 } // namespace fallout

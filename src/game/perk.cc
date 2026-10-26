@@ -1,6 +1,7 @@
 #include "game/perk.h"
 
 #include <stdio.h>
+#include <string.h>
 
 #include "game/game.h"
 #include "game/gconfig.h"
@@ -183,6 +184,15 @@ static void perk_rt_descriptions()
     snprintf(friendlyFoe, sizeof(friendlyFoe),
         "Your companions know where you stand. Their bullets and energy weapon shots, bursts included, never hurt you. Their melee attacks, thrown weapons and explosions still can, and so can anyone who turns on you.");
     perk_data[PERK_FRIENDLY_FOE].description = friendlyFoe;
+
+    static char quickPockets[512];
+    snprintf(quickPockets, sizeof(quickPockets),
+        "Quick hands get the job done before anyone notices. While you steal, each rank gives %d points of bonus for the first %.1f seconds (your steal roll gains them and the owner's roll to notice loses them), then the bonus fades to nothing over %.1f seconds. It never goes below your normal chance. Reopening the same pocket within %d seconds doesn't give a fresh start.",
+        rules->quickPocketsBonus,
+        rules->quickPocketsGraceMs / 1000.0,
+        rules->quickPocketsDecayMs / 1000.0,
+        rules->quickPocketsResetS);
+    perk_data[PERK_QUICK_POCKETS].description = quickPockets;
 }
 
 // 0x48663C
@@ -351,6 +361,38 @@ void perk_rt_debug_set_rank(int perk, int rank)
 {
     if (perk >= 0 && perk < PERK_COUNT) {
         perk_lev[perk] = rank;
+    }
+}
+
+int perk_rt_pic(int perk)
+{
+    return perk >= 0 && perk < PERK_COUNT ? perk + 72 : -1;
+}
+
+void perk_rt_requirements(int perk, char* out, size_t size)
+{
+    if (size == 0) {
+        return;
+    }
+    out[0] = '\0';
+    if (perk < 0 || perk >= PERK_COUNT) {
+        return;
+    }
+
+    PerkDescription* perkDescription = &(perk_data[perk]);
+    char part[64];
+    snprintf(out, size, "Level %d", perkDescription->min_level);
+    if (perkDescription->max_rank != -1) {
+        for (int stat = 0; stat < PRIMARY_STAT_COUNT; stat++) {
+            if (perkDescription->required_stat_levels[stat] > 0) {
+                snprintf(part, sizeof(part), ", %s %d", stat_name(stat), perkDescription->required_stat_levels[stat]);
+                strncat(out, part, size - strlen(out) - 1);
+            }
+        }
+    }
+    if (perkDescription->required_skill != -1) {
+        snprintf(part, sizeof(part), ", %s %d%%", skill_name(perkDescription->required_skill), perkDescription->required_skill_level);
+        strncat(out, part, size - strlen(out) - 1);
     }
 }
 

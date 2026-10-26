@@ -412,7 +412,7 @@ static void pb_draw_header()
         pb_text(x, y, pages[page], color);
         x += width + 10;
     }
-    pb_text_right(PB_X + PB_W - 6, y, "LB  RB", pb_dim);
+    pb_text_right(PB_X + PB_W - 6, y, "LS < >", pb_dim);
     pb_hline(y + pb_line + 1, pb_dim);
 }
 
@@ -571,6 +571,129 @@ static void pb_draw_description(int top, int bottom, const char* title, const ch
     }
 }
 
+// Perk card: the original artwork (skilldex.lst, see `perk_rt_pic`) at the
+// right, scaled down to fit this box with its proportions kept; name, rank,
+// requirements and description in the column left of it.
+#define PB_CARD_ART_WIDTH 104
+#define PB_CARD_ART_HEIGHT 90
+// Room a perk card takes below a list.
+#define PB_PERK_CARD_HEIGHT 172
+
+// Perks whose artwork was reported missing (logged once each).
+static bool pb_perk_art_missing[PERK_COUNT];
+
+// Draws a line of the card, counting it against the artwork and the footer.
+static int pb_card_line(int x, int y, const char* text, int color, int width, int bottom, const Rect* art)
+{
+    if (y + pb_line > bottom) {
+        return y;
+    }
+    pb_text(x, y, text, color, width);
+    int right = x + std::min(width, text_width(text));
+    bool overArt = art != NULL && x < art->lrx && right > art->ulx && y < art->lry && y + text_height() > art->uly;
+    if (overArt || y + text_height() > pb_body_bottom()) {
+        pb_state.perkTextOverlaps++;
+    }
+    pb_state.perkTextLines++;
+    return y + pb_line;
+}
+
+static void pb_draw_perk_card(int top, int bottom, int perk, const char* rank, const char* title = NULL)
+{
+    pb_hline(top - 3, pb_dim);
+    pb_state.perkCard = perk;
+    pb_state.perkArtFid = -1;
+    pb_state.perkTextOverlaps = 0;
+    pb_state.perkTextLines = 0;
+
+    // The artwork box: right side, from the top of the card.
+    int boxHeight = std::min(PB_CARD_ART_HEIGHT, bottom - top);
+    Rect box;
+    box.ulx = PB_X + PB_W - PB_CARD_ART_WIDTH - 8;
+    box.uly = top;
+    box.lrx = box.ulx + PB_CARD_ART_WIDTH;
+    box.lry = box.uly + boxHeight;
+
+    int fid = art_id(OBJ_TYPE_SKILLDEX, perk_rt_pic(perk), 0, 0, 0);
+    if (perk_rt_pic(perk) != -1 && art_exists(fid)) {
+        CacheEntry* handle;
+        int width;
+        int height;
+        if (art_lock(fid, &handle, &width, &height) != NULL) {
+            // Scaled down to the box (never up), centered in it.
+            int drawWidth = width;
+            int drawHeight = height;
+            if (drawWidth > PB_CARD_ART_WIDTH || drawHeight > boxHeight) {
+                if (width * boxHeight >= height * PB_CARD_ART_WIDTH) {
+                    drawWidth = PB_CARD_ART_WIDTH;
+                    drawHeight = height * PB_CARD_ART_WIDTH / width;
+                } else {
+                    drawHeight = boxHeight;
+                    drawWidth = width * boxHeight / height;
+                }
+            }
+            art_ptr_unlock(handle);
+            int x = box.ulx + (PB_CARD_ART_WIDTH - drawWidth) / 2;
+            int y = box.uly + (boxHeight - drawHeight) / 2;
+            scale_art(fid, pb_buf + PB_PITCH * y + x, drawWidth, drawHeight, PB_PITCH);
+            pb_state.perkArtFid = fid;
+            pb_state.perkArtX = x;
+            pb_state.perkArtY = y;
+            pb_state.perkArtWidth = drawWidth;
+            pb_state.perkArtHeight = drawHeight;
+        }
+    }
+    if (pb_state.perkArtFid == -1) {
+        draw_box(pb_buf, PB_PITCH, box.ulx, box.uly, box.lrx - 1, box.lry - 1, pb_dim);
+        pb_text(box.ulx + 6, box.uly + boxHeight / 2 - pb_line / 2, "No artwork", pb_dim, PB_CARD_ART_WIDTH - 12);
+        pb_state.perkArtX = box.ulx;
+        pb_state.perkArtY = box.uly;
+        pb_state.perkArtWidth = PB_CARD_ART_WIDTH;
+        pb_state.perkArtHeight = boxHeight;
+        if (perk >= 0 && perk < PERK_COUNT && !pb_perk_art_missing[perk]) {
+            pb_perk_art_missing[perk] = true;
+            rt_log("pipboy: no artwork for perk %d (%s), skilldex index %d", perk, perk_name(perk), perk_rt_pic(perk));
+        }
+    }
+
+    // Text column, left of the artwork.
+    Rect art = { box.ulx - 6, box.uly, box.lrx, box.lry };
+    int x = PB_X + 8;
+    int width = art.ulx - x;
+    int y = top;
+    y = pb_card_line(x, y, title != NULL ? title : perk_name(perk), pb_bright, width, bottom, &art);
+    if (rank != NULL) {
+        y = pb_card_line(x, y, rank, pb_green, width, bottom, &art);
+    }
+    char requirements[160];
+    perk_rt_requirements(perk, requirements, sizeof(requirements));
+    std::vector<std::string> lines;
+    pb_wrap((std::string("Requires: ") + requirements).c_str(), width, lines);
+    for (const std::string& line : lines) {
+        y = pb_card_line(x, y, line.c_str(), pb_dim, width, bottom, &art);
+    }
+    y += 3;
+    lines.clear();
+    pb_wrap(perk_description(perk), width, lines);
+    for (const std::string& line : lines) {
+        y = pb_card_line(x, y, line.c_str(), pb_green, width, bottom, &art);
+    }
+}
+
+// "Rank 1 of 3" for a perk owned, "Takes rank 2 of 3" for one to choose.
+static std::string pb_perk_rank_text(int perk, bool choosing)
+{
+    int owned = perk_level(perk);
+    int max = perk_max_rank(perk);
+    char text[64];
+    if (choosing) {
+        snprintf(text, sizeof(text), max > 1 ? "Takes rank %d of %d" : "Single rank", owned + 1, max);
+    } else {
+        snprintf(text, sizeof(text), "Rank %d of %d", owned, std::max(max, owned));
+    }
+    return text;
+}
+
 static void pb_build_perk_rows()
 {
     pb_rows.clear();
@@ -607,7 +730,9 @@ static bool pb_is_tagged(int skill)
 
 static void pb_render_choices(int top, int bottom, const char* title)
 {
-    int listBottom = bottom - pb_line * 6;
+    // Perks get a card with their artwork, which needs more room.
+    bool perkCard = pb_mode == RT_PIPBOY_MODE_CHOOSE_PERK;
+    int listBottom = perkCard ? bottom - PB_PERK_CARD_HEIGHT : bottom - pb_line * 6;
     pb_text(PB_X + 8, top, title, pb_bright);
     std::vector<std::string> labels;
     for (int choice : pb_choices) {
@@ -628,13 +753,19 @@ static void pb_render_choices(int top, int bottom, const char* title)
             break;
         }
     }
-    int visible = (listBottom - top - pb_line) / pb_line;
+    int visible = (listBottom - top - pb_line - 2) / pb_line;
+    pb_list_move(0, (int)labels.size(), visible, &pb_choice_cursor, &pb_choice_scroll);
     pb_draw_list(top + pb_line + 2, visible, (int)labels.size(), pb_choice_cursor, pb_choice_scroll, labels);
     pb_state.listCount = (int)labels.size();
     pb_state.cursor = pb_choice_cursor;
 
     if (pb_choice_cursor < (int)pb_choices.size()) {
         int choice = pb_choices[pb_choice_cursor];
+        if (perkCard) {
+            // Highlighting only shows the card; A then asks to confirm.
+            pb_draw_perk_card(listBottom + 4, bottom, choice, pb_perk_rank_text(choice, true).c_str());
+            return;
+        }
         const char* description;
         switch (pb_mode) {
         case RT_PIPBOY_MODE_CHOOSE_PERK:
@@ -679,7 +810,7 @@ static void pb_render_stats(int top, int bottom)
     }
     if (pb_mode == RT_PIPBOY_MODE_CONFIRM_PERK) {
         pb_text(PB_X + 8, top, "Take this perk?", pb_bright);
-        pb_draw_description(top + pb_line * 2, bottom, perk_name(pb_pending_perk), perk_description(pb_pending_perk));
+        pb_draw_perk_card(top + pb_line * 2, bottom, pb_pending_perk, pb_perk_rank_text(pb_pending_perk, true).c_str());
         pb_footer("A Yes   B No");
         return;
     }
@@ -687,7 +818,7 @@ static void pb_render_stats(int top, int bottom)
     switch (page) {
     case 0:
         pb_stats_status(top, bottom);
-        pb_footer("D-pad Scroll   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer("D-pad Scroll   B Close   LS Page   LT/RT Tab");
         break;
     case 1: {
         std::vector<std::string> labels;
@@ -702,7 +833,7 @@ static void pb_render_stats(int top, int bottom)
         pb_draw_list(top, 7, 7, *cursor, 0, labels, &values);
         pb_draw_description(listBottom + 4, bottom, labels[*cursor].c_str(), stat_description(STAT_STRENGTH + *cursor));
         pb_state.listCount = 7;
-        pb_footer("D-pad Select   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer("D-pad Select   B Close   LS Page   LT/RT Tab");
         break;
     }
     case 2: {
@@ -728,7 +859,7 @@ static void pb_render_stats(int top, int bottom)
         pb_draw_list(listTop, visible, SKILL_COUNT, *cursor, *scroll, labels, &values);
         pb_draw_description(listBottom + 4, bottom, skill_name(*cursor), skill_description(*cursor));
         pb_state.listCount = SKILL_COUNT;
-        pb_footer(unspent > 0 || pb_skill_added[*cursor] > 0 ? "A +1 point   X Undo   Y Skilldex   B Close   LB/RB Page" : "D-pad Select   Y Skilldex   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer(unspent > 0 || pb_skill_added[*cursor] > 0 ? "A +1 point   X Undo   Y Skilldex   B Close   LS Page" : "D-pad Select   Y Skilldex   B Close   LS Page   LT/RT Tab");
         break;
     }
     case 3: {
@@ -751,11 +882,11 @@ static void pb_render_stats(int top, int bottom)
         }
         if (labels.empty()) {
             pb_text(PB_X + 8, top, "No perks or traits yet.", pb_green);
-            pb_footer("B Close   LB/RB Page   LT/RT Tab");
+            pb_footer("B Close   LS Page   LT/RT Tab");
             pb_state.listCount = 0;
             break;
         }
-        int listBottom = bottom - pb_line * 6;
+        int listBottom = bottom - PB_PERK_CARD_HEIGHT;
         int visible = (listBottom - top) / pb_line;
         pb_list_move(0, (int)labels.size(), visible, cursor, scroll);
         pb_draw_list(top, visible, (int)labels.size(), *cursor, *scroll, labels);
@@ -763,12 +894,12 @@ static void pb_render_stats(int top, int bottom)
         if (row.kind == 0) {
             pb_draw_description(listBottom + 4, bottom, "New perk", "You have reached a level that grants a perk. Press A to choose it.");
         } else if (row.kind == 1) {
-            pb_draw_description(listBottom + 4, bottom, perk_name(row.id), perk_description(row.id));
+            pb_draw_perk_card(listBottom + 4, bottom, row.id, pb_perk_rank_text(row.id, false).c_str());
         } else {
             pb_draw_description(listBottom + 4, bottom, trait_name(row.id), trait_description(row.id));
         }
         pb_state.listCount = (int)labels.size();
-        pb_footer(row.kind == 0 ? "A Choose perk   B Close   LB/RB Page" : "D-pad Select   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer(row.kind == 0 ? "A Choose perk   B Close   LS Page" : "D-pad Select   B Close   LS Page   LT/RT Tab");
         break;
     }
     }
@@ -1069,7 +1200,8 @@ static void pb_build_actions(Object* item, std::vector<int>& actions)
             actions.push_back(RT_PIPBOY_ACTION_WEAR);
         }
     } else if (item->pid != PROTO_ID_MONEY) {
-        if ((item->flags & OBJECT_IN_LEFT_HAND) == 0) {
+        // Thrown weapons only go in the right hand (RB throws them).
+        if ((item->flags & OBJECT_IN_LEFT_HAND) == 0 && !rt_is_thrown_weapon(item)) {
             actions.push_back(RT_PIPBOY_ACTION_EQUIP_LEFT);
         }
         if ((item->flags & OBJECT_IN_RIGHT_HAND) == 0) {
@@ -1178,7 +1310,13 @@ static void pb_do_action(int action)
     case RT_PIPBOY_ACTION_EQUIP_LEFT:
     case RT_PIPBOY_ACTION_EQUIP_RIGHT:
         if (inven_rt_equip(item, action == RT_PIPBOY_ACTION_EQUIP_LEFT ? INVEN_RT_SLOT_LEFT_HAND : INVEN_RT_SLOT_RIGHT_HAND) == 0) {
-            pb_say("%s in your %s hand.", name, action == RT_PIPBOY_ACTION_EQUIP_LEFT ? "left" : "right");
+            if (rt_is_thrown_weapon(item)) {
+                pb_say("%s in your right hand. RB throws it.", name);
+            } else {
+                pb_say("%s in your %s hand.", name, action == RT_PIPBOY_ACTION_EQUIP_LEFT ? "left" : "right");
+            }
+        } else if (rt_is_thrown_weapon(item)) {
+            pb_say("Thrown weapons only go in the right hand.");
         }
         break;
     case RT_PIPBOY_ACTION_WEAR:
@@ -1246,7 +1384,7 @@ static void pb_render_inventory(int top, int bottom)
 
     if (count == 0) {
         pb_text(PB_X + 8, listTop, "Nothing here.", pb_dim);
-        pb_footer("LB/RB Category   LT/RT Tab   B Close");
+        pb_footer("LS Category   LT/RT Tab   B Close");
         return;
     }
 
@@ -1314,7 +1452,7 @@ static void pb_render_inventory(int top, int bottom)
         return;
     }
 
-    pb_footer("A Actions   X Drop   Y Favorite   LB/RB Category   B Close");
+    pb_footer("A Actions   X Drop   Y Favorite   LS Category   B Close");
 }
 
 static void pb_inventory_key(int key)
@@ -1516,7 +1654,7 @@ static void pb_render_local_map(int top, int bottom)
 
     if (map < 0 || !automap_rt_available(map, elevation)) {
         pb_text(PB_X + 8, top + pb_line * 2, "No automap is kept for this location.", pb_green);
-        pb_footer("LB/RB Page   LT/RT Tab   B Close");
+        pb_footer("LS Page   LT/RT Tab   B Close");
         return;
     }
 
@@ -1547,7 +1685,7 @@ static void pb_render_local_map(int top, int bottom)
     pb_map_centered = true;
     pb_footer(pb_scanner
             ? "D-pad/RS Pan   X Zoom   Y Detail   Motion sensor on"
-            : "D-pad/RS Pan   X Zoom   Y Detail   LB/RB Page   B Close");
+            : "D-pad/RS Pan   X Zoom   Y Detail   LS Page   B Close");
 }
 
 typedef struct PbSavedMap {
@@ -1600,13 +1738,13 @@ static void pb_render_saved_maps(int top, int bottom)
     pb_state.listCount = count;
     if (count == 0) {
         pb_text(PB_X + 8, top + pb_line * 2, "No automaps saved yet (they are saved when leaving a map).", pb_green);
-        pb_footer("LB/RB Page   LT/RT Tab   B Close");
+        pb_footer("LS Page   LT/RT Tab   B Close");
         return;
     }
     int visible = (bottom - top - pb_line) / pb_line;
     pb_list_move(0, count, visible, cursor, scroll);
     pb_draw_list(top + pb_line + 2, visible, count, *cursor, *scroll, labels);
-    pb_footer("A View   B Close   LB/RB Page   LT/RT Tab");
+    pb_footer("A View   B Close   LS Page   LT/RT Tab");
 }
 
 static void pb_render_world(int top, int bottom)
@@ -1689,7 +1827,7 @@ static void pb_render_world(int top, int bottom)
         pb_fill(px, py - 3, 1, 7, pb_red);
     }
 
-    pb_footer("D-pad/RS Pan   X Zoom   LB/RB Page   B Close");
+    pb_footer("D-pad/RS Pan   X Zoom   LS Page   B Close");
 }
 
 static void pb_render_map(int top, int bottom)
@@ -1854,7 +1992,7 @@ static void pb_render_data(int top, int bottom)
         if (labels.empty()) {
             pb_text(PB_X + 8, top + pb_line * 2, pipboy_rt_getmsg(203), pb_green);
         }
-        pb_footer("A Open   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer("A Open   B Close   LS Page   LT/RT Tab");
         break;
     case 1:
         pb_rows.clear();
@@ -1868,7 +2006,7 @@ static void pb_render_data(int top, int bottom)
         if (labels.empty()) {
             pb_text(PB_X + 8, top + pb_line * 2, "No holodisks.", pb_green);
         }
-        pb_footer("A Read   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer("A Read   B Close   LS Page   LT/RT Tab");
         break;
     case 2:
         pb_rows.clear();
@@ -1882,7 +2020,7 @@ static void pb_render_data(int top, int bottom)
         if (labels.empty()) {
             pb_text(PB_X + 8, top + pb_line * 2, "No recordings.", pb_green);
         }
-        pb_footer("A Play   B Close   LB/RB Page   LT/RT Tab");
+        pb_footer("A Play   B Close   LS Page   LT/RT Tab");
         break;
     default: {
         pb_rows.clear();
@@ -1892,7 +2030,7 @@ static void pb_render_data(int top, int bottom)
         pb_text_right(PB_X + PB_W - 10, top, text, pb_green);
         if (!pipboy_rt_can_rest()) {
             pb_text(PB_X + 8, top + pb_line * 2, pipboy_rt_getmsg(215), pb_red);
-            pb_footer("LB/RB Page   LT/RT Tab   B Close");
+            pb_footer("LS Page   LT/RT Tab   B Close");
             pb_state.listCount = 0;
             return;
         }
@@ -1900,7 +2038,7 @@ static void pb_render_data(int top, int bottom)
             pb_rows.push_back({ 7, option, NULL });
             labels.push_back(pipboy_rt_getmsg(302 + option));
         }
-        pb_footer("A Rest   B Cancel rest / Close   LB/RB Page");
+        pb_footer("A Rest   B Cancel rest / Close   LS Page");
         break;
     }
     }
@@ -2004,6 +2142,8 @@ static void pb_render()
     pb_state.cursorItem = NULL;
     pb_state.mapPixels = 0;
     pb_state.mapPlayer = false;
+    pb_state.perkCard = -1;
+    pb_state.perkArtFid = -1;
 
     if (pb_mode == RT_PIPBOY_MODE_TEXT) {
         if (pb_tab == RT_PIPBOY_TAB_INVENTORY) {
@@ -2036,6 +2176,10 @@ static void pb_render()
         pb_state.choices[index] = pb_choices[index];
     }
     pb_state.choiceCursor = pb_choice_cursor;
+    pb_state.mapPanX = pb_map_pan_x;
+    pb_state.mapPanY = pb_map_pan_y;
+    pb_state.worldX = pb_world_x;
+    pb_state.worldY = pb_world_y;
     if (pb_mode == RT_PIPBOY_MODE_NONE) {
         pb_state.cursor = pb_cursor[pb_tab][pb_page[pb_tab]];
     }
@@ -2093,15 +2237,30 @@ static void pb_back()
 static void pb_handle_key(int key)
 {
     switch (key) {
+    // Main tabs: LT/RT (one tab per pull; the press is an edge, so a held
+    // trigger never repeats). Menu presses never reach gameplay, so they
+    // can't fire or lock on either.
     case GAMEPAD_KEY_LT:
+    case GAMEPAD_KEY_RT:
     case KEY_LOWERCASE_Q:
     case KEY_UPPERCASE_Q:
-        pb_set_tab(pb_tab - 1);
-        return;
-    case GAMEPAD_KEY_RT:
     case KEY_LOWERCASE_E:
     case KEY_UPPERCASE_E:
-        pb_set_tab(pb_tab + 1);
+        pb_set_tab(pb_tab + (key == GAMEPAD_KEY_LT || key == KEY_LOWERCASE_Q || key == KEY_UPPERCASE_Q ? -1 : 1));
+        return;
+    // Subcategories: a horizontal push of the left stick (one per push, see
+    // `gamepad_set_stick_tabs`), only on a tab's own page. A nested control
+    // comes first: the quantity selector takes left/right as its amount,
+    // the others (action menu, perk choices, text, a saved map) ignore it.
+    case GAMEPAD_KEY_LS_LEFT:
+    case GAMEPAD_KEY_LS_RIGHT:
+        if (pb_mode == RT_PIPBOY_MODE_QUANTITY) {
+            pb_inventory_key(key == GAMEPAD_KEY_LS_LEFT ? KEY_ARROW_LEFT : KEY_ARROW_RIGHT);
+        } else if (pb_mode == RT_PIPBOY_MODE_NONE) {
+            pb_set_page(key == GAMEPAD_KEY_LS_LEFT ? -1 : 1);
+        } else {
+            pb_state.nestedIgnored++;
+        }
         return;
     case GAMEPAD_KEY_START:
         pb_close = true;
@@ -2109,18 +2268,16 @@ static void pb_handle_key(int key)
     case KEY_ESCAPE:
         pb_back();
         return;
+    // LB/RB: no longer change pages or tabs; in a text view they scroll a
+    // page.
     case KEY_PAGE_UP:
         if (pb_mode == RT_PIPBOY_MODE_TEXT) {
             pb_text_scroll = std::max(0, pb_text_scroll - 10);
-        } else if (pb_mode == RT_PIPBOY_MODE_NONE) {
-            pb_set_page(-1);
         }
         return;
     case KEY_PAGE_DOWN:
         if (pb_mode == RT_PIPBOY_MODE_TEXT) {
             pb_text_scroll += 10;
-        } else if (pb_mode == RT_PIPBOY_MODE_NONE) {
-            pb_set_page(1);
         }
         return;
     }
@@ -2196,6 +2353,12 @@ static void pb_loop()
     unsigned int lastPan = SDL_GetTicks();
     while (!pb_close) {
         sharedFpsLimiter.mark();
+
+        // Stick tabs are on whenever the Pip-Boy itself has the controller
+        // (a screen opened from it turns them off).
+        if (!gamepad_is_stick_tabs()) {
+            gamepad_set_stick_tabs(true);
+        }
 
         int key = get_input();
         if (game_user_wants_to_quit != 0) {

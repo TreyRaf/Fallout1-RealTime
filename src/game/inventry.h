@@ -97,6 +97,7 @@ int inven_set_timer(Object* a1);
 #define INVEN_RT_SLOT_ARMOR 2
 int inven_rt_quantity(Object* item);
 void inven_rt_refresh_appearance();
+// Thrown weapons (`rt_is_thrown_weapon`) can't go in the left hand (-1).
 int inven_rt_equip(Object* item, int slot);
 int inven_rt_unequip(Object* item);
 int inven_rt_use(Object* item);
@@ -135,6 +136,8 @@ typedef struct InvenRtLootState {
     char lastMessage[128];
     // Stealing: the shown chance the selected item goes unnoticed (-1 none).
     int stealOdds;
+    // Quick Pockets bonus last shown (steal modifier points).
+    int quickPocketsBonus;
     bool stealing;
 } InvenRtLootState;
 

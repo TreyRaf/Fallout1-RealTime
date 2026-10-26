@@ -3,8 +3,11 @@
 #include <stdio.h>
 
 #include "game/game.h"
+#include "game/inventry.h"
+#include "game/item.h"
 #include "game/message.h"
 #include "game/object.h"
+#include "game/rt_rules.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -84,10 +87,40 @@ int trait_init()
         }
     }
 
-    // RT: perks come every 2 levels for everyone, so Skilled no longer costs
-    // perks.
-    static char skilled[] = "Since you spent more time improving your skills than a normal person, you start with better skill levels.";
+    // RT: replaced traits describe their new effects with the configured
+    // values (see rt_rules.h). Skilled no longer costs perks either: they
+    // come every 2 levels for everyone.
+    const RtRules* rules = rt_rules();
+
+    static char skilled[320];
+    snprintf(skilled, sizeof(skilled),
+        "Since you spent more time improving your skills than a normal person, you start with better skill levels (+%d%% to every skill). But you learn less from experience: you get %d%% fewer experience points.",
+        rules->skilledSkillBonus, 100 - rules->skilledXpPct);
     trait_data[TRAIT_SKILLED].description = skilled;
+
+    static char kamikaze[320];
+    char share[32];
+    if (rules->kamikazeArmorAcPct == 50) {
+        snprintf(share, sizeof(share), "half");
+    } else {
+        snprintf(share, sizeof(share), "%d%%", rules->kamikazeArmorAcPct);
+    }
+    snprintf(kamikaze, sizeof(kamikaze),
+        "By not paying attention to any threats, you act a lot faster: +%d maximum Action Points. But you have no natural Armor Class, and worn armor gives only %s of its Armor Class (rounded down).",
+        rules->kamikazeAp, share);
+    trait_data[TRAIT_KAMIKAZE].description = kamikaze;
+
+    static char fastShot[320];
+    snprintf(fastShot, sizeof(fastShot),
+        "You attack faster than normal people: every weapon, fists included, attacks %d%% more often. But you don't have time to aim at body parts, so AIMED SHOT is not available. Normal target lock still works.",
+        rules->fastShotRatePct - 100);
+    trait_data[TRAIT_FAST_SHOT].description = fastShot;
+
+    static char bloodyMess[320];
+    snprintf(bloodyMess, sizeof(bloodyMess),
+        "By some strange twist of fate, people around you die violently. You always see the worst way a person can die. +%d%% critical chance, and a critical kill with a gory death destroys the victim's armor.",
+        rules->bloodyMessCrit);
+    trait_data[TRAIT_BLOODY_MESS].description = bloodyMess;
 
     // NOTE: Uninline.
     trait_reset();
@@ -255,10 +288,23 @@ int trait_adjust_stat(int stat)
         if (trait_level(TRAIT_BRUISER)) {
             modifier -= 2;
         }
+        // RT: Kamikaze gives extra maximum AP (current AP is never topped
+        // up by it; it regenerates up to the new maximum).
+        if (trait_level(TRAIT_KAMIKAZE)) {
+            modifier += rt_rules()->kamikazeAp;
+        }
         break;
     case STAT_ARMOR_CLASS:
+        // RT: Kamikaze removes the natural (Endurance-based) Armor Class, as
+        // the original trait did, and halves the Armor Class of worn armor
+        // (part of the AC bonus, see `adjust_ac`). Perks and drugs are
+        // untouched, and so are Damage Threshold and Resistance. It is
+        // worked out from the base value and the armor worn right now, so
+        // nothing is stored and nothing can add up over saves or
+        // recalculations.
         if (trait_level(TRAIT_KAMIKAZE)) {
             modifier -= stat_get_base_direct(obj_dude, STAT_ARMOR_CLASS);
+            modifier -= rt_kamikaze_armor_ac_removed(item_ar_ac(inven_worn(obj_dude)));
         }
         break;
     case STAT_MELEE_DAMAGE:
@@ -271,11 +317,6 @@ int trait_adjust_stat(int stat)
             modifier -= 10 * stat_get_base_direct(obj_dude, STAT_STRENGTH);
         }
         break;
-    case STAT_SEQUENCE:
-        if (trait_level(TRAIT_KAMIKAZE)) {
-            modifier += 5;
-        }
-        break;
     case STAT_HEALING_RATE:
         if (trait_level(TRAIT_FAST_METABOLISM)) {
             modifier += 2;
@@ -284,6 +325,10 @@ int trait_adjust_stat(int stat)
     case STAT_CRITICAL_CHANCE:
         if (trait_level(TRAIT_FINESSE)) {
             modifier += 10;
+        }
+        // RT: Bloody Mess adds critical chance (the stat's 100% cap applies).
+        if (trait_level(TRAIT_BLOODY_MESS)) {
+            modifier += rt_rules()->bloodyMessCrit;
         }
         break;
     case STAT_BETTER_CRITICALS:
@@ -317,8 +362,11 @@ int trait_adjust_skill(int skill)
         modifier -= 10;
     }
 
+    // RT: Skilled keeps its original bonus to every skill. Like every trait
+    // modifier it is added when a skill is looked up, never stored, so it
+    // counts exactly once however often the game is saved or loaded.
     if (trait_level(TRAIT_SKILLED)) {
-        modifier += 10;
+        modifier += rt_rules()->skilledSkillBonus;
     }
 
     if (trait_level(TRAIT_GOOD_NATURED)) {

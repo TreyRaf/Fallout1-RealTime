@@ -21,6 +21,7 @@
 #include "game/perk.h"
 #include "game/protinst.h"
 #include "game/proto.h"
+#include "game/realtime.h"
 #include "game/roll.h"
 #include "game/scripts.h"
 #include "game/skill.h"
@@ -1561,6 +1562,12 @@ void combatai_check_retaliation(Object* critter, Object* candidate)
 {
     int rating_new;
     int rating_current;
+
+    // RT: a "who hit me" that is no longer a critter on the map (removed, or
+    // left from another map) counts as nobody instead of being read.
+    if (rt_enabled() && !rt_is_live_critter(critter->data.critter.combat.whoHitMe)) {
+        critter->data.critter.combat.whoHitMe = NULL;
+    }
 
     rating_new = combatai_rating(candidate);
     rating_current = combatai_rating(critter->data.critter.combat.whoHitMe);

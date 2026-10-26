@@ -22,6 +22,7 @@
 #include "game/protinst.h"
 #include "game/proto.h"
 #include "game/proto_types.h"
+#include "game/rt_rules.h"
 #include "game/skill.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -1199,6 +1200,23 @@ void intface_update_move_points(int actionPoints, int bonusMove)
 
     int circle = 0;
 
+    // RT: Kamikaze can raise maximum AP past the 10 lights. AP above 10 turn
+    // lights yellow from the left: 14 AP = 4 yellow + 6 green, 20 = all
+    // yellow.
+    if (frmData == moveLightGreen && actionPoints > 10 && bonusMove == 0) {
+        int extra = std::min(actionPoints - 10, 10);
+        for (int index = 0; index < 10; index++) {
+            buf_to_buf(index < extra ? moveLightYellow : moveLightGreen,
+                5,
+                5,
+                5,
+                interfaceBuffer + 14 * 640 + 316 + index * 9,
+                640);
+        }
+        actionPoints = 0;
+        circle = 10;
+    }
+
     for (int index = 0; index < actionPoints && circle < 10; index++) {
         buf_to_buf(frmData,
             5,
@@ -1722,6 +1740,7 @@ static int intface_redraw_items()
 
     InterfaceItemState* itemState = &(itemButtonItems[itemCurrentItem]);
     int actionPoints = -1;
+    bool halfActionPoint = false;
 
     if (itemState->isDisabled == 0) {
         memcpy(itemButtonUp, itemButtonUpBlank, sizeof(itemButtonUp));
@@ -1800,7 +1819,14 @@ static int intface_redraw_items()
             }
 
             if (hitMode != -1) {
-                actionPoints = item_w_mp_cost(obj_dude, hitMode, bullseyeFid != -1);
+                // RT: the AP the attack costs in this project (see
+                // `rt_attack_ap_cost`): ordinary gunfire costs none, so no
+                // number is shown for it; fists cost half a point.
+                double cost = rt_attack_ap_cost(obj_dude, hitMode, bullseyeFid != -1);
+                if (cost > 0.0) {
+                    actionPoints = (int)cost;
+                    halfActionPoint = cost - (double)actionPoints >= 0.5;
+                }
 
                 int id;
                 int anim = item_w_anim(obj_dude, hitMode);
@@ -1885,6 +1911,26 @@ static int intface_redraw_items()
                     height -= 2;
                 }
                 dark_trans_buf_to_buf(data + actionPoints * 10, 10, height, width, itemButtonDown, offset + 7 + 1, v40, 188, 59641);
+
+                // RT: half a point: a dot (in the digits' color) and a 5.
+                if (halfActionPoint) {
+                    unsigned char color = 0;
+                    for (int index = 0; index < 10 * height && color == 0; index++) {
+                        color = data[(index / 10) * width + index % 10];
+                    }
+                    // Bottom of the digits; the pressed image is drawn 1 px
+                    // right and 2 px up, as above.
+                    int dotX = offset + 7 + 10;
+                    int dotY = 60 - 3;
+                    for (int dy = 0; dy < 2; dy++) {
+                        for (int dx = 0; dx < 2; dx++) {
+                            itemButtonUp[188 * (dotY + dy) + dotX + dx] = color;
+                            itemButtonDown[188 * (dotY + dy - 2) + dotX + 1 + dx] = color;
+                        }
+                    }
+                    trans_buf_to_buf(data + 5 * 10, 10, height, width, itemButtonUp + 188 * (60 - height) + dotX + 3, 188);
+                    dark_trans_buf_to_buf(data + 5 * 10, 10, height, width, itemButtonDown, dotX + 3 + 1, v40, 188, 59641);
+                }
 
                 art_ptr_unlock(handle);
             }

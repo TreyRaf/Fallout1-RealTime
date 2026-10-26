@@ -21,6 +21,7 @@
 #include "game/pipboy.h"
 #include "game/proto.h"
 #include "game/roll.h"
+#include "game/rt_rules.h"
 #include "game/scripts.h"
 #include "game/stat.h"
 #include "game/trait.h"
@@ -818,6 +819,12 @@ static int skill_steal_modifier(Object* a1, Object* a2, Object* item)
         stealModifier += 20;
     }
 
+    // RT: Quick Pockets, a bonus for stealing quickly that fades while the
+    // steal screen stays open (see `rt_quick_pockets_bonus`).
+    if (a1 == obj_dude) {
+        stealModifier += rt_quick_pockets_bonus(a2);
+    }
+
     return stealModifier;
 }
 
@@ -891,6 +898,10 @@ int skill_rt_uses_left(int skill)
 int skill_check_stealing(Object* a1, Object* a2, Object* item, bool isPlanting)
 {
     int howMuch;
+
+    if (a1 == obj_dude) {
+        rt_quick_pockets_note_check(a2);
+    }
 
     int stealModifier = skill_steal_modifier(a1, a2, item);
 

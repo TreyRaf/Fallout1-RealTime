@@ -121,6 +121,12 @@ int check_registry(Object* obj);
 bool anim_rt_is_locked(Object* obj, char* description, size_t size);
 int anim_rt_end_unprioritized(Object* obj);
 int anim_rt_end_all(Object* obj);
+// RT: hands `obj`'s finished part of other objects' sequences (a hit
+// reaction in an attack sequence) to those sequences, so it may start its
+// own; true when it has nothing left to play (see anim.cc).
+bool anim_rt_detach_finished(Object* obj);
+// RT: number of active sequences `obj` has an animation in (tests).
+int anim_rt_sequence_count(Object* obj);
 int anim_busy(Object* a1);
 int register_object_move_to_object(Object* owner, Object* destination, int actionPoints, int delay);
 int register_object_run_to_object(Object* owner, Object* destination, int actionPoints, int delay);

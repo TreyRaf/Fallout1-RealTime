@@ -22,7 +22,7 @@ Missing keys use the defaults. Perk descriptions show whatever values are config
 
 | Value | Original Fallout 1 | Fallout1-RealTime |
 |---|---|---|
-| Armor Class (base) | AG | **EN**. Armor, perk and trait modifiers are unchanged; Kamikaze still removes the base. |
+| Armor Class (base) | AG | **EN**. Armor and perk modifiers are unchanged. Kamikaze removes the base and also halves worn armor's AC (see `controller-menus-and-traits.md`). |
 | Action Points | 5 + AG/2 | unchanged |
 | Small Guns | 35 + AG | unchanged |
 | Big Guns | 10 + AG | unchanged |
@@ -87,7 +87,7 @@ Only the changes are listed. Every other perk keeps its original level, rank lim
 | Survivalist | 3 | 2 | narrow utility: Outdoorsman only, needs Outdoorsman 40% |
 | Healer | 3 | 2 | utility: more HP from First Aid/Doctor |
 | Scout | 3 | 2 | narrow utility: world map reveal |
-| Quick Pockets | 3 | 2 | very narrow: inventory access has no AP cost in real time |
+| Quick Pockets | 3 | 2 | effect replaced: a timed steal bonus (see below) |
 | Swift Learner | 3 | 4 | broadly useful: +5% XP per rank, compounding |
 
 No selectable perk is left at level 3.
@@ -127,6 +127,10 @@ Effects changed but levels kept, because none of these was a level-3 perk:
   - Shots from party members on the player's team, with guns or energy weapons, never hurt the player. This covers bursts, rounds that pass through, and missed shots.
   - It doesn't cover explosive damage, thrown weapons, melee, or a party member that turned hostile.
   - The old green team outline is removed.
+- **Quick Pockets:**
+  - Stealing quickly gives 5 points per rank of bonus to the steal modifier, full for 2 s, fading to 0 by 10 s; afterwards the chance is the normal one.
+  - The old inventory AP saving is removed.
+  - Details, timing and the reopening rule: [close-combat-perks-pipboy.md](close-combat-perks-pipboy.md#quick-pockets-replaced).
 
 #### Why 25% and 20%
 
@@ -148,7 +152,7 @@ These texts are updated in memory; the game's .msg files are not changed:
 
 - descriptions of Strength, Endurance, Charisma, Intelligence and Agility;
 - the skill formula part for Energy Weapons, Unarmed, Melee Weapons, Throwing and Sneak;
-- the Skilled trait (the "perk every four levels" sentence is removed);
+- the Skilled, Kamikaze, Fast Shot and Bloody Mess traits (their replaced effects, see `controller-menus-and-traits.md`);
 - the five perks whose effects changed.
 
 ## Automated tests (`--rt-autotest`)

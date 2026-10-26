@@ -32,6 +32,7 @@
 #include "game/reaction.h"
 #include "game/realtime.h"
 #include "game/roll.h"
+#include "game/rt_rules.h"
 #include "game/scripts.h"
 #include "game/skill.h"
 #include "game/stat.h"
@@ -415,7 +416,9 @@ void handle_inventory()
 
     if (isInCombat()) {
         if (inven_dude == obj_dude) {
-            int actionPointsRequired = 4 - perk_level(PERK_QUICK_POCKETS);
+            // RT: Quick Pockets no longer lowers this cost (it is now a timed
+            // steal bonus, see `rt_quick_pockets_bonus`).
+            int actionPointsRequired = 4;
             if (actionPointsRequired > 0 && actionPointsRequired > obj_dude->data.critter.combat.ap) {
                 // You don't have enough action points to use inventory
                 MessageListItem messageListItem;
@@ -3778,7 +3781,12 @@ static void loot_rt_draw()
         int catchChance;
         int odds = skill_rt_steal_odds(inven_dude, target_stack[target_curr_stack], loot_rt.selectedItem, &check, &catchChance);
         loot_rt.stealOdds = odds;
-        snprintf(text, sizeof(text), "%s unnoticed: %d%%  (Steal %d%%)", playerSide ? "Plant" : "Take", odds, skill_level(inven_dude, SKILL_STEAL));
+        int quickPockets = rt_quick_pockets_state()->active ? rt_quick_pockets_state()->bonus : 0;
+        if (quickPockets > 0) {
+            snprintf(text, sizeof(text), "%s unnoticed: %d%%  (Quick +%d)", playerSide ? "Plant" : "Take", odds, quickPockets);
+        } else {
+            snprintf(text, sizeof(text), "%s unnoticed: %d%%  (Steal %d%%)", playerSide ? "Plant" : "Take", odds, skill_level(inven_dude, SKILL_STEAL));
+        }
         loot_rt_text_centered(buffer, y, text, amber);
     }
     y += line;
@@ -4069,6 +4077,12 @@ int loot_container(Object* a1, Object* a2)
     loot_rt.stealing = gIsSteal != 0;
     loot_rt.stealOdds = -1;
     loot_rt.side = INVEN_RT_LOOT_SIDE_LOOT;
+    // RT: Quick Pockets: a genuine steal attempt starts the timer now that
+    // the screen is usable (not for looting, trading or party members).
+    if (gIsSteal && a1 == obj_dude) {
+        rt_quick_pockets_begin(a2);
+        loot_rt.quickPocketsBonus = rt_quick_pockets_state()->bonus;
+    }
     loot_rt_draw();
     rt_log("loot: open (%d items here, %d carried)", loot_rt.count[INVEN_RT_LOOT_SIDE_LOOT], loot_rt.count[INVEN_RT_LOOT_SIDE_PLAYER]);
 
@@ -4310,11 +4324,23 @@ int loot_container(Object* a1, Object* a2)
             loot_rt_draw();
         }
 
+        // RT: Quick Pockets: the timer runs while the screen is open; the
+        // odds shown follow the bonus as it fades.
+        if (loot_rt.stealing) {
+            rt_quick_pockets_tick();
+            int bonus = rt_quick_pockets_state()->bonus;
+            if (bonus != loot_rt.quickPocketsBonus) {
+                loot_rt.quickPocketsBonus = bonus;
+                loot_rt_draw();
+            }
+        }
+
         renderPresent();
         sharedFpsLimiter.throttle();
     }
 
     loot_rt.open = false;
+    rt_quick_pockets_end();
     gamepad_set_menu_key_mode(keyModeWas);
     rt_log("loot: closed (%d transfers, %d take all)", loot_rt.transfers, loot_rt.takeAlls);
 
@@ -4353,15 +4379,19 @@ int loot_container(Object* a1, Object* a2)
                     stealingXp = std::min(300 - skill_level(a1, SKILL_STEAL), stealingXp);
                     debug_printf("\n[[[%d]]]", 300 - skill_level(a1, SKILL_STEAL));
 
+                    // RT: awarded first, so the message shows the points
+                    // actually gained (Swift Learner, Skilled).
+                    int xpBefore = stat_pc_get(PC_STAT_EXPERIENCE);
+                    stat_pc_add_experience(stealingXp);
+                    int xpGained = stat_pc_get(PC_STAT_EXPERIENCE) - xpBefore;
+
                     // You gain %d experience points for successfully using your Steal skill.
                     messageListItem.num = 29;
                     if (message_search(&inventry_message_file, &messageListItem)) {
                         char formattedText[200];
-                        snprintf(formattedText, sizeof(formattedText), messageListItem.text, stealingXp);
+                        snprintf(formattedText, sizeof(formattedText), messageListItem.text, xpGained);
                         display_print(formattedText);
                     }
-
-                    stat_pc_add_experience(stealingXp);
                 }
             }
         }
@@ -5864,6 +5894,8 @@ static int do_move_timer(int inventoryWindowType, Object* item, int max)
         sharedFpsLimiter.mark();
 
         loot_rt.quantityValue = value;
+        // RT: Quick Pockets keeps timing while the amount is chosen.
+        rt_quick_pockets_tick();
 
         int keyCode = get_input();
         if (keyCode == KEY_ESCAPE) {
@@ -6307,6 +6339,12 @@ int inven_rt_equip(Object* item, int slot)
         return 0;
     }
 
+    // Thrown weapons go in the right hand (item 2) only: RB throws them
+    // from there while the left hand keeps its item.
+    if (slot == INVEN_RT_SLOT_LEFT_HAND && rt_is_thrown_weapon(item)) {
+        return -1;
+    }
+
     Object* current = slot == INVEN_RT_SLOT_LEFT_HAND ? inven_left_hand(obj_dude) : inven_right_hand(obj_dude);
     if (current == item) {
         return 0;
@@ -6325,6 +6363,11 @@ int inven_rt_equip(Object* item, int slot)
     }
     item->flags |= slot == INVEN_RT_SLOT_LEFT_HAND ? OBJECT_IN_LEFT_HAND : OBJECT_IN_RIGHT_HAND;
     item_add_force(obj_dude, item, 1);
+    // A thrown weapon is never the active item: RT keeps using the left
+    // hand, RB throws.
+    if (rt_is_thrown_weapon(item) && intface_is_item_right_hand()) {
+        intface_toggle_items(false);
+    }
     inven_rt_refresh_appearance();
     return 0;
 }

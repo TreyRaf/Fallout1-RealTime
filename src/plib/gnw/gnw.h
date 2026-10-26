@@ -67,6 +67,14 @@ int win_height(int win);
 int win_get_rect(int win, Rect* rect);
 int win_check_all_buttons();
 int win_get_nav_points(int* xs, int* ys, int capacity);
+// RT: The navigation stop under a screen point (the topmost window there
+// decides), as a screen rectangle, and its click event code.
+bool win_get_nav_button_at(int x, int y, Rect* rect, int* eventCode);
+// RT: Changes whenever a window is opened, closed, shown or hidden.
+unsigned int win_get_nav_signature();
+// RT: The navigation stop with this click event code (up or down), as a
+// screen rectangle (automated tests).
+bool win_find_nav_button(int eventCode, Rect* rect);
 Button* GNW_find_button(int btn, Window** out_win);
 int GNW_check_menu_bars(int a1);
 void win_set_minimized_title(const char* title);

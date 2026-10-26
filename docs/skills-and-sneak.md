@@ -57,6 +57,13 @@ These presses only work in gameplay. In menus, dialogue, the Skilldex, the targe
 - **Repair:** objects whose script handles Repair offer **Repair**: field generators, force-field emitters, the vault computer, robot controls and so on.
   - A runs the script's check, and fixed requirements the script checks are enforced before any attempt.
   - No durability system is added, and plain scenery isn't made repairable.
+- **Using an item on an object:** where the object's script checks for an item (its `use_obj_on_p_proc`), A uses the item through that script, the original "use item on" behavior:
+  - **The item in the active hand:** "Use <item>", first in the action menu.
+  - **A Rope, carried anywhere in the inventory:** "Attach Rope", where the script takes the rope: the Vault 15 elevator shafts and the Glow's metal beam. It replaces the plain Use, which only says a rope is needed. Without a rope that Use reads **Use (needs a Rope)**, and the shaft's own message explains it.
+  - The script decides everything: it takes the rope (from the hand too) and puts up the roped shaft, which then lowers you with A. It doesn't take a second rope, and the roped shaft stays across saves and map changes.
+  - No other carried item is used without being in the active hand (the Shady Sands well takes a bottle cap only when one is held).
+  - A second A while the player is still busy with the first use doesn't run the script again.
+  - A newly made object's script is loaded before its first use, as map loading does. The roped shaft's original script would otherwise ignore the first A.
 - **Unchanged:**
   - **Lockpick:** works as before.
   - **First Aid and Doctor:** never on A, only through the Skilldex. Healing items still work through the inventory and favorites.

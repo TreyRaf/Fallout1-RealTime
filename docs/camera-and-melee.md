@@ -7,8 +7,10 @@
 | Right stick, no lock | Pans the camera (analog: speed follows the deflection) |
 | Right stick flick, with a lock | Switches the locked target (unchanged) |
 | R3 (right-stick click) | Wider view on/off |
-| RT, unarmed or melee weapon | One attack; with no target in reach it still swings |
-| RT, ranged weapon | Needs a lock, as before |
+| RT, unarmed or melee weapon | One attack (costs its AP: 0.5 fists, 1 knuckles/knives/club, 2 heavier melee); with no target in reach it still swings |
+| RT, ranged weapon | Needs a lock, as before; ordinary shots cost no AP |
+| RB, thrown weapon in the right hand | Throws it at the locked target (3 AP); the active item stays |
+| RB, no thrown weapon in the right hand | Switches hands, as before |
 
 A right-stick push belongs to whatever it started as: a push that began as a pan keeps panning even if a target gets locked meanwhile, and a push that began with a lock never pans. The stick has to return to the center before the next push counts.
 
@@ -53,6 +55,10 @@ The translucent area that shows the player behind walls and roofs is drawn at `c
   - **The attempt:** the target gets an ordinary attack: the original to-hit roll, damage, armor and criticals. Damage is applied once, when the reactions finish.
   - **Bystanders:** attacking one makes them and their teammates hostile, as in the original.
   - **No contact:** a swing that meets nobody is just a swing.
+- **AP:** every melee or unarmed attack, swing or lock-on, costs its AP once when it starts (empty swings included): 0.5 for fists and kicks, 1 for knuckles, knives and the club, 2 for heavier melee weapons (see `close-combat-perks-pipboy.md`). With too little AP it doesn't happen.
+- **Two-handed melee (Sledgehammer, Super Sledge):** a swing hits every enemy in a 120° arc in reach, each with its own attack, for one AP charge.
+- **Missed enemies:** an enemy the player's close-combat attack missed attacks next.
+- Details of these three: [close-combat-perks-pipboy.md](close-combat-perks-pipboy.md).
 - **Timing:** cooldowns apply as for any attack. A held RT doesn't repeat melee attacks.
 - **Ranged weapons:** lock-on and firing are unchanged.
 

@@ -1884,7 +1884,11 @@ void combat_give_exps(int exp_points)
         return;
     }
 
+    // RT: the message shows the points actually gained (Swift Learner,
+    // Skilled).
+    int before = stat_pc_get(PC_STAT_EXPERIENCE);
     stat_pc_add_experience(exp_points);
+    exp_points = stat_pc_get(PC_STAT_EXPERIENCE) - before;
 
     format.num = 621; // %s you earn %d exp. points.
     if (!message_search(&proto_main_msg_file, &format)) {
@@ -3479,6 +3483,12 @@ static int determine_to_hit_func(Object* attacker, Object* defender, int hitLoca
         accuracy = 95;
     }
 
+    // RT: a badly timed or spammed RT press lowers the hit chance of the
+    // player's attack it starts (never raises it).
+    if (attacker == obj_dude) {
+        accuracy -= rt_player_timing_penalty();
+    }
+
     if (accuracy < -100) {
         debug_printf("Whoa! Bad skill value in determine_to_hit!\n");
     }
@@ -3755,6 +3765,11 @@ static void damage_object(Object* obj, int damage, bool animated, bool a4)
     }
 
     if ((obj->data.critter.combat.results & DAM_DEAD) != 0) {
+        // RT: a stale "who hit me" (see `combatai_check_retaliation`) counts
+        // as nobody.
+        if (rt_enabled() && !rt_is_live_critter(obj->data.critter.combat.whoHitMe)) {
+            obj->data.critter.combat.whoHitMe = NULL;
+        }
         scr_set_objs(obj->sid, obj->data.critter.combat.whoHitMe, NULL);
         exec_script_proc(obj->sid, SCRIPT_PROC_DESTROY);
 

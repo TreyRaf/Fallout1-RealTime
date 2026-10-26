@@ -14,6 +14,9 @@ void rt_autotest_parse_args(int argc, char** argv);
 bool rt_autotest_enabled();
 void rt_autotest_tick();
 bool rt_autotest_finished();
+// `--rt-autotest-menus`: the controller menu test (main menu, character
+// creation, pause menu) instead of the gameplay test.
+bool rt_autotest_menus_mode();
 
 } // namespace fallout
 

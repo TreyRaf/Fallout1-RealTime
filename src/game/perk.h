@@ -1,6 +1,8 @@
 #ifndef FALLOUT_GAME_PERK_H_
 #define FALLOUT_GAME_PERK_H_
 
+#include <stddef.h>
+
 #include "game/object_types.h"
 #include "game/perk_defs.h"
 #include "plib/db/db.h"
@@ -22,6 +24,12 @@ int perk_level(int perk);
 int perk_min_level(int perk);
 int perk_max_rank(int perk);
 void perk_rt_debug_set_rank(int perk, int rank);
+
+// RT: the perk's artwork in skilldex.lst, as the original character screen
+// draws it (index perk + 72, see `DrawCard2` in editor.cc), and a readable
+// list of its requirements ("Level 2, Agility 5, Steal 40%").
+int perk_rt_pic(int perk);
+void perk_rt_requirements(int perk, char* out, size_t size);
 char* perk_name(int perk);
 char* perk_description(int perk);
 void perk_add_effect(Object* critter, int perk);

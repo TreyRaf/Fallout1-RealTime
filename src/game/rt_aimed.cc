@@ -20,6 +20,7 @@
 #include "game/object.h"
 #include "game/proto.h"
 #include "game/realtime.h"
+#include "game/rt_rules.h"
 #include "game/rt_view.h"
 #include "game/stat.h"
 #include "game/tile.h"
@@ -116,17 +117,23 @@ static const char* aim_target_name(Object* target)
 // gives no reason), or NULL if it can.
 static const char* aim_unsupported_reason(int hitMode, char* buffer, size_t size)
 {
+    // Thrown weapons are never aimed: RB throws them (3 AP each).
+    Object* thrown = item_hit_with(obj_dude, hitMode);
+    if (thrown != NULL && item_w_subtype(thrown, hitMode) == ATTACK_TYPE_THROW) {
+        return "Throws can't be aimed. Press RB to throw.";
+    }
+
     if (item_w_called_shot(obj_dude, hitMode)) {
         return NULL;
     }
 
     if (trait_level(TRAIT_FAST_SHOT)) {
-        return "Your Fast Shot trait doesn't allow aimed shots.";
+        return "Fast Shot: no aimed shots. LT lock and RT attacks still work.";
     }
 
     int anim = item_w_anim(obj_dude, hitMode);
     if (anim == ANIM_FIRE_BURST || anim == ANIM_FIRE_CONTINUOUS) {
-        return "Burst fire can't be aimed. Press Back to change the attack mode.";
+        return "Burst fire can't be aimed. Press Y to change the attack mode.";
     }
 
     Object* weapon = item_hit_with(obj_dude, hitMode);
@@ -175,13 +182,13 @@ static int aim_rounds_available(Object* weapon, int hitMode)
 
 static void aim_recount()
 {
-    aim_state.reservedAp = 0;
+    aim_state.reservedAp = 0.0f;
     aim_state.reservedRounds = 0;
     for (int index = aim_state.next; index < aim_state.queueLength; index++) {
         aim_state.reservedAp += aim_state.queue[index].apCost;
         aim_state.reservedRounds += aim_state.queue[index].rounds;
     }
-    aim_state.availableAp = (int)rt_get_dude_ap() - aim_state.reservedAp;
+    aim_state.availableAp = rt_get_dude_ap() - aim_state.reservedAp;
 }
 
 // Body parts and hit chances for the current target.
@@ -320,7 +327,8 @@ static void aim_render()
     }
     y += line;
 
-    snprintf(text, sizeof(text), "%s: %d AP per aimed attack", weapon != NULL ? object_name(weapon) : "Unarmed", aim_state.apCost);
+    char ap[3][16];
+    snprintf(text, sizeof(text), "%s: %s AP per aimed attack", weapon != NULL ? object_name(weapon) : "Unarmed", rt_ap_text(aim_state.apCost, ap[0], sizeof(ap[0])));
     aim_text(8, y, text, green, 260);
     int rounds = aim_rounds_per_attack(weapon, aim_state.hitMode);
     if (rounds > 0) {
@@ -330,8 +338,9 @@ static void aim_render()
     }
     y += line;
 
-    snprintf(text, sizeof(text), "AP %d of %d free (%d reserved)", aim_state.availableAp, (int)rt_get_dude_ap(), aim_state.reservedAp);
-    aim_text(8, y, text, aim_state.availableAp >= aim_state.apCost ? green : red);
+    snprintf(text, sizeof(text), "AP %s of %s free (%s reserved)",
+        rt_ap_text(aim_state.availableAp, ap[0], sizeof(ap[0])), rt_ap_text(rt_get_dude_ap(), ap[1], sizeof(ap[1])), rt_ap_text(aim_state.reservedAp, ap[2], sizeof(ap[2])));
+    aim_text(8, y, text, aim_state.availableAp + 0.0001f >= aim_state.apCost ? green : red);
     y += line + 2;
 
     draw_line(aim_buf, AIM_WIDTH, 6, y - 2, AIM_WIDTH - 7, y - 2, dim);
@@ -344,8 +353,8 @@ static void aim_render()
         for (int index = first; index < aim_state.queueLength; index++) {
             const RtAimedEntry* entry = &(aim_state.queue[index]);
             const char* part = rt_aimed_part_name(entry->target, entry->hitLocation);
-            snprintf(text, sizeof(text), "%d. %s - %s - %s - %d AP (%d%%)",
-                index + 1, aim_target_name(entry->target), part != NULL ? part : "?", aim_weapon_name(entry->weaponPid), entry->apCost, entry->toHit);
+            snprintf(text, sizeof(text), "%d. %s - %s - %s - %s AP (%d%%)",
+                index + 1, aim_target_name(entry->target), part != NULL ? part : "?", aim_weapon_name(entry->weaponPid), rt_ap_text(entry->apCost, ap[0], sizeof(ap[0])), entry->toHit);
             aim_text(8, y + (index - first) * line, text, entry->target == target ? bright : green);
         }
     }
@@ -422,9 +431,12 @@ static void aim_queue_selected()
         return;
     }
 
-    if (aim_state.availableAp < aim_state.apCost) {
+    if (aim_state.availableAp + 0.0001f < aim_state.apCost) {
         aim_state.refusals++;
-        aim_say(true, "Not enough AP: an aimed attack needs %d, %d left.", aim_state.apCost, aim_state.availableAp);
+        char need[16];
+        char left[16];
+        aim_say(true, "Not enough AP: an aimed attack needs %s, %s left.",
+            rt_ap_text(aim_state.apCost, need, sizeof(need)), rt_ap_text(aim_state.availableAp, left, sizeof(left)));
         return;
     }
 
@@ -448,7 +460,8 @@ static void aim_queue_selected()
     aim_recount();
 
     gsound_play_sfx_file("icsxxxx1");
-    aim_say(false, "Queued: %s, %s (%d%%, %d AP).", aim_target_name(target), part != NULL ? part : "?", entry->toHit, entry->apCost);
+    char ap[16];
+    aim_say(false, "Queued: %s, %s (%d%%, %s AP).", aim_target_name(target), part != NULL ? part : "?", entry->toHit, rt_ap_text(entry->apCost, ap, sizeof(ap)));
 }
 
 static void aim_undo()
@@ -462,7 +475,8 @@ static void aim_undo()
     aim_recount();
     const char* part = rt_aimed_part_name(entry->target, entry->hitLocation);
     gsound_play_sfx_file("ib1p1xx1");
-    aim_say(false, "Removed: %s, %s (%d AP back).", aim_target_name(entry->target), part != NULL ? part : "?", entry->apCost);
+    char ap[16];
+    aim_say(false, "Removed: %s, %s (%s AP back).", aim_target_name(entry->target), part != NULL ? part : "?", rt_ap_text(entry->apCost, ap, sizeof(ap)));
 }
 
 static void aim_switch_target(float fx, float fy)
@@ -550,7 +564,7 @@ void rt_aimed_open()
     aim_state.target = target;
     aim_state.selected = 0;
     aim_state.hitMode = hitMode;
-    aim_state.apCost = item_w_mp_cost(obj_dude, hitMode, true);
+    aim_state.apCost = (float)rt_attack_ap_cost(obj_dude, hitMode, true);
     aim_state.message[0] = '\0';
     aim_state.opens++;
     aim_refresh_target();
@@ -585,9 +599,9 @@ void rt_aimed_open()
     aim_done = false;
     aim_fire = false;
     aim_set_outline(target);
-    rt_log("aimed: open on %s (%s, %d AP per attack, %d AP)",
+    rt_log("aimed: open on %s (%s, %.1f AP per attack, %.2f AP)",
         aim_target_name(target), aim_weapon_name(item_hit_with(obj_dude, hitMode) != NULL ? item_hit_with(obj_dude, hitMode)->pid : -1),
-        aim_state.apCost, (int)rt_get_dude_ap());
+        aim_state.apCost, rt_get_dude_ap());
 
     bool cursorWasHidden = mouse_hidden();
     mouse_hide();
@@ -651,7 +665,7 @@ void rt_aimed_open()
         aim_entry_since = SDL_GetTicks();
         aim_recount();
         aim_print("Aimed attacks: %d queued. B cancels the rest.", aim_state.queueLength);
-        rt_log("aimed: executing %d attacks (%d AP reserved)", aim_state.queueLength, aim_state.reservedAp);
+        rt_log("aimed: executing %d attacks (%.1f AP reserved)", aim_state.queueLength, aim_state.reservedAp);
     } else {
         // Nothing was spent; the reservations just go away.
         aim_state.queueLength = 0;
@@ -683,7 +697,7 @@ static void aim_skip(const char* why)
     RtAimedEntry* entry = &(aim_state.queue[aim_state.next]);
     const char* part = rt_aimed_part_name(entry->target, entry->hitLocation);
     aim_print("Aimed attack %d skipped: %s.", aim_state.next + 1, why);
-    rt_log("aimed: entry %d (%s) skipped: %s (released %d AP, %d rounds)",
+    rt_log("aimed: entry %d (%s) skipped: %s (released %.1f AP, %d rounds)",
         aim_state.next + 1, part != NULL ? part : "?", why, entry->apCost, entry->rounds);
     aim_state.skipped++;
     aim_state.next++;
@@ -746,7 +760,7 @@ void rt_aimed_update(bool canAct, bool pressB)
     int rc = rt_aim_attack(entry->target, entry->hitMode, entry->hitLocation, entry->apCost);
     if (rc == RT_AIM_ATTACK_STARTED) {
         const char* part = rt_aimed_part_name(entry->target, entry->hitLocation);
-        rt_log("aimed: entry %d committed: %s, %s (%d AP spent, %.2f AP left)",
+        rt_log("aimed: entry %d committed: %s, %s (%.1f AP spent, %.2f AP left)",
             aim_state.next + 1, aim_target_name(entry->target), part != NULL ? part : "?", entry->apCost, rt_get_dude_ap());
         aim_state.committed++;
         aim_state.next++;

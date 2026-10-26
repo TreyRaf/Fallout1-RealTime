@@ -100,6 +100,24 @@ typedef struct RtPipboyState {
     // Map: pixels drawn and whether the player marker is known.
     int mapPixels;
     bool mapPlayer;
+    // Map pan positions (local/saved automap, world map).
+    int mapPanX;
+    int mapPanY;
+    int worldX;
+    int worldY;
+    // Left stick subcategory pushes a nested control ignored.
+    int nestedIgnored;
+    // Perk card: the perk shown, its artwork (fid, -1 when missing or no
+    // card) and where it was drawn; text drawn over the artwork or the
+    // footer is counted in `perkTextOverlaps`.
+    int perkCard;
+    int perkArtFid;
+    int perkArtX;
+    int perkArtY;
+    int perkArtWidth;
+    int perkArtHeight;
+    int perkTextOverlaps;
+    int perkTextLines;
 } RtPipboyState;
 
 const RtPipboyState* rt_pipboy_get_state();

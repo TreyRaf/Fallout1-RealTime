@@ -1083,6 +1083,27 @@ static void refresh_all(Rect* rect, unsigned char* a2)
     }
 }
 
+// RT: a button the controller can stop on: enabled, clickable and not a
+// large click area (whole panels, scroll regions).
+static bool win_is_nav_button(Button* button)
+{
+    if ((button->flags & BUTTON_FLAG_DISABLED) != 0) {
+        return false;
+    }
+
+    bool clickable = button->leftMouseUpEventCode != -1
+        || button->lefMouseDownEventCode != -1
+        || button->leftMouseUpProc != NULL
+        || button->leftMouseDownProc != NULL;
+    if (!clickable) {
+        return false;
+    }
+
+    int width = button->rect.lrx - button->rect.ulx + 1;
+    int height = button->rect.lry - button->rect.uly + 1;
+    return width * height <= 60000;
+}
+
 // RT: Collects the centers (screen coordinates) of enabled, clickable buttons in
 // the topmost visible windows, down to and including the first modal window.
 // Used for controller (D-pad) menu navigation.
@@ -1097,27 +1118,12 @@ int win_get_nav_points(int* xs, int* ys, int capacity)
         }
 
         for (Button* button = w->buttonListHead; button != NULL && count < capacity; button = button->next) {
-            if ((button->flags & BUTTON_FLAG_DISABLED) != 0) {
-                continue;
-            }
-
-            bool clickable = button->leftMouseUpEventCode != -1
-                || button->lefMouseDownEventCode != -1
-                || button->leftMouseUpProc != NULL
-                || button->leftMouseDownProc != NULL;
-            if (!clickable) {
+            if (!win_is_nav_button(button)) {
                 continue;
             }
 
             int width = button->rect.lrx - button->rect.ulx + 1;
             int height = button->rect.lry - button->rect.uly + 1;
-
-            // Large click areas (whole panels, scroll regions) aren't useful
-            // navigation stops.
-            if (width * height > 60000) {
-                continue;
-            }
-
             xs[count] = w->rect.ulx + button->rect.ulx + width / 2;
             ys[count] = w->rect.uly + button->rect.uly + height / 2;
             count++;
@@ -1129,6 +1135,93 @@ int win_get_nav_points(int* xs, int* ys, int capacity)
     }
 
     return count;
+}
+
+bool win_get_nav_button_at(int x, int y, Rect* rect, int* eventCode)
+{
+    for (int index = num_windows - 1; index >= 0; index--) {
+        Window* w = window[index];
+        if (w == NULL || (w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+
+        if (x >= w->rect.ulx && x <= w->rect.lrx && y >= w->rect.uly && y <= w->rect.lry) {
+            int localX = x - w->rect.ulx;
+            int localY = y - w->rect.uly;
+            for (Button* button = w->buttonListHead; button != NULL; button = button->next) {
+                if (localX < button->rect.ulx || localX > button->rect.lrx
+                    || localY < button->rect.uly || localY > button->rect.lry) {
+                    continue;
+                }
+
+                if (!win_is_nav_button(button)) {
+                    continue;
+                }
+
+                if (rect != NULL) {
+                    rect->ulx = w->rect.ulx + button->rect.ulx;
+                    rect->uly = w->rect.uly + button->rect.uly;
+                    rect->lrx = w->rect.ulx + button->rect.lrx;
+                    rect->lry = w->rect.uly + button->rect.lry;
+                }
+                if (eventCode != NULL) {
+                    *eventCode = button->leftMouseUpEventCode != -1 ? button->leftMouseUpEventCode : button->lefMouseDownEventCode;
+                }
+                return true;
+            }
+
+            // The window covers whatever is below it.
+            return false;
+        }
+
+        if ((w->flags & WINDOW_MODAL) != 0) {
+            break;
+        }
+    }
+
+    return false;
+}
+
+bool win_find_nav_button(int eventCode, Rect* rect)
+{
+    for (int index = num_windows - 1; index >= 0; index--) {
+        Window* w = window[index];
+        if (w == NULL || (w->flags & WINDOW_HIDDEN) != 0) {
+            continue;
+        }
+
+        for (Button* button = w->buttonListHead; button != NULL; button = button->next) {
+            if (!win_is_nav_button(button)) {
+                continue;
+            }
+
+            if (button->leftMouseUpEventCode == eventCode || button->lefMouseDownEventCode == eventCode) {
+                rect->ulx = w->rect.ulx + button->rect.ulx;
+                rect->uly = w->rect.uly + button->rect.uly;
+                rect->lrx = w->rect.ulx + button->rect.lrx;
+                rect->lry = w->rect.uly + button->rect.lry;
+                return true;
+            }
+        }
+
+        if ((w->flags & WINDOW_MODAL) != 0) {
+            break;
+        }
+    }
+
+    return false;
+}
+
+unsigned int win_get_nav_signature()
+{
+    unsigned int signature = (unsigned int)num_windows;
+    for (int index = 0; index < num_windows; index++) {
+        Window* w = window[index];
+        if (w != NULL && (w->flags & WINDOW_HIDDEN) == 0) {
+            signature = signature * 31 + (unsigned int)w->id + 1;
+        }
+    }
+    return signature;
 }
 
 // 0x4C3940

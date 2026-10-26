@@ -1,6 +1,10 @@
 #ifndef FALLOUT_PLIB_GNW_GAMEPAD_H_
 #define FALLOUT_PLIB_GNW_GAMEPAD_H_
 
+#include "plib/gnw/rect.h"
+
+struct SDL_Renderer;
+
 namespace fallout {
 
 // RT: Game controller support (SDL GameController API).
@@ -70,12 +74,43 @@ void gamepad_set_gameplay_mode(bool enabled);
 #define GAMEPAD_KEY_RT 0x7004
 #define GAMEPAD_KEY_START 0x7005
 #define GAMEPAD_KEY_BACK 0x7006
+// Stick tabs (see `gamepad_set_stick_tabs`): one per deliberate horizontal
+// push of the left stick (the Pip-Boy's subcategories).
+#define GAMEPAD_KEY_LS_LEFT 0x7007
+#define GAMEPAD_KEY_LS_RIGHT 0x7008
 void gamepad_set_menu_key_mode(bool enabled);
 bool gamepad_is_menu_key_mode();
+
+// Sets the menu key mode for a scope and restores the previous mode after.
+class GamepadKeyModeScope {
+public:
+    explicit GamepadKeyModeScope(bool enabled)
+        : previous(gamepad_is_menu_key_mode())
+    {
+        gamepad_set_menu_key_mode(enabled);
+    }
+    ~GamepadKeyModeScope() { gamepad_set_menu_key_mode(previous); }
+
+private:
+    bool previous;
+};
+
+// Menu key mode: while enabled, a horizontal push of the left stick gives
+// one GAMEPAD_KEY_LS_LEFT/RIGHT instead of arrow keys (the Pip-Boy's
+// subcategories; its main tabs are on LT/RT).
+// The push must start near the center and stay within ~27 degrees of
+// horizontal; the stick has to come back near the center before the next
+// one counts. A push that starts vertically or diagonally is scrolling
+// (up/down arrows with repeat, or nothing) until the stick is centered.
+// The D-pad keeps its arrow keys.
+// Any `gamepad_set_menu_key_mode` call turns stick tabs off.
+void gamepad_set_stick_tabs(bool enabled);
+bool gamepad_is_stick_tabs();
 bool gamepad_is_gameplay_mode();
 
 // Window focus changes (from the SDL event loop).
 void gamepad_set_focus(bool focused);
+bool gamepad_is_focused();
 
 // Current (physical or overridden) state.
 const GamepadState* gamepad_get_state();
@@ -113,6 +148,9 @@ void gamepad_reset_gameplay_input();
 
 // Number of focus losses and controller disconnects seen (diagnostics).
 int gamepad_get_interruption_count();
+// How many times input was read outside gameplay (a menu, dialogue or another
+// modal screen was open) so far.
+int gamepad_get_modal_poll_count();
 
 // Virtual mouse contribution, consumed by `dxinput_get_mouse_state`.
 void gamepad_get_mouse_delta(int* dx, int* dy, bool* leftButton, bool* rightButton);
@@ -126,6 +164,48 @@ void gamepad_clear_override();
 // Called at the start of every poll; lets an automated test drive menus.
 typedef void(GamepadHook)();
 void gamepad_set_hook(GamepadHook* hook);
+
+// Button menus (virtual mouse context): the D-pad and the left stick move
+// the cursor from button to button, A clicks, B is Escape. While the
+// controller drives a menu (until the mouse moves) the button under the
+// cursor gets a selection frame, drawn by `renderPresent`, and a newly
+// opened screen puts the cursor on its nearest button.
+bool gamepad_get_menu_highlight(Rect* rect);
+void gamepad_render_menu_highlight(SDL_Renderer* renderer);
+// The physical mouse moved (the mouse drives the menus again).
+void gamepad_note_mouse_moved();
+// The cursor was moved onto a button by the program (navigation): A's
+// click waits until the window system has caught up.
+void gamepad_note_cursor_jump();
+// A choice screen whose entries must never be picked by accident (dialogue
+// responses). While the controller drives the menus, nothing is selected:
+// the cursor is parked at (parkX, parkY), no frame is drawn and A does
+// nothing until the D-pad or the left stick moves (which selects the entry
+// at (firstX, firstY)) or the right stick moves the cursor. In every case
+// an A press already under way, or made before the selection, doesn't
+// click: A must be released and pressed again. Call it for every new set
+// of entries; it ends with the screen (`gamepad_end_unselected_choice`),
+// on any selection, when the mouse moves and in gameplay.
+void gamepad_begin_unselected_choice(int parkX, int parkY, int firstX, int firstY);
+void gamepad_end_unselected_choice();
+bool gamepad_is_choice_unselected();
+// Pointer screens (the world map): the left stick moves the cursor as the
+// right stick does. Returns the previous setting.
+bool gamepad_set_menu_pointer(bool enabled);
+// A screen's own navigation (lists of adjustable controls): for a D-pad or
+// stick move in (dirX, dirY) from the cursor at (x, y), in screen
+// coordinates, the hook returns GAMEPAD_NAV_DEFAULT (nearest button in that
+// direction), GAMEPAD_NAV_MOVE with (*outX, *outY) set (the cursor goes
+// there) or GAMEPAD_NAV_KEY (the screen gets the arrow key, e.g. to change
+// the selected slider). NULL removes it.
+#define GAMEPAD_NAV_DEFAULT 0
+#define GAMEPAD_NAV_MOVE 1
+#define GAMEPAD_NAV_KEY 2
+typedef int(GamepadMenuNavHook)(int dirX, int dirY, int x, int y, int* outX, int* outY);
+void gamepad_set_menu_nav_hook(GamepadMenuNavHook* hook);
+// True once if the last Escape came from B (or Back) within half a second,
+// for screens where B must not do what the Escape key does.
+bool gamepad_consume_menu_back();
 
 const char* gamepad_get_name();
 int gamepad_get_detected_count();

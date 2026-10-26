@@ -1,5 +1,6 @@
 #include "plib/gnw/svga.h"
 
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/mouse.h"
@@ -230,6 +231,8 @@ void renderPresent()
     SDL_UpdateTexture(gSdlTexture, NULL, gSdlTextureSurface->pixels, gSdlTextureSurface->pitch);
     SDL_RenderClear(gSdlRenderer);
     SDL_RenderCopy(gSdlRenderer, gSdlTexture, NULL, NULL);
+    // RT: the controller's menu selection frame, over the finished image.
+    gamepad_render_menu_highlight(gSdlRenderer);
     SDL_RenderPresent(gSdlRenderer);
 }
 

@@ -41,6 +41,7 @@
 #include "plib/db/db.h"
 #include "plib/gnw/button.h"
 #include "plib/gnw/debug.h"
+#include "plib/gnw/gamepad.h"
 #include "plib/gnw/gnw.h"
 #include "plib/gnw/grbuf.h"
 #include "plib/gnw/input.h"
@@ -938,6 +939,13 @@ int load_world_map(DB_FILE* stream)
 // 0x4AA360
 int world_map(WorldMapContext ctx)
 {
+    // RT: the world and town maps are pointed at: the left stick moves the
+    // cursor there (the D-pad still jumps between buttons).
+    struct PointerScreen {
+        bool previous = gamepad_set_menu_pointer(true);
+        ~PointerScreen() { gamepad_set_menu_pointer(previous); }
+    } pointerScreen;
+
     const char* title;
     const char* text;
     const char* body[1];
