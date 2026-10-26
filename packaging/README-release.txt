@@ -1,4 +1,4 @@
-Fallout 1 Real-Time
+Fallout The Unofficial Remaster
 ===================
 
 A real-time, controller-first version of Fallout 1, built on Fallout 1 CE.

@@ -1,3 +1,25 @@
+# Fallout The Unofficial Remaster
+
+A real-time, controller-first version of Fallout 1, built on [Fallout Community Edition](https://github.com/alexbatalov/fallout1-ce). Everyone acts in real time (no turns), with lock-on targeting, contextual controller actions, a unified Pip-Boy and more.
+
+## Play
+
+You need **your own copy of Fallout 1** from [GOG](https://www.gog.com/game/fallout) or [Steam](https://store.steampowered.com/app/38400). This project contains no Fallout 1 game files.
+
+1. Download the latest zip from [Releases](https://github.com/TreyRaf/Fallout1-RealTime/releases).
+2. Unzip it anywhere you can write to (Documents or Desktop, not Program Files).
+3. Double-click `fallout-ce.exe`.
+
+On the first launch it finds your Fallout 1 automatically (or asks for its folder) and never changes your Fallout 1 install. Windows 10 or 11, 64-bit; an Xbox-style controller is recommended.
+
+## Build
+
+Windows, Visual Studio 2022: see `packaging/package.ps1` for building a release zip.
+
+---
+
+*The original Fallout Community Edition README follows.*
+
 # Fallout Community Edition
 
 Fallout Community Edition is a fully working re-implementation of Fallout, with the same original gameplay, engine bugfixes, and some quality of life improvements, that works (mostly) hassle-free on multiple platforms.

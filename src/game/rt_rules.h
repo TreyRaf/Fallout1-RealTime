@@ -8,7 +8,7 @@
 
 namespace fallout {
 
-// RT: Character rules of Fallout1-RealTime that replace original Fallout 1
+// RT: Character rules of Fallout The Unofficial Remaster that replace original Fallout 1
 // rules (perk cadence, companion limit, replaced perk effects). The balance
 // values are read from the [realtime] section of fallout.cfg:
 //

@@ -135,7 +135,7 @@ int stat_init()
         level_description[index] = getmsg(&stat_message_file, &messageListItem, 301 + index);
     }
 
-    // RT: what the attributes modify under the Fallout1-RealTime formulas.
+    // RT: what the attributes modify under this game's formulas.
     static char strength[] = "Raw physical strength. A high Strength is good for physical characters. Modifies: Hit Points, Melee Damage, Carry Weight, and the Melee Weapons, Unarmed and Throwing skills.";
     static char endurance[] = "Stamina and physical toughness. A character with a high Endurance will survive where others may not. Modifies: Hit Points, Armor Class, Poison & Radiation Resistance, Healing Rate, and the additional hit points per level.";
     static char charisma[] = "A combination of appearance and charm. A high Charisma is important for characters that want to influence people with words. Modifies: NPC reactions, barter prices, and how many companions follow you (one per 2 points, at most 5).";

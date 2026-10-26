@@ -1,4 +1,4 @@
-# Fallout1-RealTime character rules
+# Fallout The Unofficial Remaster character rules
 
 These rules replace the original Fallout 1 rules where they conflict.
 The code lives in:
@@ -20,7 +20,7 @@ Missing keys use the defaults. Perk descriptions show whatever values are config
 
 ## SPECIAL formulas (before → after)
 
-| Value | Original Fallout 1 | Fallout1-RealTime |
+| Value | Original Fallout 1 | Fallout The Unofficial Remaster |
 |---|---|---|
 | Armor Class (base) | AG | **EN**. Armor and perk modifiers are unchanged. Kamikaze removes the base and also halves worn armor's AC (see `controller-menus-and-traits.md`). |
 | Action Points | 5 + AG/2 | unchanged |

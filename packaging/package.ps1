@@ -7,7 +7,7 @@ param([string]$Version = (Get-Date -Format 'yyyy-MM-dd'))
 
 $ErrorActionPreference = 'Stop'
 $root = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$name = "Fallout1-RealTime-$Version"
+$name = "Fallout-The-Unofficial-Remaster-$Version"
 $stage = Join-Path $root "release\$name"
 $zip = Join-Path $root "release\$name.zip"
 

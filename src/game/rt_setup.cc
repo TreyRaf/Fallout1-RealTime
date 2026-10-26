@@ -25,7 +25,7 @@ namespace fallout {
 
 namespace fs = std::filesystem;
 
-#define RT_SETUP_TITLE L"Fallout 1 Real-Time"
+#define RT_SETUP_TITLE L"Fallout The Unofficial Remaster"
 
 // GOG's product id for Fallout 1 (its registry key under GOG.com\Games).
 #define RT_SETUP_GOG_ID L"1440148836"
@@ -204,7 +204,7 @@ bool rt_setup_game_files()
 
     if (install.empty()) {
         int answer = MessageBoxW(NULL,
-            L"Fallout 1 Real-Time needs your own copy of Fallout 1 (GOG or Steam), and it wasn't found automatically.\n\n"
+            L"Fallout The Unofficial Remaster needs your own copy of Fallout 1 (GOG or Steam), and it wasn't found automatically.\n\n"
             L"Choose the folder Fallout 1 is installed in (the one with MASTER.DAT and CRITTER.DAT).",
             RT_SETUP_TITLE, MB_OKCANCEL | MB_ICONINFORMATION);
         while (answer == IDOK) {
@@ -224,7 +224,7 @@ bool rt_setup_game_files()
 
     if (install.empty()) {
         MessageBoxW(NULL,
-            L"Fallout 1 Real-Time can't start without Fallout 1. Install Fallout 1 (GOG or Steam) and start it again.",
+            L"Fallout The Unofficial Remaster can't start without Fallout 1. Install Fallout 1 (GOG or Steam) and start it again.",
             RT_SETUP_TITLE, MB_OK | MB_ICONERROR);
         return false;
     }

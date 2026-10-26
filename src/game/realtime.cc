@@ -542,7 +542,7 @@ static void rt_init()
 
     rt_open_log();
 
-    rt_log("Fallout1-RealTime: real-time layer %s", rt_is_enabled ? "ENABLED" : "disabled");
+    rt_log("Fallout The Unofficial Remaster: real-time layer %s", rt_is_enabled ? "ENABLED" : "disabled");
     rt_log("config: camera_edge_scroll=%d camera_margin_pct=%d run_drain_ms_per_ap=%d ap_regen_ms_per_ap=%d attack_cooldown_ms_per_ap=%d",
         rt_camera_edge_scroll, rt_camera_margin_pct, rt_run_drain_ms, rt_ap_regen_ms, rt_ms_per_ap);
     rt_log("config: camera_pan_deadzone_pct=%d camera_pan_speed=%d camera_pan_smoothing_ms=%d camera_follow_ms=%d camera_zoom_transition_ms=%d camera_zoom_out=%.2f",
